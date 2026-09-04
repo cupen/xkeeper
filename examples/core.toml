@@ -1,0 +1,21 @@
+# xkeeper core config sample — global settings only.
+# Default locations: Linux /etc/xkeeper.toml, Windows %APPDATA%\xkeeper\xkeeper.toml
+# Override with: xkeeper -c <path> run
+# The file may be absent entirely; xkeeper then runs empty with these defaults.
+
+[daemon]
+log_level = "info"          # trace|debug|info|warn|error
+log_dir = "logs"            # relative to this file's directory
+monitor_interval = 1.0      # supervision tick (seconds)
+host = "127.0.0.1"          # control API bind address (loopback by default)
+port = 7310                 # control API port
+auth_token = ""             # empty = no auth (loopback only); set a secret to require Bearer auth
+log_buffer_lines = 1000     # in-memory ring per stream, used by `xkeeper log --tail/-f`
+app_dir = "apps"            # registration directory: one <name>.toml link per registered app
+
+# Optional: defaults for every registered app (fields mirror program fields).
+# Program-explicit fields and the app's own [app] table override these.
+[app-default]
+autostart = true            # start with the daemon
+autorestart = "always"      # always | on-failure | never
+restart_backoff = 1.0       # restart delay (seconds), doubles up to max_restart_backoff

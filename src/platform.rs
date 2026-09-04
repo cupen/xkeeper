@@ -1,5 +1,5 @@
 //! Platform-specific bits: child-process-tree cleanup on Windows, graceful
-//! SIGTERM on Unix.
+//! SIGTERM + process-group kill on Unix.
 
 #[cfg(windows)]
 mod imp {
@@ -72,10 +72,18 @@ mod imp {
         }
     }
 
-    /// Send SIGTERM to a still-running child process.
+    /// Ask a child's whole process group to terminate gracefully.
+    /// The child was started with `Command::process_group(0)`, so its pgid
+    /// equals its pid.
     pub fn terminate_gracefully(pid: u32) -> bool {
-        // SAFETY: kill(2) with a plain signal is always memory-safe.
-        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) == 0 }
+        // SAFETY: killpg(2) with a plain signal is always memory-safe.
+        unsafe { libc::killpg(pid as libc::pid_t, libc::SIGTERM) == 0 }
+    }
+
+    /// Hard-kill a child's whole process group.
+    pub fn kill_group(pid: u32) -> bool {
+        // SAFETY: killpg(2) with a plain signal is always memory-safe.
+        unsafe { libc::killpg(pid as libc::pid_t, libc::SIGKILL) == 0 }
     }
 }
 
