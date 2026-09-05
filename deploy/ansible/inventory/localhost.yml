@@ -1,0 +1,32 @@
+# 本地单机 inventory 样例 —— 既可直接用于本机冒烟测试，也是编写自有 inventory 的参考模板。
+#
+# 用法：
+#   1. 准备 xkeeper Linux 二进制与核心配置文件（见 ../README.md）
+#   2. 把下方两个必填变量改成你的实际路径
+#   3. cd deploy/ansible && ansible-playbook -i inventory/localhost.yml site.yml
+#
+# 编写自有 inventory 时：复制本文件，把连接信息换成真实主机（ansible_host +
+# ansible_user 等），并按各主机环境覆盖可选变量即可，playbook 无需改动。
+---
+all:
+  hosts:
+    xkeeper-local:
+      ansible_host: 127.0.0.1
+      ansible_connection: local
+
+      # ----- 必填变量 -----
+      # 控制机上的 xkeeper Linux 二进制文件路径，或 http(s):// 下载 URL
+      xkeeper_binary_src: ../../target/release/xkeeper
+      # 控制机上的核心配置文件路径（将被复制到目标机 xkeeper_config_dest）
+      xkeeper_config_src: ../../examples/core.toml
+
+      # ----- 可选变量（默认值见 ../README.md 变量表） -----
+      # xkeeper_binary_dest: /usr/local/bin/xkeeper
+      # xkeeper_config_dest: /etc/xkeeper.toml
+      # xkeeper_service_name: xkeeper
+      # xkeeper_service_user: ""
+      # xkeeper_binary_checksum: ""        # URL 来源时可填 sha256 值校验产物
+      # xkeeper_force_overwrite: false     # true = 允许覆盖/重启既有安装（危险）
+
+      # 本机若无免密 sudo，取消注释并在运行时输入 become 密码：
+      # ansible_become_pass: ""

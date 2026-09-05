@@ -178,6 +178,14 @@ cargo build --release
 - 设置 `XKEEPER_FRONTEND_BUILD=skip` 可跳过前端构建（CI 无 Node 环境时），
   直接使用磁盘上已有的 `frontend/dist/`。
 
+### Ansible 批量部署
+
+多台 Linux 主机部署见 [deploy/ansible/README.md](deploy/ansible/README.md)：
+写一份 inventory 即可完成"分发二进制 → 装核心配置 → 注册 systemd 服务"。
+仓库内附 `inventory/localhost.yml` 本地样例，可直接用于冒烟测试。默认部署
+对既有 xkeeper 安装零影响——检测到既有安装立即停止并说明原因，需显式设置
+`xkeeper_force_overwrite: true` 才允许覆盖。
+
 ### API 概览
 
 控制台模式下（`xkeeper webui` = 守护循环 + 控制台一体），HTTP API 与 WebSocket
