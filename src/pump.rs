@@ -12,7 +12,7 @@ use std::thread::JoinHandle;
 
 use log::{debug, warn};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Stream {
     Out,
     Err,

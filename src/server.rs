@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use log::{info, warn};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::supervisor::{Command, Supervisor};
 
@@ -25,35 +25,52 @@ const MAX_HEADER_BYTES: usize = 32 * 1024;
 
 static FOLLOWS: AtomicUsize = AtomicUsize::new(0);
 
-#[derive(Serialize)]
-struct ProgramInfo {
-    app: String,
-    name: String,
-    state: String,
-    pid: Option<u32>,
-    unhealthy: bool,
-    uptime_secs: f64,
-    total_exits: u64,
-    restart_backoff: f64,
-    last_exit: Option<String>,
-    fatal_reason: Option<String>,
-    wait_reason: Option<String>,
+/// Shared status projection: served as JSON by the control plane and
+/// re-used verbatim by the web console (`/api/*` + WS, MessagePack).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ProgramInfo {
+    pub app: String,
+    pub name: String,
+    pub state: String,
+    pub pid: Option<u32>,
+    pub unhealthy: bool,
+    pub uptime_secs: f64,
+    pub total_exits: u64,
+    pub restart_backoff: f64,
+    pub last_exit: Option<String>,
+    pub fatal_reason: Option<String>,
+    pub wait_reason: Option<String>,
 }
 
-#[derive(Serialize)]
-struct StatusDoc {
-    daemon: DaemonInfo,
-    programs: Vec<ProgramInfo>,
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct StatusDoc {
+    pub daemon: DaemonInfo,
+    pub programs: Vec<ProgramInfo>,
 }
 
-#[derive(Serialize)]
-struct DaemonInfo {
-    version: &'static str,
-    port: u16,
-    apps: usize,
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct DaemonInfo {
+    pub version: String,
+    pub port: u16,
+    pub apps: usize,
 }
 
-fn program_info(p: &crate::program::ManagedProgram) -> ProgramInfo {
+/// One status snapshot for any consumer (control plane + web console).
+pub(crate) fn status_doc(sup: &Arc<Supervisor>) -> StatusDoc {
+    let st = sup.state.lock().unwrap();
+    let mut programs: Vec<ProgramInfo> = st.programs.values().map(program_info).collect();
+    programs.sort_by(|a, b| (&a.app, &a.name).cmp(&(&b.app, &b.name)));
+    StatusDoc {
+        daemon: DaemonInfo {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            port: st.core.daemon.port,
+            apps: st.apps.len(),
+        },
+        programs,
+    }
+}
+
+pub(crate) fn program_info(p: &crate::program::ManagedProgram) -> ProgramInfo {
     ProgramInfo {
         app: p.def.app.clone(),
         name: p.def.name.clone(),
@@ -203,7 +220,7 @@ fn handle_connection(sup: &Arc<Supervisor>, token: &str, stream: TcpStream) {
                 200,
                 StatusDoc {
                     daemon: DaemonInfo {
-                        version: env!("CARGO_PKG_VERSION"),
+                        version: env!("CARGO_PKG_VERSION").to_string(),
                         port: st.core.daemon.port,
                         apps: st.apps.len(),
                     },

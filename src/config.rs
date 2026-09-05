@@ -96,7 +96,7 @@ pub enum RestartPolicy {
 // core config (global only)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CoreConfig {
     #[serde(default)]

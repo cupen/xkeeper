@@ -128,6 +128,96 @@ restart_on_unhealthy = true # unhealthy 触发与崩溃一致的重启
 
 CLI 退出码：`0` 成功、`1` 一般错误、`2` 配置错误、`3` 守护进程不可达。
 
+Web 控制台（`xkeeper webui`）在同一守护进程内另开一个回环端口，伺服内嵌 UI、
+`/api/*` 查询与 `/ws` WebSocket 推送——状态投影与本控制面完全一致（见下文 Web UI）。
+
+## Web UI
+
+### 技术栈
+
+`frontend/` 是一个 Vite + TypeScript + Lit 的 SPA：
+
+- **Lit 3**（Web Components / Shadow DOM）渲染全部界面，视图即自定义元素 `<xkeeper-*>`；
+- **Web Awesome** 提供 Web Components 基础控件，主题经 `frontend/src/styles/wa-overrides.css`
+  映射到仓库自己的 design tokens（`tokens.css`，indigo 品牌、暗色优先）；
+- **pnpm** 管理依赖，**vitest**（happy-dom/jsdom 环境）跑组件测试，TypeScript `strict` 模式；
+- 图标是零依赖的内联 SVG 集合（`src/components/icons.ts`），无字体/CDN 外链。
+
+前端产物经 **rust-embed** 编译进二进制：`cargo build` 时 `build.rs` 检查
+`frontend/` 输入是否比 `dist/` 新，需要时自动执行 `pnpm install` + `pnpm build`，
+然后把 `frontend/dist` 嵌入；`dist/` 本身**不提交**，全新 checkout 只要有 Rust +
+Node 工具链即可一次 `cargo build` 得到带完整 UI 的二进制。
+
+### 开发调试（pnpm dev）
+
+双进程工作流：后端伺服 JSON API（`127.0.0.1:9877`），Vite 伺服 SPA 并热更新，
+`/api`、`/health` 经代理转发到后端——开发与部署访问的是同一组路径。
+
+```bash
+# 终端 A：后端（API + 内嵌 UI）
+cargo run -- webui                  # http://127.0.0.1:9877
+
+# 终端 B：前端热更新开发服务器
+cd frontend
+pnpm install
+pnpm dev                            # http://localhost:5273（代理 /api /health → 9877）
+pnpm test                           # vitest 组件测试
+```
+
+前端改完后 `pnpm build` 产出 `dist/`，再 `cargo build` 即把新 UI 嵌入二进制。
+
+### 发布
+
+```bash
+cargo build --release
+# 产物: target/release/xkeeper(.exe) —— 单文件，自带全部前端资源
+```
+
+- 发布产物是**单个二进制**：运行时不需要 Node、不需要静态文件目录。
+- 没有 Node 工具链时 `cargo build` 不会失败：build.rs 内嵌一个占位页并给出 warning。
+- 设置 `XKEEPER_FRONTEND_BUILD=skip` 可跳过前端构建（CI 无 Node 环境时），
+  直接使用磁盘上已有的 `frontend/dist/`。
+
+### API 概览
+
+控制台模式下（`xkeeper webui` = 守护循环 + 控制台一体），HTTP API 与 WebSocket
+同端口伺服。`/api/*` 与控制面 `/v1/*` 使用**同一份状态投影**（`server.rs`），
+数据同源：程序状态来自守护循环，日志来自内存环形缓冲（不受轮转影响）：
+
+| 端点 | 说明 |
+|---|---|
+| `GET /api/health` | 存活探针 |
+| `GET /api/overview` | 守护进程概况 + 全部程序状态（JSON 快照） |
+| `GET /api/programs` | 程序状态列表 |
+| `GET /api/programs/{name}` | 单个程序详情 |
+| `GET /api/programs/{name}/logs?stream=out\|err&tail=n` | 日志末尾 n 行（取自内存环形缓冲） |
+| `POST /api/programs/{name}/start\|stop\|restart` | 控制命令（经命令队列由守护循环执行；非法迁移返回 409，响应 `{"result": …}`） |
+
+WebSocket `/ws`（二进制帧 = 1 字节类型 + 载荷，最高位=zlib 压缩标记）：
+
+| 类型 | 载荷 | 说明 |
+|---|---|---|
+| 1 snapshot | MessagePack | 连接建立后立即下发的全量快照 |
+| 2 status | MessagePack（变更程序数组） | 状态增量事件 |
+| 3 log | 程序名 + 流向 + 原始 UTF-8 文本 | 日志分块（订阅后先补发 tail 再跟随） |
+| 4 heartbeat | — | 周期心跳 |
+| 5 error | JSON | 订阅失败等原因 |
+
+客户端向 `/ws` 发送 `{"action":"subscribe","program":"…","stream":"out\|err"}`
+（JSON 或 MessagePack 均可）订阅日志流。结构化消息与 REST JSON 由同一组
+serde 结构体派生，字段语义完全一致；体积敏感的 WS 通道用 MessagePack（实测
+约为 JSON 的 82–87%），日志文本以无转义的原始 UTF-8 承载。
+
+### 当前状态
+
+`frontend/` 目前是**最小占位骨架**（品牌侧栏 + 单路由占位页，展示 `/api/health`
+探活结果）。从模板项目带入的会话工作台代码已全部删除；控制台应提供的界面元素
+——左侧 app→进程两层导航、状态徽章、启停控制、日志查看等——定义在
+`openspec/specs/webui-ui`（经变更 `webui-docs-and-ui-scope` 固化），两层导航的
+第一层即 app-registry 的注册应用。服务端已按 `openspec/specs/webui-api`
+（变更 `webui-api`）实现：控制台 REST + WebSocket 实时推送，与控制面共享状态
+投影与命令队列；前端界面将在后续变更中按规格落地。
+
 ## 从 v0.1 迁移
 
 v0.1 单文件配置（`[daemon]` + `[[program]]`）在 `xkeeper add <旧文件>` 时被
