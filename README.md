@@ -226,23 +226,22 @@ v0.1 单文件配置（`[daemon]` + `[[program]]`）在 `xkeeper add <旧文件>
 
 ## 作为系统服务运行（守护 xkeeper 本身）
 
-Linux (systemd) `/etc/systemd/system/xkeeper.service`：
+Linux (systemd) 一条命令安装/卸载（需要 root）：
 
-```ini
-[Unit]
-Description=xkeeper process keeper
-After=network.target
-
-[Service]
-ExecStart=/usr/local/bin/xkeeper run
-Restart=always
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
+```bash
+sudo xkeeper service install            # 生成 /etc/systemd/system/xkeeper.service + daemon-reload + enable
+sudo xkeeper service install --now      # 安装后立即 start
+sudo xkeeper service uninstall          # stop + disable + 删除 unit + daemon-reload
 ```
 
-Windows (nssm)：
+可选参数：`-c <核心配置>`（写入 unit 的 ExecStart，缺省 `/etc/xkeeper.toml`）、
+`--name <unit>`（unit 名，默认 `xkeeper`）、`--user <name>`（服务运行用户）、
+`--force`（目标 unit 已存在且内容不同时覆盖）。重复安装内容一致时幂等跳过。
+`TimeoutStopSec` 按已注册程序的最大 `stop_timeout` 自动估算（2×最大值 + 10s，
+配置不可加载时 90s）；需要定制可直接修改生成后的 unit 文件再
+`systemctl daemon-reload`。
+
+Windows 暂不支持 `xkeeper service`（nssm 仍可用）：
 
 ```bat
 nssm install xkeeper D:\tools\xkeeper\xkeeper.exe
