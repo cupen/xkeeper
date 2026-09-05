@@ -5,6 +5,8 @@
 //! subcommands talk to the loopback HTTP API, and add/remove/list manage the
 //! app registry (app_dir links).
 
+mod api;
+mod assets;
 mod client;
 mod config;
 mod health;
@@ -14,6 +16,7 @@ mod pump;
 mod registry;
 mod server;
 mod supervisor;
+mod web;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -51,6 +54,12 @@ struct Cli {
 enum Cmd {
     /// Run the daemon in the foreground (default when no subcommand given)
     Run,
+    /// Run the daemon and serve the web console (API + embedded UI)
+    Webui {
+        /// Address for the console to listen on
+        #[arg(long, default_value = "127.0.0.1:9877")]
+        listen: String,
+    },
     /// Validate the core config + all registered apps, or one app file
     Validate {
         /// Optional path to a single app config file
@@ -148,7 +157,8 @@ fn core_path_of(cli: &Cli) -> PathBuf {
 fn dispatch(cli: &Cli) -> Result<()> {
     let core_path = core_path_of(cli);
     match &cli.cmd {
-        Some(Cmd::Run) | None => run_daemon(&core_path),
+        Some(Cmd::Run) | None => run_daemon(&core_path, None),
+        Some(Cmd::Webui { listen }) => run_daemon(&core_path, Some(listen.clone())),
         Some(Cmd::Validate { path }) => validate(&core_path, path.as_deref()),
         Some(Cmd::Status) => client_cmd(&core_path, |c| {
             let v = c.status()?;
@@ -361,7 +371,7 @@ fn validate(core_path: &Path, single: Option<&Path>) -> Result<()> {
 
 // -- daemon -----------------------------------------------------------------
 
-fn run_daemon(core_path: &Path) -> Result<()> {
+fn run_daemon(core_path: &Path, webui_listen: Option<String>) -> Result<()> {
     let (core, existed) = CoreConfig::load_or_default(core_path)
         .with_context(|| format!("failed to load core config {}", core_path.display()))?;
     if !existed {
@@ -413,6 +423,21 @@ fn run_daemon(core_path: &Path) -> Result<()> {
             .name("api-accept".into())
             .spawn(move || server::serve(sup2, listener))
             .context("failed to spawn api accept loop")?;
+    }
+
+    // Web console: SPA + WebSocket push on its own loopback port, sharing
+    // the supervisor with the control plane. Exits with the daemon.
+    if let Some(listen) = &webui_listen {
+        let sup2 = sup.clone();
+        let listen = listen.clone();
+        std::thread::Builder::new()
+            .name("webui".into())
+            .spawn(move || {
+                if let Err(e) = web::serve(sup2, &listen) {
+                    log::error!("webui server error: {e:#}");
+                }
+            })
+            .context("failed to spawn webui thread")?;
     }
 
     // Bootstrap the registry and enter the supervision loop.
