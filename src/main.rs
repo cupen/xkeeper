@@ -15,6 +15,7 @@ mod program;
 mod pump;
 mod registry;
 mod server;
+mod service;
 mod supervisor;
 mod web;
 
@@ -113,6 +114,36 @@ enum Cmd {
     Remove { name: String },
     /// List registered apps
     List,
+    /// Install/uninstall xkeeper as a system service (Linux systemd; root required)
+    Service {
+        #[command(subcommand)]
+        cmd: ServiceCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ServiceCmd {
+    /// Generate the systemd unit, daemon-reload and enable it
+    Install {
+        /// Also start the service right after installing
+        #[arg(long)]
+        now: bool,
+        /// Overwrite an existing unit whose content differs
+        #[arg(long)]
+        force: bool,
+        /// systemd unit name without the .service suffix
+        #[arg(long)]
+        name: Option<String>,
+        /// Run the service as this user (User= in the unit)
+        #[arg(long)]
+        user: Option<String>,
+    },
+    /// Stop, disable and remove the systemd unit
+    Uninstall {
+        /// systemd unit name without the .service suffix
+        #[arg(long)]
+        name: Option<String>,
+    },
 }
 
 fn main() {
@@ -254,6 +285,26 @@ fn dispatch(cli: &Cli) -> Result<()> {
             registry::remove(&core, &core_dir, name)?;
             println!("app[{name}] unregistered (deployment config kept)");
             sync_if_online(&core)?;
+            Ok(())
+        }
+        Some(Cmd::Service { cmd }) => {
+            let (action, name, user, force, now) = match cmd {
+                ServiceCmd::Install { now, force, name, user } => {
+                    ("install", name, user, *force, *now)
+                }
+                ServiceCmd::Uninstall { name } => ("uninstall", name, &None, false, false),
+            };
+            let opts = service::ServiceOptions {
+                unit_name: name.clone().unwrap_or_else(|| service::DEFAULT_UNIT_NAME.to_string()),
+                user: user.clone(),
+                force,
+                now,
+            };
+            if action == "install" {
+                service::install(&core_path, &opts)?;
+            } else {
+                service::uninstall(&core_path, &opts)?;
+            }
             Ok(())
         }
         Some(Cmd::List) => {
