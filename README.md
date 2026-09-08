@@ -149,18 +149,23 @@ Web 控制台（`xkeeper webui`）在同一守护进程内另开一个回环端�
 
 ### 技术栈
 
-`frontend/` 是一个 Vite + TypeScript + Lit 的 SPA：
+`webui/` 是一个 Vite + TypeScript + Lit 的 SPA：
 
 - **Lit 3**（Web Components / Shadow DOM）渲染全部界面，视图即自定义元素 `<xkeeper-*>`；
-- **Web Awesome** 提供 Web Components 基础控件，主题经 `frontend/src/styles/wa-overrides.css`
+- **Web Awesome** 提供 Web Components 基础控件，主题经 `webui/src/styles/wa-overrides.css`
   映射到仓库自己的 design tokens（`tokens.css`，indigo 品牌、暗色优先）；
 - **pnpm** 管理依赖，**vitest**（happy-dom/jsdom 环境）跑组件测试，TypeScript `strict` 模式；
 - 图标是零依赖的内联 SVG 集合（`src/components/icons.ts`），无字体/CDN 外链。
 
-前端产物经 **rust-embed** 编译进二进制：`cargo build` 时 `build.rs` 检查
-`frontend/` 输入是否比 `dist/` 新，需要时自动执行 `pnpm install` + `pnpm build`，
-然后把 `frontend/dist` 嵌入；`dist/` 本身**不提交**，全新 checkout 只要有 Rust +
-Node 工具链即可一次 `cargo build` 得到带完整 UI 的二进制。
+前端产物经 **rust-embed** 编译进二进制：`cargo build --release` 时 `build.rs` 检查
+`webui/` 输入是否比 `dist/` 新，需要时自动执行 `pnpm install` + `pnpm build`，
+然后把 `webui/dist` 嵌入；`dist/` 本身**不提交**，全新 checkout 只要有 Rust +
+Node 工具链即可一次 `cargo build --release` 得到带完整 UI 的二进制。
+
+**debug 构建默认跳过前端工具链**（不调 pnpm，Rust 调试迭代不被拖慢）：debug 下
+rust-embed 在运行时直接读取磁盘上的 `webui/dist`——手动 `pnpm build` 一次后，
+改前端再 `pnpm build` 即可，无需重新编译 Rust；`dist` 缺失时伺服占位页。
+需要 debug 下自动构建可设 `XKEEPER_WEBUI_BUILD=force`。
 
 ### 开发调试（pnpm dev）
 
@@ -172,13 +177,17 @@ Node 工具链即可一次 `cargo build` 得到带完整 UI 的二进制。
 cargo run -- webui                  # http://127.0.0.1:9877
 
 # 终端 B：前端热更新开发服务器
-cd frontend
+cd webui
 pnpm install
-pnpm dev                            # http://localhost:5273（代理 /api /health → 9877）
+pnpm dev                            # http://localhost:5273（代理 /api /health /ws → 9877）
 pnpm test                           # vitest 组件测试
 ```
 
-前端改完后 `pnpm build` 产出 `dist/`，再 `cargo build` 即把新 UI 嵌入二进制。
+`/ws` WebSocket 推送同样经 dev server 代理，dev 模式下实时状态与日志可用；
+代理目标可用 `XKEEPER_WEBUI_DEV_BACKEND` 覆盖（默认 `http://127.0.0.1:9877`）。
+
+前端改完后 `pnpm build` 产出 `dist/`，再 `cargo build --release` 即把新 UI 嵌入
+二进制（debug 构建则运行时直接读盘，无需重编）。
 
 ### 发布
 
@@ -188,9 +197,9 @@ cargo build --release
 ```
 
 - 发布产物是**单个二进制**：运行时不需要 Node、不需要静态文件目录。
-- 没有 Node 工具链时 `cargo build` 不会失败：build.rs 内嵌一个占位页并给出 warning。
-- 设置 `XKEEPER_FRONTEND_BUILD=skip` 可跳过前端构建（CI 无 Node 环境时），
-  直接使用磁盘上已有的 `frontend/dist/`。
+- 没有 Node 工具链时 `cargo build` 不会失败：build.rs 写入一个占位页并给出 warning。
+- 设置 `XKEEPER_WEBUI_BUILD=skip` 可跳过前端构建（CI 无 Node 环境时），
+  直接使用磁盘上已有的 `webui/dist/`；旧变量 `XKEEPER_FRONTEND_BUILD` 仍被兼容识别。
 
 ### Ansible 部署
 
@@ -231,7 +240,7 @@ serde 结构体派生，字段语义完全一致；体积敏感的 WS 通道用 
 
 ### 当前状态
 
-`frontend/` 目前是**最小占位骨架**（品牌侧栏 + 单路由占位页，展示 `/api/health`
+`webui/` 目前是**最小占位骨架**（品牌侧栏 + 单路由占位页，展示 `/api/health`
 探活结果）。从模板项目带入的会话工作台代码已全部删除；控制台应提供的界面元素
 ——左侧 app→进程两层导航、状态徽章、启停控制、日志查看等——定义在
 `openspec/specs/webui-ui`（经变更 `webui-docs-and-ui-scope` 固化），两层导航的

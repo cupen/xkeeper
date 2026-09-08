@@ -1,7 +1,8 @@
 //! Embedded frontend assets and SPA delivery.
 //!
-//! The built SPA (`frontend/dist`, built automatically by `build.rs` during
-//! `cargo build`) is compiled into the binary so a single `xkeeper` artifact
+//! The built SPA (`webui/dist`, built automatically by `build.rs` during
+//! `cargo build` for release; debug builds serve the on-disk dist) is
+//! compiled into the binary so a single `xkeeper` artifact
 //! ships the whole UI: `/assets/*` serves the content-hashed bundle files,
 //! and every page path falls back to the SPA entry document so client-side
 //! routes survive deep links and reloads.
@@ -12,7 +13,7 @@ use axum::response::{Html, IntoResponse, Response};
 use rust_embed::RustEmbed;
 
 #[derive(RustEmbed)]
-#[folder = "$CARGO_MANIFEST_DIR/frontend/dist"]
+#[folder = "$CARGO_MANIFEST_DIR/webui/dist"]
 struct FrontendAssets;
 
 fn lookup(path: &str) -> Option<Response> {

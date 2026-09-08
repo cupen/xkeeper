@@ -18,20 +18,21 @@ stdout/stderr 落盘、Ctrl+C / SIGTERM 优雅停机、Windows Job Object 清理
 - `src/web.rs` + `src/api.rs` — Web 控制台（`xkeeper webui`）：axum 伺服内嵌
   SPA + `/api/*`（复用控制面投影）+ `/ws` 推送（快照/增量/日志/心跳，
   MessagePack 二进制帧）；与控制面共享 `Supervisor` 与环形缓冲。
-- `src/assets.rs` — `rust-embed` 内嵌前端 `dist/`。
-- `frontend/` — Web 控制台前端（pnpm + Vite + TypeScript + Lit），编译后的
-  `dist/` 经 rust-embed 嵌入二进制；dist 不提交，fresh checkout 需先
-  `pnpm build`（build.rs 会在 `cargo build` 时自动构建，无 Node 时回退占位页）。
+- `src/assets.rs` — `rust-embed` 内嵌 webui `dist/`。
+- `webui/` — Web 控制台前端（pnpm + Vite + TypeScript + Lit），release 构建
+  后 `dist/` 经 rust-embed 嵌入二进制；dist 不提交。build.rs 在 release（或
+  `XKEEPER_WEBUI_BUILD=force`）时自动构建，debug 默认跳过前端工具链（rust-embed
+  运行时读盘，无 Node 时回退占位页）。
 
 ## Build & Run
 
 ```bash
 cargo build --release                  # 产物 target/release/xkeeper(.exe)
 
-cd frontend
+cd webui
 pnpm install
 pnpm exec tsc --noEmit && pnpm test && pnpm build   # 类型检查 + 测试 + 产出 dist/，之后 cargo build 重新嵌入
-pnpm dev                               # HMR dev server（:5273），代理 /api → 后端（:9877）
+pnpm dev                               # HMR dev server（:5273），代理 /api /health /ws → 后端（:9877）
 
 cargo run -- validate                  # 校验 core + 全部注册应用
 cargo run -- webui --listen 127.0.0.1:9877   # 守护 + Web 控制台

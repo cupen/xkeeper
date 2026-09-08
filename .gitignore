@@ -1,5 +1,5 @@
 /target
 /logs
-/frontend/node_modules
-/frontend/dist
+/webui/node_modules
+/webui/dist
 .ansible/.tmp/
