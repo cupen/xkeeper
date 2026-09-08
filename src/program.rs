@@ -65,6 +65,10 @@ pub struct ManagedProgram {
     /// program must not be auto-started again by dependency evaluation.
     user_stopped: bool,
     last_exit: Option<String>,
+    /// Numeric exit code of the last child, taken from `status.code()`.
+    /// The Display string is locale/toolchain-dependent ("exit code" vs
+    /// "exit status"), so restart decisions must not parse it.
+    last_code: Option<i32>,
     fatal_reason: Option<String>,
     pumps: Option<PumpSet>,
 }
@@ -88,6 +92,7 @@ impl ManagedProgram {
             unhealthy: false,
             user_stopped: false,
             last_exit: None,
+            last_code: None,
             fatal_reason: None,
             pumps: None,
         }
@@ -225,6 +230,7 @@ impl ManagedProgram {
                     let uptime = self.start_time.map(|t| t.elapsed()).unwrap_or_default();
                     self.finish_child(status);
                     self.total_exits += 1;
+                    self.last_code = status.code();
                     self.last_exit =
                         Some(format!("{status} after {:.1}s", uptime.as_secs_f64()));
                     self.handle_failed_start(now);
@@ -256,6 +262,7 @@ impl ManagedProgram {
                 if let Some(status) = status {
                     self.finish_child(status);
                     self.total_exits += 1;
+                    self.last_code = status.code();
                     let uptime = self.start_time.map(|t| t.elapsed()).unwrap_or_default();
                     self.last_exit = Some(format!("{status} after {:.1}s", uptime.as_secs_f64()));
                     info!(
@@ -324,13 +331,9 @@ impl ManagedProgram {
             RestartPolicy::Never => false,
             RestartPolicy::Always => true,
             RestartPolicy::OnFailure => {
-                let code = self.last_exit.as_deref().and_then(|s| {
-                    // "exit code: N" is the std formatting for numeric exits
-                    s.split("exit code: ").nth(1).and_then(|r| {
-                        r.split(|c: char| !c.is_ascii_digit()).next()?.parse::<i32>().ok()
-                    })
-                });
-                !matches!(code, Some(c) if self.def.exit_codes.contains(&c))
+                // Exit was expected -> do not restart. Signals (code = None)
+                // count as failures.
+                !matches!(self.last_code, Some(c) if self.def.exit_codes.contains(&c))
             }
         };
         if !restart {
@@ -499,7 +502,8 @@ mod tests {
 
     fn fast_exit(overrides: &str) -> String {
         format!(
-            "[program.t]\ncommand = \"{}\"\nstartsecs = 0.05\nrestart_backoff = 0.05\nmax_restart_backoff = 0.05\nbackoff_reset_after = 3600\n{}",
+            // TOML literal string ('') so the inner double quotes need no escaping
+            "[program.t]\ncommand = '{}'\nstartsecs = 0.05\nrestart_backoff = 0.05\nmax_restart_backoff = 0.05\nbackoff_reset_after = 3600\n{}",
             if cfg!(windows) { "cmd /c exit 3" } else { "sh -c \"exit 3\"" },
             overrides
         )
