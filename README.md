@@ -145,6 +145,29 @@ CLI 退出码：`0` 成功、`1` 一般错误、`2` 配置错误、`3` 守护进
 Web 控制台（`xkeeper webui`）在同一守护进程内另开一个回环端口，伺服内嵌 UI、
 `/api/*` 查询与 `/ws` WebSocket 推送——状态投影与本控制面完全一致（见下文 Web UI）。
 
+### 交互式 shell（`xkeeper shell`）
+
+supervisorctl 风格的终端入口，经控制面 API 与守护进程通信（纯客户端，不改变守护行为）：
+
+```bash
+xkeeper shell                        # 进入 REPL（行编辑 + 历史，Ctrl+C 中断当前行，exit/quit 离开）
+xkeeper shell -c "status"            # 单命令模式：执行一条后退出（脚本友好，退出码同 CLI 约定）
+```
+
+内置命令：`status`（对齐表格：NAME/APP/STATE/PID/RESTARTS/UNHEALTHY）、
+`start|stop|restart <name>`、`pid <name>`、`log <name> [-f] [--tail N] [--stream out|err]`、
+`reload`、`shutdown`、`open`（用系统浏览器打开 webui 控制台）、`help`/`?`、`exit`/`quit`。
+
+### 一键打开控制台（`xkeeper system webui`）
+
+```bash
+xkeeper system webui                 # 守护离线 → 后台拉起 xkeeper webui → 浏览器打开 http://127.0.0.1:9877
+xkeeper system webui http://127.0.0.1:12345   # 指定控制台地址
+```
+
+守护已在跑时不改动它的生命周期：webui 可达则直接开浏览器，不可达则提示用
+`xkeeper webui` 启动（退出码 1）。拉起失败（如端口被占用）同样归入退出码 1。
+
 ## Web UI
 
 ### 技术栈

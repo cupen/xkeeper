@@ -1,6 +1,6 @@
 # xkeeper core config sample — global settings only.
 # Default locations: Linux /etc/xkeeper.toml, Windows %APPDATA%\xkeeper\xkeeper.toml
-# Override with: xkeeper -c <path> run
+# Override with: xkeeper --config <path> run
 # The file may be absent entirely; xkeeper then runs empty with these defaults.
 
 [daemon]

@@ -16,6 +16,7 @@ mod pump;
 mod registry;
 mod server;
 mod service;
+mod shell;
 mod supervisor;
 mod web;
 
@@ -44,7 +45,8 @@ const EXIT_CONFIG: i32 = 2;
 struct Cli {
     /// Path to the core config file. Defaults to the platform location
     /// (/etc/xkeeper.toml on Linux, %APPDATA%\xkeeper\xkeeper.toml on Windows).
-    #[arg(short, long, global = true)]
+    /// Long option only: `-c` belongs to `xkeeper shell -c <cmd>`.
+    #[arg(long, global = true)]
     config: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -114,10 +116,30 @@ enum Cmd {
     Remove { name: String },
     /// List registered apps
     List,
+    /// Interactive shell client (like supervisorctl)
+    Shell {
+        /// Execute a single shell command and exit (script-friendly)
+        #[arg(short = 'c')]
+        cmd: Option<String>,
+    },
+    /// Local helper commands not needing a running daemon
+    System {
+        #[command(subcommand)]
+        cmd: SystemCmd,
+    },
     /// Install/uninstall xkeeper as a system service (Linux systemd; root required)
     Service {
         #[command(subcommand)]
         cmd: ServiceCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SystemCmd {
+    /// Open the web console in the system browser, starting the daemon if needed
+    Webui {
+        /// Console URL (default: the webui listen address, 127.0.0.1:9877)
+        url: Option<String>,
     },
 }
 
@@ -159,7 +181,7 @@ fn main() {
 }
 
 /// Platform default location for the core config.
-fn default_core_path() -> PathBuf {
+pub(crate) fn default_core_path() -> PathBuf {
     #[cfg(unix)]
     {
         PathBuf::from("/etc/xkeeper.toml")
@@ -287,6 +309,10 @@ fn dispatch(cli: &Cli) -> Result<()> {
             sync_if_online(&core)?;
             Ok(())
         }
+        Some(Cmd::Shell { cmd }) => shell::run(&core_path, cmd.as_deref()),
+        Some(Cmd::System { cmd }) => match cmd {
+            SystemCmd::Webui { url } => shell::system_webui(url.as_deref()),
+        },
         Some(Cmd::Service { cmd }) => {
             let (action, name, user, force, now) = match cmd {
                 ServiceCmd::Install { now, force, name, user } => {
