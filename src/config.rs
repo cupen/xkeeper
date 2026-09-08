@@ -105,6 +105,22 @@ pub struct CoreConfig {
     pub app_default: Option<AppDefaults>,
 }
 
+/// Built-in rotation defaults: 50MB per file, 2 rotated files kept
+/// (3 files on disk per stream including the live one).
+const DEFAULT_LOG_MAX_SIZE: u64 = 50 * 1024 * 1024;
+const DEFAULT_LOG_ROTATE_KEEP: u32 = 2;
+
+/// Fixed absolute default so the log location never depends on where the
+/// core config lives. `/tmp` is volatile by design (see README); pin an
+/// absolute `log_dir` (e.g. `/var/log/xkeeper`) for logs that survive reboots.
+fn default_log_dir() -> PathBuf {
+    if cfg!(windows) {
+        std::env::temp_dir().join("xkeeper").join("logs")
+    } else {
+        PathBuf::from("/tmp/xkeeper/logs")
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DaemonConfig {
@@ -122,7 +138,7 @@ impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             log_level: "info".into(),
-            log_dir: PathBuf::from("logs"),
+            log_dir: default_log_dir(),
             monitor_interval: 1.0,
             host: "127.0.0.1".into(),
             port: 7310,
@@ -163,6 +179,11 @@ impl CoreConfig {
         }
         if d.log_dir.as_os_str().is_empty() {
             errors.push("daemon.log_dir: must not be empty".to_string());
+        } else if !d.log_dir.is_absolute() {
+            errors.push(format!(
+                "daemon.log_dir: {:?} must be an absolute path (e.g. log_dir = \"/var/log/xkeeper\")",
+                d.log_dir
+            ));
         }
         if d.monitor_interval <= 0.0 || d.monitor_interval > 60.0 {
             errors.push(format!(
@@ -502,11 +523,17 @@ pub fn resolve_program(
         .or(defaults.and_then(|d| d.log_max_size.clone()))
         .map(|s| parse_size(&s))
         .transpose()?;
+    // Rotation is on by default; "0" is the explicit opt-out (max_size None).
+    let log_max_size = match log_max_size {
+        Some(0) => None,
+        Some(n) => Some(n),
+        None => Some(DEFAULT_LOG_MAX_SIZE),
+    };
     let log_rotate_keep = raw
         .log_rotate_keep
         .or(meta.as_ref().and_then(|m| m.log_rotate_keep))
         .or(defaults.and_then(|d| d.log_rotate_keep))
-        .unwrap_or(5);
+        .unwrap_or(DEFAULT_LOG_ROTATE_KEEP);
 
     if restart_backoff <= 0.0 {
         bail!("program[{prog_name}]: restart_backoff must be > 0");
@@ -853,7 +880,40 @@ mod tests {
         assert_eq!(p.work_dir, PathBuf::from("/opt/demo"));
         assert_eq!(p.autorestart, RestartPolicy::Always);
         assert_eq!(p.restart_backoff, 1.0);
-        assert_eq!(p.log_max_size, None);
+        assert_eq!(p.log_max_size, Some(50 * 1024 * 1024)); // built-in default
+        assert_eq!(p.log_rotate_keep, 2); // built-in default
+    }
+
+    #[test]
+    fn log_rotation_defaults_and_opt_out() {
+        let a = app_of("[program.a]\ncommand=\"x\"\nlog_max_size = \"0\"\n").unwrap();
+        assert_eq!(a.programs[0].log_max_size, None); // "0" disables rotation
+        let b = app_of(
+            "[program.a]\ncommand=\"x\"\nlog_max_size = \"10MB\"\nlog_rotate_keep = 3\n",
+        )
+        .unwrap();
+        assert_eq!(b.programs[0].log_max_size, Some(10 * 1024 * 1024));
+        assert_eq!(b.programs[0].log_rotate_keep, 3);
+    }
+
+    #[test]
+    fn default_log_dir_is_absolute() {
+        let d = DaemonConfig::default();
+        assert!(d.log_dir.is_absolute());
+        #[cfg(unix)]
+        assert_eq!(d.log_dir, PathBuf::from("/tmp/xkeeper/logs"));
+    }
+
+    #[test]
+    fn core_rejects_relative_or_empty_log_dir() {
+        let rel: CoreConfig = toml::from_str("[daemon]\nlog_dir = \"logs\"\n").unwrap();
+        let err = rel.validate().unwrap_err().to_string();
+        assert!(err.contains("daemon.log_dir"), "error must name the field: {err}");
+        assert!(err.contains("absolute"), "error must state the rule: {err}");
+        let empty: CoreConfig = toml::from_str("[daemon]\nlog_dir = \"\"\n").unwrap();
+        assert!(empty.validate().is_err());
+        let ok: CoreConfig = toml::from_str("[daemon]\nlog_dir = \"/var/log/xkeeper\"\n").unwrap();
+        ok.validate().unwrap();
     }
 
     #[test]

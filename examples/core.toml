@@ -5,7 +5,7 @@
 
 [daemon]
 log_level = "info"          # trace|debug|info|warn|error
-log_dir = "logs"            # relative to this file's directory
+log_dir = "/tmp/xkeeper/logs" # absolute path required; /tmp is volatile — use e.g. /var/log/xkeeper for logs that survive reboots
 monitor_interval = 1.0      # supervision tick (seconds)
 host = "127.0.0.1"          # control API bind address (loopback by default)
 port = 7310                 # control API port

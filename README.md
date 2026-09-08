@@ -64,7 +64,7 @@ core（`examples/core.toml`）：
 ```toml
 [daemon]
 log_level = "info"
-log_dir = "logs"
+log_dir = "/var/log/xkeeper" # 可选；缺省 /tmp/xkeeper/logs，必须为绝对路径
 monitor_interval = 1.0
 host = "127.0.0.1"          # 控制平面仅回环
 port = 7310
@@ -93,12 +93,26 @@ startsecs = 1.0             # 存活超过此时长才算启动成功（预算 s
 stop_timeout = 10
 exit_codes = [0]            # on-failure 的"期望退出码"
 depends_on = ["db.main"]    # 可跨应用引用；成环在注册期拒绝
-log_max_size = "10MB"       # 日志按大小轮转，保留 log_rotate_keep 份
-log_rotate_keep = 5
+log_max_size = "10MB"       # 可选；缺省 50MB，"0" 显式禁用轮转
+log_rotate_keep = 2          # 可选；缺省保留 2 份轮转文件
 health_check = "http://127.0.0.1:8000/health"   # http(s):// | tcp://host:port | exec 命令行
 health_interval = 10        # 健康连续失败 health_retries 次 -> unhealthy
 restart_on_unhealthy = true # unhealthy 触发与崩溃一致的重启
 ```
+
+## 日志
+
+未配置 `daemon.log_dir` 时，日志固定写入 `/tmp/xkeeper/logs`，且 `log_dir`
+必须是绝对路径。每个程序的 stdout 与 stderr 分别按大小轮转：缺省单文件
+`50MB`，保留 2 个轮转文件（当前文件加 `.1`、`.2`，每流最多 3 个文件）。设置
+`log_max_size = "0"` 可禁用该程序的轮转。
+
+`/tmp` 可能是 tmpfs，或被系统的临时文件清理机制删除；需要跨重启保留日志时，
+请显式配置绝对目录，例如 `/var/log/xkeeper`。多实例部署也应使用不同的绝对目录。
+
+升级前依赖默认相对 `logs` 目录的部署，新日志会改写到 `/tmp/xkeeper/logs`，旧日志
+仍留在 `<core 配置目录>/logs`，不会自动迁移。已有 `log_dir = "logs"` 等相对路径
+配置会被拒绝启动，需改为绝对路径。
 
 ## 状态机与重启语义
 
