@@ -1,0 +1,9 @@
+---
+# 仅当部署前 unit 已存在（覆盖既有安装）且本轮文件发生变化时重启；
+# 全新部署由 service install --now 完成首次启动，不额外重启。
+- name: Restart xkeeper service
+  ansible.builtin.systemd:
+    name: "{{ xkeeper_service_name }}"
+    state: restarted
+    enabled: true
+  when: xk_unit_pre.stat.exists

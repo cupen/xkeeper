@@ -1,0 +1,52 @@
+---
+# 护栏通过后的安装流程：目录 → 分发二进制 → 装核心配置 → service install
+# → 验证。文件变化经 handler 触发服务重启（仅覆盖既有安装时生效）。
+
+- name: Ensure destination directories exist
+  ansible.builtin.file:
+    path: "{{ item | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - "{{ xkeeper_binary_dest }}"
+    - "{{ xkeeper_config_dest }}"
+
+- name: Distribute xkeeper binary
+  ansible.builtin.copy:
+    src: "{{ xk_binary_effective_src }}"
+    dest: "{{ xkeeper_binary_dest }}"
+    owner: root
+    group: root
+    mode: "0755"
+  notify: Restart xkeeper service
+
+- name: Install core config
+  ansible.builtin.copy:
+    src: "{{ xkeeper_config_src }}"
+    dest: "{{ xkeeper_config_dest }}"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart xkeeper service
+
+- name: Build service install argument list
+  ansible.builtin.set_fact:
+    xk_service_install_argv: >-
+      {{ [xkeeper_binary_dest, 'service', 'install', '--now', '--name', xkeeper_service_name]
+         + (['--force'] if (xkeeper_force_overwrite | bool and xk_traces | length > 0) else [])
+         + (['--user', xkeeper_service_user] if xkeeper_service_user | length > 0 else []) }}
+
+- name: Register and start xkeeper service
+  ansible.builtin.command:
+    argv: "{{ xk_service_install_argv }}"
+  changed_when: not xk_unit_pre.stat.exists
+
+- name: Verify service is running
+  ansible.builtin.command: "systemctl is-active {{ xkeeper_service_name }}"
+  register: xk_active_post
+  changed_when: false
+  failed_when: xk_active_post.rc != 0
+  # check 模式不会真正注册服务，无从验证
+  when: not ansible_check_mode

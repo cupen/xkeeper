@@ -2,4 +2,4 @@
 /logs
 /frontend/node_modules
 /frontend/dist
-deploy/ansible/.tmp/
+.ansible/.tmp/

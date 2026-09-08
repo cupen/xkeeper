@@ -6,7 +6,7 @@
 
 ### Requirement: playbook 分发二进制并注册服务
 
-`deploy/ansible/site.yml` SHALL 在每台目标机上完成：将 xkeeper 二进制分发到目标路径、安装核心配置到目标机、执行 `xkeeper service install --now` 注册 systemd 服务并启动。二进制来源 MUST 支持两种变量指定方式：控制机上的本地文件路径，或可下载的 URL。核心配置 MUST 由变量指定控制机上的本地文件路径，复制到目标机的平台默认核心配置路径。
+`xkeeper` Ansible role（`.ansible/roles/xkeeper`，本机入口 `.ansible/site.yml`）SHALL 在每台目标机上完成：将 xkeeper 二进制分发到目标路径、安装核心配置到目标机、执行 `xkeeper service install --now` 注册 systemd 服务并启动。二进制来源 MUST 支持两种变量指定方式：控制机上的本地文件路径，或可下载的 URL。核心配置 MUST 由变量指定控制机上的本地文件路径，复制到目标机的平台默认核心配置路径。
 
 #### Scenario: 部署到全新主机
 
@@ -60,16 +60,16 @@ playbook 在对目标机做任何变更（写文件、注册服务、重启、�
 - **WHEN** playbook 首次部署成功后原样重跑第二次
 - **THEN** 第二次执行成功退出，服务保持运行未被重启，文件内容未变
 
-### Requirement: 本地 inventory 样例
+### Requirement: 免 inventory 本机部署
 
-仓库 SHALL 提供 `inventory/localhost.yml` 本地单机 inventory 样例（`ansible_connection=local`），可直接用于本机冒烟测试，并作为用户编写自有 inventory 的参考；该样例 MUST 与 playbook 的变量约定保持一致，附带的说明文档 MUST 给出最少可用变量组合。
+仓库 SHALL 提供开箱即用的本机部署入口：`.ansible/ansible.cfg` 内置隐式 localhost，`.ansible/site.yml` 以 `connection: local` 调用 `xkeeper` role，用户无需编写 inventory 即可在控制机本机完成部署与冒烟测试；role 本身 MUST 不绑定 hosts 与连接方式，用户编写自有 inventory 后无需修改 role 即可扩展到多主机。附带的说明文档 MUST 给出最少可用变量组合。
 
-#### Scenario: 用本地样例做冒烟测试
+#### Scenario: 免 inventory 本机冒烟测试
 
-- **WHEN** 用户按说明文档准备二进制与核心配置后，使用本地 inventory 样例执行 playbook
-- **THEN** 本机完成部署且服务注册成功，全程无需修改 playbook
+- **WHEN** 用户按说明文档准备二进制与核心配置后，在 `.ansible/` 下直接执行 `ansible-playbook site.yml`
+- **THEN** 本机完成部署且服务注册成功，全程无需编写或修改 inventory
 
-#### Scenario: 用户照参考编写自有 inventory
+#### Scenario: 扩展到多主机
 
-- **WHEN** 用户复制本地样例结构，把连接信息改为主机清单并填入变量
-- **THEN** playbook 无需改动即可对该清单执行
+- **WHEN** 用户编写自有 inventory（远程主机 + 连接信息）并以 `-i` 传入
+- **THEN** role 无需改动即可对该清单执行

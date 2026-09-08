@@ -19,16 +19,24 @@
 
 ## Decisions
 
-### 1. 目录与文件布局
+### 1. 目录与文件布局（role 化）
 
 ```
-deploy/ansible/
-  site.yml                  # 唯一 playbook
-  inventory/localhost.yml   # 本地样例（连接=local）
-  README.md                 # 变量表 + 用法 + 自定义 inventory 指引
+.ansible/
+  ansible.cfg              # 隐式 localhost inventory，免 inventory 即用
+  site.yml                 # 本机部署入口 playbook（hosts: localhost + connection: local）
+  roles/xkeeper/
+    defaults/main.yml      # 变量缺省
+    tasks/main.yml         # 入口：断言 → 控制机源准备 → 护栏 → 安装 → 清理
+    tasks/guard.yml        # 既有安装只读预检 + 幂等命中判定
+    tasks/install.yml      # 分发二进制/配置 + service install + 验证
+    handlers/main.yml      # 覆盖部署时按需重启
+  README.md                # 变量表 + 用法 + 自定义 playbook/inventory 指引
 ```
 
-备选：`ansible/` 放仓库根。选 `deploy/ansible/` 是给未来其他部署形态（compose、k8s manifest）留位。
+部署逻辑全部下沉到 `xkeeper` role（不绑定 hosts 与连接方式），`site.yml` 只做
+本机入口。选 `.ansible/`（而非 `deploy/ansible/`）是应用户偏好：隐藏目录表达
+"部署工具而非业务代码"，且与本仓库 `.agents/`、`.openspec` 等点目录风格一致。
 
 ### 2. 变量约定（全部带安全缺省）
 
@@ -44,9 +52,9 @@ deploy/ansible/
 
 备选：二进制来源拆成两个变量（`src` + `is_url` 布尔）。拒绝之——`copy`（本地路径存在）与 `get_url`（字符串可解析为 URL）按值形态自动分派，少一个易错的开关变量。
 
-### 3. 预检用 `pre_tasks` + `block`，不做变更前置
+### 3. 预检在安装前执行（`guard.yml`），不做变更前置
 
-预检放在 `pre_tasks`，全部为只读命令（`stat`、`systemctl is-active`、`test -f`），命中任意痕迹即 `fail`。关键点：
+预检任务（`tasks/guard.yml`，在安装 include 之前执行）全部为只读命令（`stat`、`systemctl is-active`），命中任意痕迹即 `fail`。关键点：
 
 - 检测项四条：同名 unit 文件存在（`/etc/systemd/system/<name>.service`）、`systemctl is-active` 非 inactive、`xkeeper_binary_dest` 已存在、`xkeeper_config_dest` 已存在。unit 名按 `xkeeper_service_name` 动态拼，用户自定义 unit 名也能被查到。
 - 失败信息拼出具体痕迹列表 + 提示 `xkeeper_force_overwrite: true` 可绕过。`any_errors_fatal: true` 防止多机场景下部分机继续跑。
@@ -65,21 +73,12 @@ deploy/ansible/
 
 备选：Ansible 原生 `ansible.builtin.systemd` + 自己维护 unit 模板。能力重复且双源漂移，拒绝。
 
-### 6. 本地 inventory 样例即参考模板
+### 6. 免 inventory 本机部署
 
-`inventory/localhost.yml` 用 INI 或 YAML 均可，选 YAML（用户扩展到多机组更自然）：
-
-```yaml
-all:
-  hosts:
-    xkeeper-local:
-      ansible_host: 127.0.0.1
-      ansible_connection: local
-      xkeeper_binary_src: ./dist/xkeeper
-      xkeeper_config_src: ./conf/xkeeper.toml
-```
-
-`ansible_connection: local` 免 SSH，本地冒烟零配置。README 给出"复制此文件改连接信息"的最短路径。
+`ansible.cfg` 设 `inventory = localhost,`（隐式单机清单），`site.yml` play 显式
+`connection: local`——`cd .ansible && ansible-playbook site.yml` 零配置冒烟。
+role 内部不写死连接方式；用户扩展多主机时编写自有 inventory、在调用 playbook
+里去掉 `connection: local` 即可，role 无需改动。
 
 ## Risks / Trade-offs
 
@@ -90,7 +89,7 @@ all:
 
 ## Migration Plan
 
-纯新增目录，无存量迁移。回滚 = 删除 `deploy/ansible/`。目标机卸载走既有 `xkeeper service uninstall`，playbook 不提供 destroy 编排（避免"一键删生产"类风险，与本次护栏主题一致）。
+纯新增目录，无存量迁移。回滚 = 删除 `.ansible/`。目标机卸载走既有 `xkeeper service uninstall`，playbook 不提供 destroy 编排（避免"一键删生产"类风险，与本次护栏主题一致）。
 
 ## Open Questions
 

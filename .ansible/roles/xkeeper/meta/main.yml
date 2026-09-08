@@ -1,0 +1,13 @@
+---
+galaxy_info:
+  author: xkeeper
+  description: Deploy the xkeeper process keeper binary and register it as a systemd service
+  license: MIT
+  min_ansible_version: "2.12"
+  platforms:
+    - name: Archlinux
+    - name: Debian
+    - name: Ubuntu
+    - name: EL
+
+dependencies: []

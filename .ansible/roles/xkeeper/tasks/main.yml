@@ -1,0 +1,78 @@
+---
+# role 入口：断言必填变量 → 控制机侧源准备（URL 暂存/本地 stat）→
+# 目标机护栏预检（guard.yml，只读）→ 安装注册（install.yml）→ 收尾清理。
+
+- name: Assert required variables are set
+  ansible.builtin.assert:
+    that:
+      - xkeeper_binary_src is defined and xkeeper_binary_src | length > 0
+      - xkeeper_config_src is defined and xkeeper_config_src | length > 0
+    fail_msg: >-
+      必填变量缺失：xkeeper_binary_src（二进制路径或 URL）与
+      xkeeper_config_src（核心配置文件路径）必须由 extra-vars 或调用方提供。
+
+- name: Classify binary source (URL or local path)
+  ansible.builtin.set_fact:
+    xk_binary_is_url: "{{ xkeeper_binary_src is string and xkeeper_binary_src | lower is match('https?://') }}"
+
+# ---- 控制机侧：解析源文件与 checksum（不触碰目标机） ----
+- name: Prepare controller staging directory
+  ansible.builtin.file:
+    path: "{{ xkeeper_staging_dir }}"
+    state: directory
+    mode: "0755"
+  when: xk_binary_is_url | bool
+  delegate_to: localhost
+  become: false
+
+- name: Stage binary from URL on controller
+  ansible.builtin.get_url:
+    url: "{{ xkeeper_binary_src }}"
+    dest: "{{ xkeeper_staging_dir }}/xkeeper-staged-{{ inventory_hostname }}"
+    mode: "0755"
+    checksum: "{{ ('sha256:' ~ xkeeper_binary_checksum) if xkeeper_binary_checksum | length > 0 else omit }}"
+  register: xk_stage_binary
+  when: xk_binary_is_url | bool
+  delegate_to: localhost
+  become: false
+
+- name: Resolve effective binary source path
+  ansible.builtin.set_fact:
+    xk_binary_effective_src: "{{ xk_stage_binary.dest if xk_binary_is_url | bool else xkeeper_binary_src }}"
+
+- name: Stat binary source on controller
+  ansible.builtin.stat:
+    path: "{{ xk_binary_effective_src }}"
+    get_checksum: true
+  register: xk_src_binary
+  delegate_to: localhost
+  become: false
+  failed_when: not xk_src_binary.stat.exists
+
+- name: Stat config source on controller
+  ansible.builtin.stat:
+    path: "{{ xkeeper_config_src }}"
+    get_checksum: true
+  register: xk_src_config
+  delegate_to: localhost
+  become: false
+  failed_when: not xk_src_config.stat.exists
+
+# ---- 目标机侧：护栏预检（只读），通过后才进入安装 ----
+- name: Run existing-install guard (read-only preflight)
+  ansible.builtin.include_tasks: guard.yml
+
+- name: Skip host on idempotent hit (no changes will be made)
+  ansible.builtin.meta: end_host
+  when: xk_idempotent_hit | bool
+
+- name: Install xkeeper (binary, config, service)
+  ansible.builtin.include_tasks: install.yml
+
+- name: Clean up controller staging directory
+  ansible.builtin.file:
+    path: "{{ xkeeper_staging_dir }}"
+    state: absent
+  when: xk_binary_is_url | bool
+  delegate_to: localhost
+  become: false
