@@ -19,5 +19,5 @@
 ## 4. 文档与整体验证
 
 - [x] 4.1 更新 README："作为系统服务运行" 改为 `xkeeper service install` / `uninstall` 用法，保留手工 unit 为备选；配置参考补充 `service` 命令说明。验证：README 阅读自查，命令与 `--help` 输出一致
-- [ ] 4.2 Linux 环境端到端手动验证：root 下 `xkeeper service install --now` → `systemctl status xkeeper` running、`systemctl is-enabled xkeeper` enabled → 杀掉 xkeeper 进程被 systemd 拉起 → `xkeeper service uninstall` 清理干净。验证：按上述步骤逐条确认并在 PR 描述附输出
+- [x] 4.2 Linux 环境端到端手动验证：root 下 `xkeeper service install --now` → `systemctl status xkeeper` running、`systemctl is-enabled xkeeper` enabled → 杀掉 xkeeper 进程被 systemd 拉起 → `xkeeper service uninstall` 清理干净。验证：按上述步骤逐条确认并在 PR 描述附输出
 - [x] 4.3 `cargo test` 全量通过、`cargo clippy` 无新警告。验证：CI/本地输出
