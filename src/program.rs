@@ -108,8 +108,7 @@ impl ManagedProgram {
     }
 
     pub fn is_running(&self) -> bool {
-        matches!(self.state, ProgramState::Running | ProgramState::Starting)
-            && self.child.is_some()
+        matches!(self.state, ProgramState::Running | ProgramState::Starting) && self.child.is_some()
     }
 
     pub fn pid(&self) -> Option<u32> {
@@ -137,11 +136,15 @@ impl ManagedProgram {
         self.fatal_reason.as_deref()
     }
 
-    pub fn wait_reason(&self) -> Option<String> {        if !self.def.depends_on.is_empty()
+    pub fn wait_reason(&self) -> Option<String> {
+        if !self.def.depends_on.is_empty()
             && self.state == ProgramState::Stopped
             && !self.user_stopped
         {
-            Some(format!("waiting for dependencies: {}", self.def.depends_on.join(", ")))
+            Some(format!(
+                "waiting for dependencies: {}",
+                self.def.depends_on.join(", ")
+            ))
         } else {
             None
         }
@@ -153,6 +156,14 @@ impl ManagedProgram {
         match stream {
             Stream::Out => self.out_ring.clone(),
             Stream::Err => self.err_ring.clone(),
+        }
+    }
+
+    /// Current per-stream log line rates for the status projection.
+    pub fn log_rates(&self) -> crate::metrics::LogRates {
+        crate::metrics::LogRates {
+            out: crate::metrics::StreamRate::of(self.out_ring.rate()),
+            err: crate::metrics::StreamRate::of(self.err_ring.rate()),
         }
     }
 
@@ -184,6 +195,9 @@ impl ManagedProgram {
             Ok(mut child) => {
                 let pid = child.id();
                 self.job = platform::JobHandle::attach(&child);
+                // New process: the previous one's log rates must not carry over.
+                self.out_ring.reset_rate();
+                self.err_ring.reset_rate();
                 let out = child.stdout.take().expect("stdout was piped");
                 let err = child.stderr.take().expect("stderr was piped");
                 self.pumps = Some(pump::start(
@@ -202,7 +216,10 @@ impl ManagedProgram {
                 info!("program[{name}] starting (pid {pid})");
             }
             Err(e) => {
-                error!("program[{name}] failed to start {:?}: {e}", self.def.command);
+                error!(
+                    "program[{name}] failed to start {:?}: {e}",
+                    self.def.command
+                );
                 self.last_exit = Some(format!("spawn error: {e}"));
                 self.total_exits += 1;
                 self.handle_failed_start(Instant::now());
@@ -231,8 +248,7 @@ impl ManagedProgram {
                     self.finish_child(status);
                     self.total_exits += 1;
                     self.last_code = status.code();
-                    self.last_exit =
-                        Some(format!("{status} after {:.1}s", uptime.as_secs_f64()));
+                    self.last_exit = Some(format!("{status} after {:.1}s", uptime.as_secs_f64()));
                     self.handle_failed_start(now);
                 } else if self
                     .start_time
@@ -243,8 +259,10 @@ impl ManagedProgram {
                     self.state = ProgramState::Running;
                     self.start_failures = 0;
                     self.unhealthy = false;
-                    debug!("program[{}] is now running (stable for {:.1}s)",
-                        self.def.name, self.def.startsecs);
+                    debug!(
+                        "program[{}] is now running (stable for {:.1}s)",
+                        self.def.name, self.def.startsecs
+                    );
                 }
             }
             ProgramState::Running => {
@@ -346,10 +364,7 @@ impl ManagedProgram {
         }
         if self.def.max_restarts > 0 && self.restarts_done >= self.def.max_restarts {
             self.state = ProgramState::Fatal;
-            self.fatal_reason = Some(format!(
-                "exceeded max_restarts ({})",
-                self.def.max_restarts
-            ));
+            self.fatal_reason = Some(format!("exceeded max_restarts ({})", self.def.max_restarts));
             error!(
                 "program[{}] entering FATAL state: {}",
                 self.def.name,
@@ -481,7 +496,7 @@ mod tests {
     use std::path::Path;
     use std::thread;
 
-    use crate::config::{resolve_app, AppRaw};
+    use crate::config::{AppRaw, resolve_app};
 
     fn resolved(toml_text: &str) -> ResolvedProgram {
         let raw: AppRaw = toml::from_str(toml_text).unwrap();
@@ -504,7 +519,11 @@ mod tests {
         format!(
             // TOML literal string ('') so the inner double quotes need no escaping
             "[program.t]\ncommand = '{}'\nstartsecs = 0.05\nrestart_backoff = 0.05\nmax_restart_backoff = 0.05\nbackoff_reset_after = 3600\n{}",
-            if cfg!(windows) { "cmd /c exit 3" } else { "sh -c \"exit 3\"" },
+            if cfg!(windows) {
+                "cmd /c exit 3"
+            } else {
+                "sh -c \"exit 3\""
+            },
             overrides
         )
     }
@@ -514,7 +533,11 @@ mod tests {
     fn slow_exit(overrides: &str) -> String {
         format!(
             "[program.t]\ncommand = \"{}\"\nstartsecs = 0.2\nrestart_backoff = 0.05\nmax_restart_backoff = 0.05\nbackoff_reset_after = 3600\n{}",
-            if cfg!(windows) { "ping -n 2 127.0.0.1" } else { "sleep 1" },
+            if cfg!(windows) {
+                "ping -n 2 127.0.0.1"
+            } else {
+                "sleep 1"
+            },
             overrides
         )
     }
@@ -532,9 +555,15 @@ mod tests {
     fn restarts_and_reaches_stable_running() {
         let mut p = make(&slow_exit(""), "restart");
         p.spawn();
-        drive(&mut p, |p| p.total_exits() >= 2 && p.state() == ProgramState::Running);
+        drive(&mut p, |p| {
+            p.total_exits() >= 2 && p.state() == ProgramState::Running
+        });
         assert_eq!(p.state(), ProgramState::Running);
-        assert!(p.total_exits() >= 2, "expected restarts, exits={}", p.total_exits());
+        assert!(
+            p.total_exits() >= 2,
+            "expected restarts, exits={}",
+            p.total_exits()
+        );
         p.stop();
         let _ = std::fs::remove_dir_all(p.log_dir.clone());
     }
@@ -569,7 +598,11 @@ mod tests {
         let mut p = make(
             &format!(
                 "[program.t]\ncommand = \"{}\"\nstartsecs = 0.2\n",
-                if cfg!(windows) { "ping -n 30 127.0.0.1" } else { "sleep 30" }
+                if cfg!(windows) {
+                    "ping -n 30 127.0.0.1"
+                } else {
+                    "sleep 30"
+                }
             ),
             "stop",
         );
@@ -578,7 +611,10 @@ mod tests {
         assert!(p.is_running());
         let t0 = Instant::now();
         p.stop();
-        assert!(t0.elapsed() < Duration::from_secs(5), "stop should be quick");
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "stop should be quick"
+        );
         assert_eq!(p.state(), ProgramState::Stopped);
         assert!(p.log_dir.join("t.out.log").exists());
         let _ = std::fs::remove_dir_all(p.log_dir.clone());
@@ -605,7 +641,9 @@ mod tests {
             "unexpected",
         );
         p.spawn();
-        drive(&mut p, |p| p.total_exits() >= 1 && p.state() == ProgramState::Running);
+        drive(&mut p, |p| {
+            p.total_exits() >= 1 && p.state() == ProgramState::Running
+        });
         assert_eq!(p.state(), ProgramState::Running);
         p.stop();
         let _ = std::fs::remove_dir_all(p.log_dir.clone());

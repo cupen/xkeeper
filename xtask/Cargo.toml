@@ -1,0 +1,13 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Developer tasks for xkeeper: test suite runner and firehose stress harness"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "net", "time", "io-util"] }
+tokio-tungstenite = "0.26"
+futures-util = "0.3"

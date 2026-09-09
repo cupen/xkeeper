@@ -31,7 +31,7 @@
     get_checksum: true
   register: xk_binary_pre
 
-- name: Detect existing core config (with checksum)
+- name: Detect existing daemon config (with checksum)
   ansible.builtin.stat:
     path: "{{ xkeeper_config_dest }}"
     get_checksum: true
@@ -45,7 +45,7 @@
          + (['service is ' ~ xk_active_pre.stdout] if xk_active_pre.rc == 0 else [])
          + (['service is enabled'] if xk_enabled_pre.rc == 0 else [])
          + (['binary exists at ' ~ xkeeper_binary_dest] if xk_binary_pre.stat.exists else [])
-         + (['core config exists at ' ~ xkeeper_config_dest] if xk_config_pre.stat.exists else []) }}
+         + (['daemon config exists at ' ~ xkeeper_config_dest] if xk_config_pre.stat.exists else []) }}
 
 - name: Determine idempotent hit (own deployment, identical content)
   ansible.builtin.set_fact:

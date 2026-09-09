@@ -18,10 +18,10 @@ Linux 与 Windows 上行为一致：崩溃自动拉起、启动顺序与依赖�
    xkeeper add/remove/list        ← 离线可用，在线时自动同步
 ```
 
-## 模型：core 全局 + app 分布 + app_dir 注册
+## 模型：daemon 全局 + app 分布 + app_dir 注册
 
-- **core 根配置**（全局唯一）：Linux `/etc/xkeeper.toml`，Windows
-  `%APPDATA%\xkeeper\xkeeper.toml`，`-c` 可覆盖；**文件可以不存在**——
+- **daemon 根配置**（全局唯一）：Linux `/etc/xkeeper/daemon.toml`，Windows
+  `%APPDATA%\xkeeper\daemon.toml`，`-c/--config` 可覆盖；**文件可以不存在**——
   xkeeper 以内置默认值空启动。只放全局内容：`[daemon]`（含 `app_dir` 注册
   目录）与可选 `[app-default]`（所有应用共享的默认值）。任何应用专属条目
   都会被未知字段校验拒绝。
@@ -34,12 +34,15 @@ Linux 与 Windows 上行为一致：崩溃自动拉起、启动顺序与依赖�
   Windows 无符号链接权限时降级为硬链接（见下方"注意"）。
 
 字段优先级（高 → 低）：`[program.*]` 显式字段 > app 配置 `[app]` 表 >
-core `[app-default]` > 内置默认。`autostart`/`priority` 是应用级字段。
+daemon `[app-default]` > 内置默认。`autostart`/`priority` 是应用级字段。
 
 ## 快速上手
 
 ```bash
 cargo build --release          # 产物: target/release/xkeeper(.exe)
+
+xkeeper edit                   # 可选：用 $VISUAL/$EDITOR（缺省 vi/notepad）打开 daemon 配置，
+                               #   不存在则创建；保存退出后自动校验，非法以退出码 2 报告
 
 # 1. 在你的应用部署目录写一个 xkeeper.toml（见 examples/demo-app）
 # 2. 注册（空配置也能先跑起来）
@@ -53,13 +56,13 @@ xkeeper run
 xkeeper status
 xkeeper stop myapp-程序名
 xkeeper log <程序名> --tail 50 -f
-xkeeper reload                 # 重读 core + 全部 app 配置（按应用隔离失败）
+xkeeper reload                 # 重读 daemon + 全部 app 配置（按应用隔离失败）
 xkeeper shutdown
 ```
 
 ## 配置示例
 
-core（`examples/core.toml`）：
+daemon（`examples/daemon.toml`，带注释模板在 `conf/daemon.toml`；app 模板在 `conf/app.toml`）：
 
 ```toml
 [daemon]
@@ -70,7 +73,7 @@ host = "127.0.0.1"          # 控制平面仅回环
 port = 7310
 auth_token = ""             # 非空则要求 Bearer 鉴权
 log_buffer_lines = 1000
-app_dir = "apps"            # 注册目录，缺省 core 同级 apps/
+app_dir = "apps"            # 注册目录，缺省 daemon 配置同级 apps/
 
 [app-default]               # 可选：全体应用默认值
 autostart = true
@@ -111,7 +114,7 @@ restart_on_unhealthy = true # unhealthy 触发与崩溃一致的重启
 请显式配置绝对目录，例如 `/var/log/xkeeper`。多实例部署也应使用不同的绝对目录。
 
 升级前依赖默认相对 `logs` 目录的部署，新日志会改写到 `/tmp/xkeeper/logs`，旧日志
-仍留在 `<core 配置目录>/logs`，不会自动迁移。已有 `log_dir = "logs"` 等相对路径
+仍留在 `<daemon 配置目录>/logs`，不会自动迁移。已有 `log_dir = "logs"` 等相对路径
 配置会被拒绝启动，需改为绝对路径。
 
 ## 状态机与重启语义
@@ -151,7 +154,7 @@ supervisorctl 风格的终端入口，经控制面 API 与守护进程通信（�
 
 ```bash
 xkeeper shell                        # 进入 REPL（行编辑 + 历史，Ctrl+C 中断当前行，exit/quit 离开）
-xkeeper shell -c "status"            # 单命令模式：执行一条后退出（脚本友好，退出码同 CLI 约定）
+xkeeper shell -e "status"            # 单命令模式：执行一条后退出（脚本友好，退出码同 CLI 约定）
 ```
 
 内置命令：`status`（对齐表格：NAME/APP/STATE/PID/RESTARTS/UNHEALTHY）、
@@ -227,7 +230,7 @@ cargo build --release
 ### Ansible 部署
 
 Ansible role 部署见 [.ansible/README.md](.ansible/README.md)：默认免 inventory，
-本机一条命令完成"分发二进制 → 装核心配置 → 注册 systemd 服务"，也可直接引用
+本机一条命令完成"分发二进制 → 装 daemon 配置 → 注册 systemd 服务"，也可直接引用
 `roles/xkeeper` 扩展到多主机。默认部署对既有 xkeeper 安装零影响——检测到
 既有安装立即停止并说明原因，需显式设置 `xkeeper_force_overwrite: true` 才允许覆盖。
 
@@ -275,7 +278,7 @@ serde 结构体派生，字段语义完全一致；体积敏感的 WS 通道用 
 
 v0.1 单文件配置（`[daemon]` + `[[program]]`）在 `xkeeper add <旧文件>` 时被
 自动识别并转换：程序转写为 `[program.*]` 注册为一个应用，`[daemon]` 段提示
-并入 core，原文件不修改。`xkeeper run -c <旧文件>` 走同一条导入路径。
+并入 daemon 配置，原文件不修改。
 
 ## 作为系统服务运行（守护 xkeeper 本身）
 
@@ -287,7 +290,7 @@ sudo xkeeper service install --now      # 安装后立即 start
 sudo xkeeper service uninstall          # stop + disable + 删除 unit + daemon-reload
 ```
 
-可选参数：`-c <核心配置>`（写入 unit 的 ExecStart，缺省 `/etc/xkeeper.toml`）、
+可选参数：`-c/--config <daemon 配置>`（全局参数；写入 unit 的 ExecStart，缺省 `/etc/xkeeper/daemon.toml`）、
 `--name <unit>`（unit 名，默认 `xkeeper`）、`--user <name>`（服务运行用户）、
 `--force`（目标 unit 已存在且内容不同时覆盖）。重复安装内容一致时幂等跳过。
 `TimeoutStopSec` 按已注册程序的最大 `stop_timeout` 自动估算（2×最大值 + 10s，
@@ -312,8 +315,8 @@ xkeeper 被强杀时，Windows 上子进程树由 Job Object（kill-on-close）�
 - Windows 符号链接需要管理员/开发者模式：无权限时 `app_dir` 降级为硬链接。
   硬链接会被 `sed -i` 等"替换文件式"编辑断开——编辑配置后重跑一次
   `xkeeper add .` 刷新链接即可（幂等）；symlink 模式不受影响。
-- Linux 上 `/etc/xkeeper.toml` 需 root 写权限：非 root 用户执行 add/remove
-  请用 sudo，或 `-c` 指向用户级 core 配置。
+- Linux 上 `/etc/xkeeper/daemon.toml` 需 root 写权限：非 root 用户执行 add/remove
+  请用 sudo，或 `-c/--config` 指向用户级 daemon 配置。
 - 单行 `command` 只做词法拆分（空白 + 引号），不经过 shell；需要 shell 语义
   显式写 `bash -c "..."`。
 

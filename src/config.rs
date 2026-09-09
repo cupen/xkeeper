@@ -1,10 +1,10 @@
-//! Configuration: the unique global core config plus per-app deployment
+//! Configuration: the unique global daemon config plus per-app deployment
 //! config files (`xkeeper.toml`), with layered defaults resolution.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -93,14 +93,14 @@ pub enum RestartPolicy {
 }
 
 // ---------------------------------------------------------------------------
-// core config (global only)
+// daemon config (global only)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct CoreConfig {
+pub struct DaemonConfig {
     #[serde(default)]
-    pub daemon: DaemonConfig,
+    pub daemon: DaemonSettings,
     #[serde(default, rename = "app-default")]
     pub app_default: Option<AppDefaults>,
 }
@@ -111,7 +111,7 @@ const DEFAULT_LOG_MAX_SIZE: u64 = 50 * 1024 * 1024;
 const DEFAULT_LOG_ROTATE_KEEP: u32 = 2;
 
 /// Fixed absolute default so the log location never depends on where the
-/// core config lives. `/tmp` is volatile by design (see README); pin an
+/// daemon config lives. `/tmp` is volatile by design (see README); pin an
 /// absolute `log_dir` (e.g. `/var/log/xkeeper`) for logs that survive reboots.
 fn default_log_dir() -> PathBuf {
     if cfg!(windows) {
@@ -123,7 +123,7 @@ fn default_log_dir() -> PathBuf {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct DaemonConfig {
+pub struct DaemonSettings {
     pub log_level: String,
     pub log_dir: PathBuf,
     pub monitor_interval: f64,
@@ -134,7 +134,7 @@ pub struct DaemonConfig {
     pub app_dir: PathBuf,
 }
 
-impl Default for DaemonConfig {
+impl Default for DaemonSettings {
     fn default() -> Self {
         Self {
             log_level: "info".into(),
@@ -149,23 +149,29 @@ impl Default for DaemonConfig {
     }
 }
 
-impl CoreConfig {
-    /// Load the core config; a missing file means "run with defaults".
-    pub fn load_or_default(path: &Path) -> Result<(CoreConfig, bool)> {
+impl DaemonConfig {
+    /// Load the daemon config; a missing file means "run with defaults".
+    pub fn load_or_default(path: &Path) -> Result<(DaemonConfig, bool)> {
         match std::fs::read_to_string(path) {
             Ok(text) => {
-                let cfg: CoreConfig = toml::from_str(&text)
-                    .with_context(|| format!("failed to parse core config: {}", path.display()))?;
+                let cfg: DaemonConfig = toml::from_str(&text).with_context(|| {
+                    format!("failed to parse daemon config: {}", path.display())
+                })?;
                 cfg.validate()?;
                 Ok((cfg, true))
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((CoreConfig::empty(), false)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Ok((DaemonConfig::empty(), false))
+            }
             Err(e) => Err(e).with_context(|| format!("failed to read {}", path.display())),
         }
     }
 
     pub fn empty() -> Self {
-        CoreConfig { daemon: DaemonConfig::default(), app_default: None }
+        DaemonConfig {
+            daemon: DaemonSettings::default(),
+            app_default: None,
+        }
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -203,13 +209,16 @@ impl CoreConfig {
         if errors.is_empty() {
             Ok(())
         } else {
-            bail!("core config validation failed:\n  - {}", errors.join("\n  - "));
+            bail!(
+                "daemon config validation failed:\n  - {}",
+                errors.join("\n  - ")
+            );
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// app-level default fields (used by core [app-default] and app [app])
+// app-level default fields (used by daemon [app-default] and app [app])
 // ---------------------------------------------------------------------------
 
 /// Optional program-level knobs shared across layers. Each layer may set any
@@ -233,7 +242,7 @@ pub struct LevelOptions {
     pub log_rotate_keep: Option<u32>,
 }
 
-/// Defaults shared by every app, from the core config `[app-default]` table.
+/// Defaults shared by every app, from the daemon config `[app-default]` table.
 pub type AppDefaults = LevelOptions;
 
 /// The `[app]` table of an app config: metadata plus app-level defaults.
@@ -266,7 +275,9 @@ fn check_level_defaults(label: &str, l: &AppDefaults, errors: &mut Vec<String>) 
     }
     if let (Some(mx), Some(mn)) = (l.max_restart_backoff, l.restart_backoff) {
         if mx < mn {
-            errors.push(format!("{label}.max_restart_backoff must be >= restart_backoff"));
+            errors.push(format!(
+                "{label}.max_restart_backoff must be >= restart_backoff"
+            ));
         }
     }
     if let Some(t) = l.stop_timeout {
@@ -402,17 +413,27 @@ fn parse_health(s: &str, raw: &ProgramRaw) -> Result<HealthCheck> {
     let kind = if s.starts_with("http://") || s.starts_with("https://") {
         HealthKind::Http { url: s.to_string() }
     } else if let Some(addr) = s.strip_prefix("tcp://") {
-        if addr.rsplit_once(':').map(|(_, p)| p.parse::<u16>()).transpose()?.is_none() {
+        if addr
+            .rsplit_once(':')
+            .map(|(_, p)| p.parse::<u16>())
+            .transpose()?
+            .is_none()
+        {
             bail!("health_check tcp address must be host:port, got {s:?}");
         }
-        HealthKind::Tcp { addr: addr.to_string() }
+        HealthKind::Tcp {
+            addr: addr.to_string(),
+        }
     } else {
         let mut parts = split_command(s);
         if parts.is_empty() {
             bail!("health_check is empty");
         }
         let command = parts.remove(0);
-        HealthKind::Exec { command, args: parts }
+        HealthKind::Exec {
+            command,
+            args: parts,
+        }
     };
     Ok(HealthCheck {
         kind,
@@ -432,7 +453,7 @@ fn def_hash(p: &ResolvedProgram) -> u64 {
 }
 
 /// Resolve one `[program.<name>]` entry against the `[app]` layer and the
-/// core `[app-default]` layer (highest priority first).
+/// daemon `[app-default]` layer (highest priority first).
 pub fn resolve_program(
     app_name: &str,
     prog_name: &str,
@@ -543,9 +564,10 @@ pub fn resolve_program(
     }
 
     let health = match &raw.health_check {
-        Some(s) => Some(parse_health(s, raw).with_context(|| {
-            format!("program[{prog_name}]: invalid health_check")
-        })?),
+        Some(s) => Some(
+            parse_health(s, raw)
+                .with_context(|| format!("program[{prog_name}]: invalid health_check"))?,
+        ),
         None => None,
     };
 
@@ -579,7 +601,10 @@ pub fn resolve_program(
         health,
         hash: 0,
     };
-    Ok(ResolvedProgram { hash: def_hash(&p), ..p })
+    Ok(ResolvedProgram {
+        hash: def_hash(&p),
+        ..p
+    })
 }
 
 /// Resolve a whole app config file.
@@ -612,7 +637,14 @@ pub fn resolve_app(
         .program
         .iter()
         .map(|(pname, praw)| {
-            resolve_program(name, pname, praw, meta, defaults, &path.parent().unwrap_or(Path::new(".")).to_path_buf())
+            resolve_program(
+                name,
+                pname,
+                praw,
+                meta,
+                defaults,
+                &path.parent().unwrap_or(Path::new(".")).to_path_buf(),
+            )
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(ResolvedApp {
@@ -674,13 +706,18 @@ pub fn validate_all(apps: &[ResolvedApp]) -> Result<()> {
             let st = state.entry(node).or_insert(0);
             if i == 0 {
                 if *st == 1 {
-                    errors.push(format!("dependency cycle detected through program {node:?}"));
+                    errors.push(format!(
+                        "dependency cycle detected through program {node:?}"
+                    ));
                     stack.clear();
                     break;
                 }
                 *st = 1;
             }
-            let deps = all.get(node).map(|p| p.depends_on.as_slice()).unwrap_or(&[]);
+            let deps = all
+                .get(node)
+                .map(|p| p.depends_on.as_slice())
+                .unwrap_or(&[]);
             if let Some(next) = deps.get(i) {
                 stack.push((node, i + 1));
                 match all.get(next.as_str()) {
@@ -759,26 +796,32 @@ pub struct LegacyImport {
 pub fn import_legacy(legacy_path: &Path) -> Result<LegacyImport> {
     let text = std::fs::read_to_string(legacy_path)
         .with_context(|| format!("failed to read {}", legacy_path.display()))?;
-    let file: LegacyFile =
-        toml::from_str(&text).with_context(|| format!("failed to parse legacy config {}", legacy_path.display()))?;
+    let file: LegacyFile = toml::from_str(&text)
+        .with_context(|| format!("failed to parse legacy config {}", legacy_path.display()))?;
     if file.program.is_empty() {
         bail!("legacy config has no [[program]] entries");
     }
     let dir = legacy_path.parent().unwrap_or(Path::new("."));
     let new_file = dir.join("xkeeper.toml");
     if new_file.exists() {
-        bail!("{} already exists; refusing to overwrite during legacy import", new_file.display());
+        bail!(
+            "{} already exists; refusing to overwrite during legacy import",
+            new_file.display()
+        );
     }
 
     let mut programs: BTreeMap<String, ProgramRaw> = BTreeMap::new();
     for p in file.program {
-        let autorestart = p.autorestart.map(|v| match v {
-            toml::Value::Boolean(true) => Some(RestartPolicy::Always),
-            toml::Value::Boolean(false) => Some(RestartPolicy::Never),
-            other => other
-                .as_str()
-                .and_then(|s| serde_json::from_value::<RestartPolicy>(serde_json::json!(s)).ok()),
-        }).flatten();
+        let autorestart = p
+            .autorestart
+            .map(|v| match v {
+                toml::Value::Boolean(true) => Some(RestartPolicy::Always),
+                toml::Value::Boolean(false) => Some(RestartPolicy::Never),
+                other => other.as_str().and_then(|s| {
+                    serde_json::from_value::<RestartPolicy>(serde_json::json!(s)).ok()
+                }),
+            })
+            .flatten();
         programs.insert(
             p.name.clone(),
             ProgramRaw {
@@ -820,11 +863,14 @@ pub fn import_legacy(legacy_path: &Path) -> Result<LegacyImport> {
         program: programs,
     };
     let body = toml::to_string_pretty(&out).context("failed to serialize imported app config")?;
-    std::fs::write(&new_file, format!(
-        "# Generated by `xkeeper add` from a v0.1 config. Source: {}\n\n{}",
-        legacy_path.display(),
-        body
-    ))
+    std::fs::write(
+        &new_file,
+        format!(
+            "# Generated by `xkeeper add` from a v0.1 config. Source: {}\n\n{}",
+            legacy_path.display(),
+            body
+        ),
+    )
     .with_context(|| format!("failed to write {}", new_file.display()))?;
 
     let daemon_hint: Vec<String> = file
@@ -832,7 +878,11 @@ pub fn import_legacy(legacy_path: &Path) -> Result<LegacyImport> {
         .map(|t| t.keys().cloned().collect())
         .unwrap_or_default();
 
-    Ok(LegacyImport { app_name, new_file, daemon_hint })
+    Ok(LegacyImport {
+        app_name,
+        new_file,
+        daemon_hint,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -845,8 +895,10 @@ mod tests {
 
     #[test]
     fn splits_command_lines() {
-        assert_eq!(split_command("python -m http.server 8000"),
-            vec!["python", "-m", "http.server", "8000"]);
+        assert_eq!(
+            split_command("python -m http.server 8000"),
+            vec!["python", "-m", "http.server", "8000"]
+        );
         assert_eq!(split_command("echo \"a b\" c"), vec!["echo", "a b", "c"]);
         assert_eq!(split_command("  spaced   out  "), vec!["spaced", "out"]);
     }
@@ -867,10 +919,7 @@ mod tests {
 
     #[test]
     fn minimal_map_program_resolves() {
-        let a = app_of(
-            "[program.api]\ncommand = \"python -m http.server 8000\"\n",
-        )
-        .unwrap();
+        let a = app_of("[program.api]\ncommand = \"python -m http.server 8000\"\n").unwrap();
         assert_eq!(a.name, "demo");
         assert_eq!(a.autostart, true);
         let p = &a.programs[0];
@@ -888,31 +937,34 @@ mod tests {
     fn log_rotation_defaults_and_opt_out() {
         let a = app_of("[program.a]\ncommand=\"x\"\nlog_max_size = \"0\"\n").unwrap();
         assert_eq!(a.programs[0].log_max_size, None); // "0" disables rotation
-        let b = app_of(
-            "[program.a]\ncommand=\"x\"\nlog_max_size = \"10MB\"\nlog_rotate_keep = 3\n",
-        )
-        .unwrap();
+        let b =
+            app_of("[program.a]\ncommand=\"x\"\nlog_max_size = \"10MB\"\nlog_rotate_keep = 3\n")
+                .unwrap();
         assert_eq!(b.programs[0].log_max_size, Some(10 * 1024 * 1024));
         assert_eq!(b.programs[0].log_rotate_keep, 3);
     }
 
     #[test]
     fn default_log_dir_is_absolute() {
-        let d = DaemonConfig::default();
+        let d = DaemonSettings::default();
         assert!(d.log_dir.is_absolute());
         #[cfg(unix)]
         assert_eq!(d.log_dir, PathBuf::from("/tmp/xkeeper/logs"));
     }
 
     #[test]
-    fn core_rejects_relative_or_empty_log_dir() {
-        let rel: CoreConfig = toml::from_str("[daemon]\nlog_dir = \"logs\"\n").unwrap();
+    fn daemon_rejects_relative_or_empty_log_dir() {
+        let rel: DaemonConfig = toml::from_str("[daemon]\nlog_dir = \"logs\"\n").unwrap();
         let err = rel.validate().unwrap_err().to_string();
-        assert!(err.contains("daemon.log_dir"), "error must name the field: {err}");
+        assert!(
+            err.contains("daemon.log_dir"),
+            "error must name the field: {err}"
+        );
         assert!(err.contains("absolute"), "error must state the rule: {err}");
-        let empty: CoreConfig = toml::from_str("[daemon]\nlog_dir = \"\"\n").unwrap();
+        let empty: DaemonConfig = toml::from_str("[daemon]\nlog_dir = \"\"\n").unwrap();
         assert!(empty.validate().is_err());
-        let ok: CoreConfig = toml::from_str("[daemon]\nlog_dir = \"/var/log/xkeeper\"\n").unwrap();
+        let ok: DaemonConfig =
+            toml::from_str("[daemon]\nlog_dir = \"/var/log/xkeeper\"\n").unwrap();
         ok.validate().unwrap();
     }
 
@@ -924,7 +976,8 @@ mod tests {
 
     #[test]
     fn four_layer_priority() {
-        let defaults: AppDefaults = toml::from_str("restart_backoff = 2.0\nautorestart = \"always\"\n").unwrap();
+        let defaults: AppDefaults =
+            toml::from_str("restart_backoff = 2.0\nautorestart = \"always\"\n").unwrap();
         let raw: AppRaw = toml::from_str(
             "[app]\nautorestart = \"on-failure\"\n\n[program.a]\ncommand = \"x\"\nautorestart = \"never\"\n\n[program.b]\ncommand = \"y\"\n",
         )
@@ -946,9 +999,18 @@ mod tests {
         )
         .unwrap();
         let p = |n: &str| a.programs.iter().find(|p| p.name == n).unwrap();
-        assert!(matches!(&p("a").health.as_ref().unwrap().kind, HealthKind::Http { .. }));
-        assert!(matches!(&p("b").health.as_ref().unwrap().kind, HealthKind::Tcp { .. }));
-        assert!(matches!(&p("c").health.as_ref().unwrap().kind, HealthKind::Exec { .. }));
+        assert!(matches!(
+            &p("a").health.as_ref().unwrap().kind,
+            HealthKind::Http { .. }
+        ));
+        assert!(matches!(
+            &p("b").health.as_ref().unwrap().kind,
+            HealthKind::Tcp { .. }
+        ));
+        assert!(matches!(
+            &p("c").health.as_ref().unwrap().kind,
+            HealthKind::Exec { .. }
+        ));
     }
 
     #[test]
@@ -957,10 +1019,10 @@ mod tests {
     }
 
     #[test]
-    fn core_rejects_app_entries() {
-        let r: Result<CoreConfig, _> =
+    fn daemon_rejects_app_entries() {
+        let r: Result<DaemonConfig, _> =
             toml::from_str("[daemon]\nport = 1\n\n[[app]]\nname = \"x\"\n");
-        assert!(r.is_err(), "[[app]] must be rejected in core config");
+        assert!(r.is_err(), "[[app]] must be rejected in daemon config");
     }
 
     #[test]

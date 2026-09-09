@@ -5,7 +5,7 @@
 #   cd .ansible
 #   ansible-playbook site.yml \
 #     -e xkeeper_binary_src=../target/release/xkeeper \
-#     -e xkeeper_config_src=../examples/core.toml
+#     -e xkeeper_config_src=../examples/daemon.toml
 #
 # 将来扩展远程多主机：编写 inventory 后去掉本 play 的 `connection: local`，
 # 用 `ansible-playbook -i <inventory> site.yml` 执行，role 无需改动。

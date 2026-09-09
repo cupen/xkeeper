@@ -14,16 +14,16 @@
   "dependencies": {
     "@awesome.me/webawesome": "^3.12.0",
     "@msgpack/msgpack": "^3.1.3",
-    "dompurify": "^3.4.14",
+    "dompurify": "^3.4.15",
     "highlight.js": "^11.12.0",
     "lit": "^3.3.3",
-    "marked": "^16.4.2"
+    "marked": "^18.0.12"
   },
   "devDependencies": {
-    "happy-dom": "^20.11.13",
+    "happy-dom": "^20.14.0",
     "jsdom": "^30.0.1",
-    "typescript": "^5.9.3",
+    "typescript": "^7.0.2",
     "vite": "^8.2.2",
-    "vitest": "^4.1.11"
+    "vitest": "^5.0.0"
   }
 }

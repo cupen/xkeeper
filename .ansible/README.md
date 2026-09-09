@@ -1,6 +1,6 @@
 # xkeeper Ansible 部署（role 化）
 
-以 Ansible role（`roles/xkeeper/`）封装部署流程：分发二进制 → 安装核心配置 →
+以 Ansible role（`roles/xkeeper/`）封装部署流程：分发二进制 → 安装 daemon 配置 →
 `xkeeper service install --now`（复用 xkeeper 自身的服务注册能力）。
 默认**免 inventory 本机部署**：`ansible.cfg` 已内置隐式 localhost，
 `cd .ansible && ansible-playbook site.yml` 即可。
@@ -9,7 +9,7 @@
 
 - 控制机：Ansible ≥ 2.12
 - 目标机：Linux + systemd + Python 3，root 权限（play 已设 `become: true`）
-- xkeeper 的 Linux 二进制（`cargo build --release` 产物或 release 下载）与一份核心配置 TOML
+- xkeeper 的 Linux 二进制（`cargo build --release` 产物或 release 下载）与一份 daemon 配置 TOML
 
 > Windows 目标机不支持（`xkeeper service` 本身仅实现 systemd）。
 
@@ -20,7 +20,7 @@ cargo build --release                      # 先产出二进制
 cd .ansible
 ansible-playbook site.yml \
   -e xkeeper_binary_src=../target/release/xkeeper \
-  -e xkeeper_config_src=../examples/core.toml
+  -e xkeeper_config_src=../examples/daemon.toml
 ```
 
 `become` 需要 sudo；无免密 sudo 时加 `--ask-become-pass`。
@@ -50,7 +50,7 @@ all:
       ansible_user: deploy
   vars:
     xkeeper_binary_src: ./dist/xkeeper          # 控制机上的二进制路径
-    xkeeper_config_src: ./conf/xkeeper.toml     # 控制机上的核心配置
+    xkeeper_config_src: ./conf/daemon.toml     # 控制机上的 daemon 配置
 ```
 
 ```bash
@@ -63,9 +63,9 @@ ansible-playbook -i inventory/prod.yml -e @extra.yml site.yml
 | 变量 | 必填 | 默认 | 说明 |
 |---|---|---|---|
 | `xkeeper_binary_src` | 是 | — | 控制机上的二进制文件路径，或 `http(s)://` 下载 URL |
-| `xkeeper_config_src` | 是 | — | 控制机上的核心配置文件路径，复制到目标机 |
+| `xkeeper_config_src` | 是 | — | 控制机上的 daemon 配置文件路径，复制到目标机 |
 | `xkeeper_binary_dest` | 否 | `/usr/local/bin/xkeeper` | 目标机二进制落位路径 |
-| `xkeeper_config_dest` | 否 | `/etc/xkeeper.toml` | 目标机核心配置路径 |
+| `xkeeper_config_dest` | 否 |  `/etc/xkeeper/daemon.toml` | 目标机 daemon 配置路径 |
 | `xkeeper_service_name` | 否 | `xkeeper` | systemd unit 名（传给 `service install --name`） |
 | `xkeeper_service_user` | 否 | 空（不传） | 服务运行用户（传给 `service install --user`） |
 | `xkeeper_binary_checksum` | 否 | 空 | URL 来源时的 sha256 值，用于校验下载产物 |
@@ -78,7 +78,7 @@ role 在对目标机做**任何变更之前**做只读预检，检测以下痕�
 - 同名 systemd unit 文件（`/etc/systemd/system/<service_name>.service`）
 - 服务处于运行状态或已 enable
 - 默认二进制路径已有文件
-- 默认核心配置路径已有文件
+- 默认 daemon 配置路径已有文件
 
 **发现任一痕迹且未设置强制覆盖变量时，立即失败，明确列出检测到的痕迹，
 目标机不做任何修改、服务不重启**——防止一键脚本误触生产环境：

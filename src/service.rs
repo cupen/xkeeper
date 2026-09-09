@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 pub const DEFAULT_UNIT_NAME: &str = "xkeeper";
 /// Fallback stop budget when the config cannot be loaded.
@@ -58,7 +58,7 @@ fn quote_exec_arg(s: &str) -> String {
 #[cfg_attr(windows, allow(dead_code))]
 pub fn render_unit(
     exe: &Path,
-    core_config: &Path,
+    config_path: &Path,
     user: Option<&str>,
     timeout_stop_sec: u64,
 ) -> String {
@@ -69,9 +69,9 @@ pub fn render_unit(
     s.push('\n');
     s.push_str("[Service]\n");
     s.push_str(&format!(
-        "ExecStart={} run -c {}\n",
+        "ExecStart={} run --config {}\n",
         quote_exec_arg(&exe.display().to_string()),
-        quote_exec_arg(&core_config.display().to_string())
+        quote_exec_arg(&config_path.display().to_string())
     ));
     s.push_str("Restart=always\n");
     s.push_str("RestartSec=3\n");
@@ -114,18 +114,18 @@ fn timeout_from_max_stop(max_stop_timeout: f64) -> u64 {
     (2.0 * max_stop_timeout + 10.0).ceil() as u64
 }
 
-/// Try to load the core config and every registered app and derive
+/// Try to load the daemon config and every registered app and derive
 /// `TimeoutStopSec` from the largest `stop_timeout`. Any load failure falls
 /// back to a conservative 90s.
 #[cfg_attr(windows, allow(dead_code))]
-pub fn compute_timeout_stop_sec(core_path: &Path) -> u64 {
+pub fn compute_timeout_stop_sec(config_path: &Path) -> u64 {
     let compute = || -> Result<u64> {
-        let (core, _) = crate::config::CoreConfig::load_or_default(core_path)?;
-        let core_dir = core_path
+        let (config, _) = crate::config::DaemonConfig::load_or_default(config_path)?;
+        let config_dir = config_path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
-        let apps = crate::registry::list(&core, core_dir)?;
+        let apps = crate::registry::list(&config, config_dir)?;
         let mut max = 0.0f64;
         for listed in apps {
             let (raw, _) = crate::config::AppRaw::load(&listed.path)?;
@@ -133,7 +133,7 @@ pub fn compute_timeout_stop_sec(core_path: &Path) -> u64 {
                 &listed.name,
                 &listed.path,
                 &raw,
-                core.app_default.as_ref(),
+                config.app_default.as_ref(),
             )?;
             for p in &app.programs {
                 max = max.max(p.stop_timeout);
@@ -146,19 +146,19 @@ pub fn compute_timeout_stop_sec(core_path: &Path) -> u64 {
 
 // -- platform entry points ---------------------------------------------------
 
-pub fn install(core_path: &Path, opts: &ServiceOptions) -> Result<()> {
+pub fn install(config_path: &Path, opts: &ServiceOptions) -> Result<()> {
     #[cfg(windows)]
     {
-        let _ = (core_path, opts);
+        let _ = (config_path, opts);
         bail!("service registration is not supported on Windows yet");
     }
     #[cfg(unix)]
     {
-        unix_install(core_path, opts)
+        unix_install(config_path, opts)
     }
 }
 
-pub fn uninstall(_core_path: &Path, opts: &ServiceOptions) -> Result<()> {
+pub fn uninstall(_config_path: &Path, opts: &ServiceOptions) -> Result<()> {
     #[cfg(windows)]
     {
         let _ = opts;
@@ -195,7 +195,7 @@ fn unit_path(unit_name: &str) -> PathBuf {
 }
 
 #[cfg(unix)]
-fn unix_install(core_path: &Path, opts: &ServiceOptions) -> Result<()> {
+fn unix_install(config_path: &Path, opts: &ServiceOptions) -> Result<()> {
     require_root()?;
     if !is_valid_unit_name(&opts.unit_name) {
         bail!(
@@ -208,13 +208,17 @@ fn unix_install(core_path: &Path, opts: &ServiceOptions) -> Result<()> {
         .context("cannot locate the current executable")?
         .canonicalize()
         .context("cannot resolve the current executable path")?;
-    let core_abs = std::path::absolute(core_path)
-        .with_context(|| format!("cannot resolve core config path {}", core_path.display()))?;
+    let config_abs = std::path::absolute(config_path).with_context(|| {
+        format!(
+            "cannot resolve daemon config path {}",
+            config_path.display()
+        )
+    })?;
     let rendered = render_unit(
         &exe,
-        &core_abs,
+        &config_abs,
         opts.user.as_deref(),
-        compute_timeout_stop_sec(core_path),
+        compute_timeout_stop_sec(config_path),
     );
 
     let path = unit_path(&opts.unit_name);
@@ -314,7 +318,7 @@ mod tests {
     fn renders_unit_without_user() {
         let unit = render_unit(
             Path::new("/usr/local/bin/xkeeper"),
-            Path::new("/etc/xkeeper.toml"),
+            Path::new("/etc/xkeeper/daemon.toml"),
             None,
             90,
         );
@@ -325,7 +329,7 @@ mod tests {
              After=network.target\n\
              \n\
              [Service]\n\
-             ExecStart=/usr/local/bin/xkeeper run -c /etc/xkeeper.toml\n\
+             ExecStart=/usr/local/bin/xkeeper run --config /etc/xkeeper/daemon.toml\n\
              Restart=always\n\
              RestartSec=3\n\
              KillSignal=SIGTERM\n\
@@ -344,7 +348,9 @@ mod tests {
             Some("svc-xk"),
             60,
         );
-        assert!(unit.contains("ExecStart=\"/opt/my tools/xkeeper\" run -c \"/etc/my conf/xkeeper.toml\"\n"));
+        assert!(unit.contains(
+            "ExecStart=\"/opt/my tools/xkeeper\" run --config \"/etc/my conf/xkeeper.toml\"\n"
+        ));
         assert!(unit.contains("User=svc-xk\n"));
         assert!(unit.contains("TimeoutStopSec=60\n"));
     }
@@ -366,7 +372,10 @@ mod tests {
             decide_write(Some("other\n"), rendered, false),
             WriteDecision::RefuseNeedsForce
         );
-        assert_eq!(decide_write(Some("other\n"), rendered, true), WriteDecision::Write);
+        assert_eq!(
+            decide_write(Some("other\n"), rendered, true),
+            WriteDecision::Write
+        );
     }
 
     #[test]
@@ -380,9 +389,9 @@ mod tests {
     fn timeout_falls_back_when_config_unloadable() {
         let dir = temp_dir("fallback");
         std::fs::create_dir_all(&dir).unwrap();
-        let core = dir.join("xkeeper.toml");
-        std::fs::write(&core, "not [valid toml").unwrap();
-        assert_eq!(compute_timeout_stop_sec(&core), FALLBACK_TIMEOUT_STOP_SEC);
+        let config = dir.join("xkeeper.toml");
+        std::fs::write(&config, "not [valid toml").unwrap();
+        assert_eq!(compute_timeout_stop_sec(&config), FALLBACK_TIMEOUT_STOP_SEC);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -391,14 +400,14 @@ mod tests {
         let dir = temp_dir("apps");
         let apps = dir.join("apps");
         std::fs::create_dir_all(&apps).unwrap();
-        let core = dir.join("xkeeper.toml");
-        std::fs::write(&core, "[daemon]\napp_dir = \"apps\"\n").unwrap();
+        let config = dir.join("xkeeper.toml");
+        std::fs::write(&config, "[daemon]\napp_dir = \"apps\"\n").unwrap();
         std::fs::write(
             apps.join("demo.toml"),
             "[program.api]\ncommand = \"python -m http.server 8000\"\nstop_timeout = 25\n",
         )
         .unwrap();
-        assert_eq!(compute_timeout_stop_sec(&core), 60);
+        assert_eq!(compute_timeout_stop_sec(&config), 60);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

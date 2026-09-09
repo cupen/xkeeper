@@ -1,14 +1,14 @@
 //! App registry: the set of registered apps lives as `<name>.toml` links in
-//! the core-configured `app_dir`. add/remove/list manage those links; the
+//! the daemon-configured `app_dir`. add/remove/list manage those links; the
 //! linked deployment file is always the source of truth.
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
-use log::{info, warn};
+use anyhow::{Context, Result, bail};
+use log::{debug, warn};
 
 use crate::config::{
-    is_valid_name, resolve_app, validate_all, AppDefaults, CoreConfig, RestartPolicy,
+    AppDefaults, DaemonConfig, RestartPolicy, is_valid_name, resolve_app, validate_all,
 };
 
 #[derive(Debug, Clone)]
@@ -19,13 +19,13 @@ pub struct ListedApp {
 }
 
 /// `<app_dir>/<name>.toml` for a given app name.
-pub fn link_path(core: &CoreConfig, core_dir: &Path, name: &str) -> PathBuf {
-    crate::config::resolve_path(&core.daemon.app_dir, core_dir).join(format!("{name}.toml"))
+pub fn link_path(config: &DaemonConfig, config_dir: &Path, name: &str) -> PathBuf {
+    crate::config::resolve_path(&config.daemon.app_dir, config_dir).join(format!("{name}.toml"))
 }
 
 /// The resolved `app_dir` directory.
-pub fn app_dir(core: &CoreConfig, core_dir: &Path) -> PathBuf {
-    crate::config::resolve_path(&core.daemon.app_dir, core_dir)
+pub fn app_dir(config: &DaemonConfig, config_dir: &Path) -> PathBuf {
+    crate::config::resolve_path(&config.daemon.app_dir, config_dir)
 }
 
 /// Derive the app name from a config path's parent directory.
@@ -39,8 +39,8 @@ pub fn name_from_dir(path: &Path) -> String {
 
 /// Scan `app_dir` and list every registered app. Dangling links are warned
 /// about and skipped.
-pub fn list(core: &CoreConfig, core_dir: &Path) -> Result<Vec<ListedApp>> {
-    let dir = app_dir(core, core_dir);
+pub fn list(config: &DaemonConfig, config_dir: &Path) -> Result<Vec<ListedApp>> {
+    let dir = app_dir(config, config_dir);
     let mut out = Vec::new();
     if !dir.exists() {
         return Ok(out);
@@ -57,7 +57,10 @@ pub fn list(core: &CoreConfig, core_dir: &Path) -> Result<Vec<ListedApp>> {
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
         let real = std::fs::canonicalize(&link).with_context(|| {
-            format!("dangling registration link {} (run `xkeeper remove {name}`)", link.display())
+            format!(
+                "dangling registration link {} (run `xkeeper remove {name}`)",
+                link.display()
+            )
         });
         let real = match real {
             Ok(r) => r,
@@ -95,8 +98,8 @@ pub struct AddOptions {
 /// micro-tuning flags into the deployment file's `[app]` table. Idempotent
 /// (upsert by name). Returns the app name.
 pub fn add(
-    core: &CoreConfig,
-    core_dir: &Path,
+    config: &DaemonConfig,
+    config_dir: &Path,
     path: &Path,
     opts: &AddOptions,
 ) -> Result<String> {
@@ -127,15 +130,20 @@ pub fn add(
 
     // Load + validate this app against the current registry.
     let (raw, _) = crate::config::AppRaw::load(&path)?;
-    let resolved = resolve_app(&name, &path, &raw, core.app_default.as_ref())?;
-    let existing = list(core, core_dir)?;
+    let resolved = resolve_app(&name, &path, &raw, config.app_default.as_ref())?;
+    let existing = list(config, config_dir)?;
     let mut all_apps = Vec::new();
     for l in &existing {
         if l.name == name {
             continue; // replaced by the new definition below
         }
         let (r, _) = crate::config::AppRaw::load(&l.path)?;
-        all_apps.push(resolve_app(&l.name, &l.path, &r, core.app_default.as_ref())?);
+        all_apps.push(resolve_app(
+            &l.name,
+            &l.path,
+            &r,
+            config.app_default.as_ref(),
+        )?);
     }
     all_apps.push(resolved.clone());
     validate_all(&all_apps)?;
@@ -144,33 +152,46 @@ pub fn add(
     apply_flags(&path, opts)
         .with_context(|| format!("cannot write tuning flags into {}", path.display()))?;
 
-    // Create the registration link (this IS the registry record).
-    let dir = app_dir(core, core_dir);
+    // Create the registration link (this IS the registry record — the
+    // daemon discovers apps by scanning app_dir, so a command that leaves
+    // no link behind must not report success).
+    let dir = app_dir(config, config_dir);
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create app_dir {}", dir.display()))?;
-    let link = link_path(core, core_dir, &name);
+    let link = link_path(config, config_dir, &name);
     let _ = std::fs::remove_file(&link); // upsert: replace any old link
-    match make_link(&link, &path) {
-        Ok(()) => {}
-        Err(e) => warn!(
-            "app {name:?} registered, but the app_dir link could not be created ({e}); \
-             the link is only a central viewing aid"
-        ),
+    if let Err(e) = make_link(&link, &path) {
+        bail!(
+            "cannot write the registration link into app_dir {}: {e:#}; \
+             fix write access (re-run with sudo, or chown the app_dir to the current user) \
+             and run `xkeeper add` again",
+            dir.display()
+        );
     }
-    info!("app[{name}] registered from {} (link: {})", path.display(), link.display());
+    debug!(
+        "app[{name}] registered from {} (link: {})",
+        path.display(),
+        link.display()
+    );
     Ok(name)
 }
 
 /// Remove an app registration (delete the link, never the deployment file).
-pub fn remove(core: &CoreConfig, core_dir: &Path, name: &str) -> Result<PathBuf> {
-    let link = link_path(core, core_dir, name);
+pub fn remove(config: &DaemonConfig, config_dir: &Path, name: &str) -> Result<PathBuf> {
+    let link = link_path(config, config_dir, name);
     if !link.exists() {
-        bail!("app {name:?} is not registered (no link at {})", link.display());
+        bail!(
+            "app {name:?} is not registered (no link at {})",
+            link.display()
+        );
     }
     let real = std::fs::canonicalize(&link).unwrap_or_else(|_| link.clone());
     std::fs::remove_file(&link)
         .with_context(|| format!("failed to remove registration link {}", link.display()))?;
-    info!("app[{name}] unregistered (config kept at {})", real.display());
+    debug!(
+        "app[{name}] unregistered (config kept at {})",
+        real.display()
+    );
     Ok(real)
 }
 
@@ -244,7 +265,61 @@ fn apply_flags(path: &Path, opts: &AddOptions) -> Result<()> {
 }
 
 /// Re-parse the deployment file after flag writes so callers see final state.
-pub fn reload_app(name: &str, path: &Path, defaults: Option<&AppDefaults>) -> Result<crate::config::ResolvedApp> {
+pub fn reload_app(
+    name: &str,
+    path: &Path,
+    defaults: Option<&AppDefaults>,
+) -> Result<crate::config::ResolvedApp> {
     let (raw, _) = crate::config::AppRaw::load(path)?;
     resolve_app(name, path, &raw, defaults)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// add must fail loudly (not "register" with a swallowed warning) when
+    /// the app_dir link cannot be written — the link IS the registry record.
+    #[test]
+    #[cfg(unix)]
+    fn add_fails_when_app_dir_not_writable() {
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root can write anything; can't simulate the failure
+        }
+        let tmp = std::env::temp_dir().join(format!("xk-registry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let app_dir = tmp.join("apps");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        let deploy = tmp.join("myapp");
+        std::fs::create_dir_all(&deploy).unwrap();
+        std::fs::write(
+            deploy.join("xkeeper.toml"),
+            "[program.a]\ncommand = \"true\"\n",
+        )
+        .unwrap();
+
+        // Simulate a root-owned app_dir: drop write permission for everyone.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&app_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let config = DaemonConfig::default();
+        let opts = AddOptions {
+            name: Some("myapp".into()),
+            ..Default::default()
+        };
+        let r = add(&config, &tmp, &deploy.join("xkeeper.toml"), &opts);
+        let err = r.err().expect("add must fail when app_dir is not writable");
+        let msg = err.to_string();
+        assert!(msg.contains("app_dir"), "must name app_dir: {msg}");
+        assert!(msg.contains("sudo"), "must hint at the fix: {msg}");
+
+        // The registration must NOT have persisted.
+        assert!(
+            std::fs::read_dir(&app_dir).unwrap().next().is_none(),
+            "no link may appear in app_dir on failure"
+        );
+
+        std::fs::set_permissions(&app_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

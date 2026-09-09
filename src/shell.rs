@@ -5,7 +5,7 @@
 
 use std::io::Write;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::client::{self, Client};
 
@@ -57,7 +57,7 @@ pub(crate) fn parse_line(line: &str) -> Result<Option<ShellCmd>> {
 }
 
 /// Split on whitespace, honoring double/single quotes (enough for
-/// `shell -c "log web --tail 5"`).
+/// `shell -e "log web --tail 5"`).
 fn shell_words(line: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut cur = String::new();
@@ -154,8 +154,7 @@ fn similar_hint(input: &str) -> String {
         .copied()
         .filter(|c| {
             // cheap similarity: shared prefix or edit distance <= 2 on short words
-            c.starts_with(input.chars().next().unwrap_or_default())
-                && levenshtein(&input, c) <= 2
+            c.starts_with(input.chars().next().unwrap_or_default()) && levenshtein(&input, c) <= 2
         })
         .collect();
     match similar.as_slice() {
@@ -189,7 +188,7 @@ Built-in commands:
   pid <name>                          print a program's pid
   log <name> [-f] [--tail N] [--stream out|err]
                                       view program logs
-  reload                              hot-reload core config and all registered apps
+  reload                              hot-reload daemon config and all registered apps
   shutdown                            stop all programs and exit the daemon
   open                                open the web console in the system browser
   help (or ?)                         show this help
@@ -201,17 +200,17 @@ enum Outcome {
     Exit,
 }
 
-/// Entry: REPL, or a single command via `-c`.
-pub(crate) fn run(core_path: &std::path::Path, single: Option<&str>) -> Result<()> {
-    let core = client::load_core(core_path)?;
-    let c = Client::from_core(&core);
+/// Entry: REPL, or a single command via `-e`.
+pub(crate) fn run(config_path: &std::path::Path, single: Option<&str>) -> Result<()> {
+    let config = client::load_config(config_path)?;
+    let c = Client::from_config(&config);
 
     if let Some(line) = single {
         let cmd = parse_line(line).context("invalid command")?;
         match cmd {
             None => Ok(()),
             Some(c2) => {
-                let webui_url = webui_url_of(&core);
+                let webui_url = webui_url_of(&config);
                 match execute(&c, &c2, &webui_url) {
                     Ok(Outcome::Continue) => Ok(()),
                     Ok(Outcome::Exit) => Ok(()),
@@ -222,12 +221,12 @@ pub(crate) fn run(core_path: &std::path::Path, single: Option<&str>) -> Result<(
             }
         }
     } else {
-        repl(&c, &webui_url_of(&core))
+        repl(&c, &webui_url_of(&config))
     }
 }
 
-fn webui_url_of(core: &crate::config::CoreConfig) -> String {
-    if core.daemon.host == "127.0.0.1" || core.daemon.host == "localhost" {
+fn webui_url_of(config: &crate::config::DaemonConfig) -> String {
+    if config.daemon.host == "127.0.0.1" || config.daemon.host == "localhost" {
         // The console defaults to its own port; /v1 port is not it.
     }
     DEFAULT_WEBUI_URL.to_string()
@@ -259,7 +258,7 @@ fn repl(c: &Client, webui_url: &str) -> Result<()> {
                     Ok(Outcome::Continue) => {}
                     Ok(Outcome::Exit) => break,
                     // Per the CLI contract the shell stays alive on command
-                    // errors; only the `-c` mode maps them to exit codes.
+                    // errors; only the `-e` mode maps them to exit codes.
                     Err(e) => eprintln!("xkeeper: error: {e:#}"),
                 }
             }
@@ -284,7 +283,12 @@ fn execute(c: &Client, cmd: &ShellCmd, webui_url: &str) -> Result<Outcome> {
             }
             Ok(Outcome::Continue)
         }
-        ShellCmd::Log { name, follow, tail, stream } => {
+        ShellCmd::Log {
+            name,
+            follow,
+            tail,
+            stream,
+        } => {
             if *follow {
                 c.log_follow(name, stream)?;
             } else {
@@ -296,12 +300,22 @@ fn execute(c: &Client, cmd: &ShellCmd, webui_url: &str) -> Result<Outcome> {
         }
         ShellCmd::Reload => {
             let v = c.reload()?;
-            println!("{}", v.get("result").and_then(|r| r.as_str()).unwrap_or("reloaded"));
+            println!(
+                "{}",
+                v.get("result")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("reloaded")
+            );
             Ok(Outcome::Continue)
         }
         ShellCmd::Shutdown => {
             let v = c.shutdown()?;
-            println!("{}", v.get("result").and_then(|r| r.as_str()).unwrap_or("shutting down"));
+            println!(
+                "{}",
+                v.get("result")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("shutting down")
+            );
             Ok(Outcome::Continue)
         }
         ShellCmd::Open => open_webui(webui_url).map(|_| Outcome::Continue),
@@ -315,7 +329,10 @@ fn execute(c: &Client, cmd: &ShellCmd, webui_url: &str) -> Result<Outcome> {
 
 fn print_action(c: &Client, name: &str, action: &str) -> Result<Outcome> {
     let v = c.action(name, action)?;
-    println!("{}", v.get("result").and_then(|r| r.as_str()).unwrap_or("done"));
+    println!(
+        "{}",
+        v.get("result").and_then(|r| r.as_str()).unwrap_or("done")
+    );
     Ok(Outcome::Continue)
 }
 
@@ -340,8 +357,7 @@ fn print_status(c: &Client) -> Result<Outcome> {
                             .and_then(|x| x.as_u64())
                             .map(|x| x.to_string())
                             .unwrap_or_else(|| "0".into()),
-                        if p
-                            .get("unhealthy")
+                        if p.get("unhealthy")
                             .and_then(|x| x.as_bool())
                             .unwrap_or(false)
                         {
@@ -440,6 +456,7 @@ fn browser_command(url: &str) -> std::process::Command {
     }
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
         let mut cmd = std::process::Command::new("cmd");
         cmd.args(["/C", "start"]);
         // raw arg: `start` mangles extra quotes otherwise
@@ -479,10 +496,10 @@ pub(crate) fn system_webui(url: Option<&str>) -> Result<()> {
     let url = url
         .map(String::from)
         .unwrap_or_else(|| DEFAULT_WEBUI_URL.to_string());
-    // The daemon command line records its own core path; the spawned child
+    // The daemon command line records its own config path; the spawned child
     // re-reads the platform default (or errors clearly if misconfigured).
-    let core = client::load_core(&crate::default_core_path())?;
-    let c = Client::from_core(&core);
+    let config = client::load_config(&crate::default_config_path())?;
+    let c = Client::from_config(&config);
 
     if c.health().is_ok() {
         // Daemon runs: never touch its lifecycle — open or explain.
@@ -525,7 +542,9 @@ pub(crate) fn system_webui(url: Option<&str>) -> Result<()> {
         }
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();
-            bail!("webui did not become reachable within 5s — start it manually with `xkeeper webui`");
+            bail!(
+                "webui did not become reachable within 5s — start it manually with `xkeeper webui`"
+            );
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
@@ -654,8 +673,7 @@ mod tests {
                         .and_then(|x| x.as_u64())
                         .map(|x| x.to_string())
                         .unwrap_or_default(),
-                    if p
-                        .get("unhealthy")
+                    if p.get("unhealthy")
                         .and_then(|x| x.as_bool())
                         .unwrap_or(false)
                     {
@@ -683,8 +701,14 @@ mod tests {
 
     #[test]
     fn listen_of_parses() {
-        assert_eq!(listen_of("http://127.0.0.1:9877").unwrap(), "127.0.0.1:9877");
-        assert_eq!(listen_of("http://127.0.0.1:9877/x").unwrap(), "127.0.0.1:9877");
+        assert_eq!(
+            listen_of("http://127.0.0.1:9877").unwrap(),
+            "127.0.0.1:9877"
+        );
+        assert_eq!(
+            listen_of("http://127.0.0.1:9877/x").unwrap(),
+            "127.0.0.1:9877"
+        );
         assert!(listen_of("ftp://x").is_err());
         assert!(listen_of("http://").is_err());
     }

@@ -13,21 +13,23 @@ pub struct Client {
 }
 
 impl Client {
-    /// Build a client from the core config (host/port/token). Works with
-    /// default settings even when no core config file exists.
-    pub fn from_core(core: &crate::config::CoreConfig) -> Self {
+    /// Build a client from the daemon config (host/port/token). Works with
+    /// default settings even when no daemon config file exists.
+    pub fn from_config(config: &crate::config::DaemonConfig) -> Self {
         Self {
             agent: ureq::AgentBuilder::new()
                 .timeout_connect(Duration::from_secs(2))
                 .timeout(Duration::from_secs(70))
                 .build(),
-            base: format!("http://{}:{}", core.daemon.host, core.daemon.port),
-            token: core.daemon.auth_token.clone(),
+            base: format!("http://{}:{}", config.daemon.host, config.daemon.port),
+            token: config.daemon.auth_token.clone(),
         }
     }
 
     fn call(&self, method: &str, path: &str) -> Result<serde_json::Value> {
-        let mut r = self.agent.request(method, &format!("{}{}", self.base, path));
+        let mut r = self
+            .agent
+            .request(method, &format!("{}{}", self.base, path));
         if !self.token.is_empty() {
             r = r.set("Authorization", &format!("Bearer {}", self.token));
         }
@@ -141,9 +143,9 @@ pub fn exit_code_of(err: &anyhow::Error) -> i32 {
     }
 }
 
-/// Load the core config for client commands (defaults when absent).
-pub fn load_core(core_path: &Path) -> Result<crate::config::CoreConfig> {
-    crate::config::CoreConfig::load_or_default(core_path)
-        .with_context(|| format!("failed to load core config {}", core_path.display()))
+/// Load the daemon config for client commands (defaults when absent).
+pub fn load_config(config_path: &Path) -> Result<crate::config::DaemonConfig> {
+    crate::config::DaemonConfig::load_or_default(config_path)
+        .with_context(|| format!("failed to load daemon config {}", config_path.display()))
         .map(|(c, _)| c)
 }

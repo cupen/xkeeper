@@ -7,10 +7,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use log::{error, info, warn};
 
-use crate::config::{self, CoreConfig, ResolvedApp, ResolvedProgram};
+use crate::config::{self, DaemonConfig, ResolvedApp, ResolvedProgram};
 use crate::health;
 use crate::program::{ManagedProgram, ProgramState};
 use crate::registry;
@@ -19,13 +19,28 @@ pub type Reply = std::sync::mpsc::Sender<Result<String>>;
 
 #[derive(Debug)]
 pub enum Command {
-    Start { name: String, reply: Option<Reply> },
-    Stop { name: String, reply: Option<Reply> },
-    Restart { name: String, reply: Option<Reply> },
-    Reload { reply: Option<Reply> },
-    Shutdown { reply: Option<Reply> },
+    Start {
+        name: String,
+        reply: Option<Reply>,
+    },
+    Stop {
+        name: String,
+        reply: Option<Reply>,
+    },
+    Restart {
+        name: String,
+        reply: Option<Reply>,
+    },
+    Reload {
+        reply: Option<Reply>,
+    },
+    Shutdown {
+        reply: Option<Reply>,
+    },
     /// Sent by the health checker when a program needs a restart.
-    HealthRestart { name: String },
+    HealthRestart {
+        name: String,
+    },
 }
 
 #[derive(Clone)]
@@ -41,8 +56,8 @@ pub struct AppRecord {
 pub struct SupervisorState {
     pub programs: HashMap<String, ManagedProgram>,
     pub apps: Vec<AppRecord>,
-    pub core: CoreConfig,
-    pub core_dir: PathBuf,
+    pub config: DaemonConfig,
+    pub config_dir: PathBuf,
     pub shutdown: AtomicBool,
 }
 
@@ -51,35 +66,51 @@ pub struct Supervisor {
     queue: Mutex<VecDeque<Command>>,
     cv: Condvar,
     pub health_tasks: health::TaskMap,
-    core_path: Mutex<PathBuf>,
+    /// Latest metrics from the sideband sampler thread; the only writer is
+    /// [`crate::metrics::spawn_sampler`], the supervision loop never touches it.
+    pub metrics: Arc<crate::metrics::MetricsTable>,
+    config_path: Mutex<PathBuf>,
+    started: std::time::Instant,
     interval: Duration,
 }
 
 impl Supervisor {
-    pub fn new(core: CoreConfig, core_dir: &Path) -> Result<Arc<Self>> {
-        let log_dir = config::resolve_path(&core.daemon.log_dir, core_dir);
+    pub fn new(config: DaemonConfig, config_dir: &Path) -> Result<Arc<Self>> {
+        let log_dir = config::resolve_path(&config.daemon.log_dir, config_dir);
         std::fs::create_dir_all(&log_dir)
             .with_context(|| format!("failed to create log dir: {}", log_dir.display()))?;
-        let interval = Duration::from_secs_f64(core.daemon.monitor_interval.max(0.05));
+        let interval = Duration::from_secs_f64(config.daemon.monitor_interval.max(0.05));
         Ok(Arc::new(Supervisor {
             state: Arc::new(Mutex::new(SupervisorState {
                 programs: HashMap::new(),
                 apps: Vec::new(),
-                core,
-                core_dir: core_dir.to_path_buf(),
+                config,
+                config_dir: config_dir.to_path_buf(),
                 shutdown: AtomicBool::new(false),
             })),
             queue: Mutex::new(VecDeque::new()),
             cv: Condvar::new(),
             health_tasks: Arc::new(Mutex::new(HashMap::new())),
-            core_path: Mutex::new(core_dir.join("xkeeper.toml")),
+            metrics: Arc::new(crate::metrics::MetricsTable::new()),
+            config_path: Mutex::new(config_dir.join("xkeeper.toml")),
+            started: std::time::Instant::now(),
             interval,
         }))
     }
 
-    /// Remember where the core config lives so `reload` re-reads it.
-    pub fn set_core_path(&self, p: &Path) {
-        *self.core_path.lock().unwrap() = p.to_path_buf();
+    /// Remember where the daemon config lives so `reload` re-reads it.
+    pub fn set_config_path(&self, p: &Path) {
+        *self.config_path.lock().unwrap() = p.to_path_buf();
+    }
+
+    /// Where the daemon config lives (config-source display for the console).
+    pub fn config_path(&self) -> PathBuf {
+        self.config_path.lock().unwrap().clone()
+    }
+
+    /// How long the daemon has been running (console overview).
+    pub fn uptime_secs(&self) -> f64 {
+        self.started.elapsed().as_secs_f64()
     }
 
     pub fn enqueue(&self, cmd: Command) {
@@ -88,7 +119,11 @@ impl Supervisor {
     }
 
     pub fn request_shutdown(&self) {
-        self.state.lock().unwrap().shutdown.store(true, Ordering::SeqCst);
+        self.state
+            .lock()
+            .unwrap()
+            .shutdown
+            .store(true, Ordering::SeqCst);
         self.cv.notify_all();
     }
 
@@ -100,15 +135,15 @@ impl Supervisor {
 
     /// Load every registered app and start eligible programs.
     pub fn bootstrap(&self) -> Result<()> {
-        let (core, core_dir) = {
+        let (config, config_dir) = {
             let st = self.state.lock().unwrap();
-            (st.core.clone(), st.core_dir.clone())
+            (st.config.clone(), st.config_dir.clone())
         };
-        let listed = registry::list(&core, &core_dir)?;
+        let listed = registry::list(&config, &config_dir)?;
         let mut records = Vec::new();
         let mut resolved: Vec<ResolvedApp> = Vec::new();
         for l in listed {
-            match registry::reload_app(&l.name, &l.path, core.app_default.as_ref()) {
+            match registry::reload_app(&l.name, &l.path, config.app_default.as_ref()) {
                 Ok(a) => {
                     records.push(AppRecord {
                         name: a.name.clone(),
@@ -118,10 +153,7 @@ impl Supervisor {
                     });
                     resolved.push(a);
                 }
-                Err(e) => error!(
-                    "app[{}] failed to load at startup (skipped): {e:#}",
-                    l.name
-                ),
+                Err(e) => error!("app[{}] failed to load at startup (skipped): {e:#}", l.name),
             }
         }
         // Uniqueness of program names across apps is enforced at add-time, but
@@ -131,8 +163,8 @@ impl Supervisor {
         }
         {
             let mut st = self.state.lock().unwrap();
-            let log_dir = config::resolve_path(&st.core.daemon.log_dir, &st.core_dir);
-            let ring_cap = st.core.daemon.log_buffer_lines;
+            let log_dir = config::resolve_path(&st.config.daemon.log_dir, &st.config_dir);
+            let ring_cap = st.config.daemon.log_buffer_lines;
             for app in &resolved {
                 for p in app.programs.clone() {
                     st.programs.insert(
@@ -210,7 +242,9 @@ impl Supervisor {
             {
                 let st = self.state.lock().unwrap();
                 for (name, deps) in &snapshot {
-                    let Some(p) = st.programs.get(name) else { continue };
+                    let Some(p) = st.programs.get(name) else {
+                        continue;
+                    };
                     if p.state() != ProgramState::Stopped || p.user_stopped() {
                         continue;
                     }
@@ -321,16 +355,16 @@ impl Supervisor {
     // -- reload -------------------------------------------------------------
 
     /// Rescan the registry, diff every app, apply changes. Per-app atomic: a
-    /// broken file freezes only that app. Aborts entirely if the core config
+    /// broken file freezes only that app. Aborts entirely if the daemon config
     /// or cross-app validation fails.
     fn cmd_reload(&self) -> Result<String> {
-        let core_path = self.core_path.lock().unwrap().clone();
-        let (new_core, _) = CoreConfig::load_or_default(&core_path)
-            .map_err(|e| anyhow::anyhow!("reload aborted, core config invalid: {e:#}"))?;
-        let core_dir = self.state.lock().unwrap().core_dir.clone();
-        let defaults = new_core.app_default.clone();
+        let config_path = self.config_path.lock().unwrap().clone();
+        let (new_config, _) = DaemonConfig::load_or_default(&config_path)
+            .map_err(|e| anyhow::anyhow!("reload aborted, daemon config invalid: {e:#}"))?;
+        let config_dir = self.state.lock().unwrap().config_dir.clone();
+        let defaults = new_config.app_default.clone();
 
-        let listed = registry::list(&new_core, &core_dir)?;
+        let listed = registry::list(&new_config, &config_dir)?;
         let mut errors: Vec<String> = Vec::new();
         let mut summary: Vec<String> = Vec::new();
         let mut new_records: Vec<AppRecord> = Vec::new();
@@ -362,8 +396,8 @@ impl Supervisor {
 
         {
             let mut st = self.state.lock().unwrap();
-            let log_dir = config::resolve_path(&st.core.daemon.log_dir, &st.core_dir);
-            let ring_cap = st.core.daemon.log_buffer_lines;
+            let log_dir = config::resolve_path(&st.config.daemon.log_dir, &st.config_dir);
+            let ring_cap = st.config.daemon.log_buffer_lines;
 
             // Apps no longer registered: stop and drop all their programs.
             let keep: HashSet<String> = new_records.iter().map(|a| a.name.clone()).collect();
@@ -384,8 +418,7 @@ impl Supervisor {
             // Per-app program diff.
             for app in &resolved {
                 let new_defs: &Vec<ResolvedProgram> = &app.programs;
-                let new_names: HashSet<&str> =
-                    new_defs.iter().map(|p| p.name.as_str()).collect();
+                let new_names: HashSet<&str> = new_defs.iter().map(|p| p.name.as_str()).collect();
                 let old_names: Vec<String> = st
                     .programs
                     .values()
@@ -430,16 +463,16 @@ impl Supervisor {
             }
 
             // Daemon fields that cannot hot-apply.
-            let old_daemon = st.core.daemon.clone();
-            if old_daemon.port != new_core.daemon.port
-                || old_daemon.host != new_core.daemon.host
+            let old_daemon = st.config.daemon.clone();
+            if old_daemon.port != new_config.daemon.port
+                || old_daemon.host != new_config.daemon.host
             {
                 summary.push("daemon host/port changed: restart xkeeper to apply".into());
             }
-            if old_daemon.auth_token != new_core.daemon.auth_token {
+            if old_daemon.auth_token != new_config.daemon.auth_token {
                 summary.push("daemon auth_token changed: restart xkeeper to apply".into());
             }
-            st.core = new_core;
+            st.config = new_config;
             st.apps = new_records;
         }
         self.sync_health_tasks();
@@ -474,7 +507,10 @@ impl Supervisor {
                 })
                 .collect()
         };
-        info!("shutdown: stopping {} program(s) in reverse order", order.len());
+        info!(
+            "shutdown: stopping {} program(s) in reverse order",
+            order.len()
+        );
         let mut st = self.state.lock().unwrap();
         for name in order {
             if let Some(p) = st.programs.get_mut(&name) {
@@ -488,7 +524,10 @@ impl Supervisor {
     /// Consume commands, tick programs, until shutdown. Runs on the spawned
     /// supervisor thread.
     pub fn run(self: &Arc<Self>) {
-        info!("supervisor loop started (interval {:.1}s)", self.interval.as_secs_f64());
+        info!(
+            "supervisor loop started (interval {:.1}s)",
+            self.interval.as_secs_f64()
+        );
         while !self.state.lock().unwrap().shutdown.load(Ordering::SeqCst) {
             while let Some(cmd) = self.pop_command() {
                 self.execute(cmd);
@@ -516,10 +555,7 @@ impl Supervisor {
                 let guard = self.queue.lock().unwrap();
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 let slice = remaining.min(Duration::from_millis(100));
-                let (guard, _) = self
-                    .cv
-                    .wait_timeout(guard, slice)
-                    .unwrap();
+                let (guard, _) = self.cv.wait_timeout(guard, slice).unwrap();
                 let pending = !guard.is_empty();
                 drop(guard);
                 if pending {

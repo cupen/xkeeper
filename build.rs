@@ -77,9 +77,8 @@ fn main() {
     ];
     let newest_input = newest_mtime(&inputs);
     let stale = marker.exists()
-        || newest_input.is_none_or(|newest| {
-            !index.exists() || mtime(&index).is_some_and(|t| t < newest)
-        });
+        || newest_input
+            .is_none_or(|newest| !index.exists() || mtime(&index).is_some_and(|t| t < newest));
 
     if stale && !build_webui(&webui, &dist) && !index.exists() {
         // No usable bundle and no toolchain (or the build failed): embed a
@@ -116,9 +115,12 @@ fn build_mode() -> BuildMode {
         "skip" | "0" | "false" => BuildMode::Skip,
         "force" => BuildMode::Force,
         _ => {
-            let debug =
-                matches!(std::env::var("PROFILE").as_deref(), Ok("debug") | Err(_));
-            if debug { BuildMode::Skip } else { BuildMode::Auto }
+            let debug = matches!(std::env::var("PROFILE").as_deref(), Ok("debug") | Err(_));
+            if debug {
+                BuildMode::Skip
+            } else {
+                BuildMode::Auto
+            }
         }
     }
 }
@@ -137,7 +139,14 @@ fn build_webui(webui: &Path, dist: &Path) -> bool {
         || mtime(&lock).is_some_and(|lock_t| mtime(&modules).is_none_or(|m_t| lock_t > m_t));
 
     let _ = fs::remove_dir_all(dist);
-    if need_install && !run(&pnpm, webui, &["install", "--frozen-lockfile"], "pnpm install") {
+    if need_install
+        && !run(
+            &pnpm,
+            webui,
+            &["install", "--frozen-lockfile"],
+            "pnpm install",
+        )
+    {
         return false;
     }
     run(&pnpm, webui, &["build"], "pnpm build")

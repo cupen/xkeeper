@@ -1,5 +1,5 @@
 ---
-# 护栏通过后的安装流程：目录 → 分发二进制 → 装核心配置 → service install
+# 护栏通过后的安装流程：目录 → 分发二进制 → 装 daemon 配置 → service install
 # → 验证。文件变化经 handler 触发服务重启（仅覆盖既有安装时生效）。
 
 - name: Ensure destination directories exist
@@ -22,7 +22,7 @@
     mode: "0755"
   notify: Restart xkeeper service
 
-- name: Install core config
+- name: Install daemon config
   ansible.builtin.copy:
     src: "{{ xkeeper_config_src }}"
     dest: "{{ xkeeper_config_dest }}"

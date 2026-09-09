@@ -1,18 +1,23 @@
 /**
- * Placeholder dashboard. The real console surface (program overview,
- * status badges, controls, logs — the `webui-ui` capability) lands in
- * follow-up changes; this view only proves the frontend→backend chain
- * (`GET /api/health`) and states honestly that the console is under
- * construction. No fake data, no dead controls.
+ * Dashboard (route `/`): daemon-level overview — system resources live in
+ * the overview bar; this view lists every registered app with its program
+ * states, so a fatal anywhere is visible without drilling in. Replaces the
+ * earlier under-construction placeholder.
  */
 
-import { LitElement, css, html } from 'lit'
-import { customElement, state } from 'lit/decorators.js'
+import { LitElement, css, html, nothing } from 'lit'
+import { customElement, property } from 'lit/decorators.js'
+import { ConsoleController, consoleStore, type ConsoleStore } from '../lib/store.js'
+import type { ProgramInfo } from '../lib/types.js'
+import { stateGlyph } from '../lib/format.js'
+import { navigate } from '../router.js'
 
 @customElement('xkeeper-dashboard')
 export class XkeeperDashboard extends LitElement {
-  /** null = probe pending; true/false = backend reachability. */
-  @state() private backendUp: boolean | null = null
+  /** Injectable for tests; defaults to the shared singleton. */
+  @property({ attribute: false }) store: ConsoleStore = consoleStore
+
+  private console: ConsoleController | null = null
 
   static styles = css`
     :host {
@@ -21,93 +26,169 @@ export class XkeeperDashboard extends LitElement {
       overflow-y: auto;
       display: flex;
       flex-direction: column;
-      align-items: center;
-      justify-content: center;
       gap: var(--xkeeper-space-4);
-      padding: var(--xkeeper-space-8) var(--xkeeper-space-5);
+      padding: var(--xkeeper-space-4) var(--xkeeper-space-5);
       box-sizing: border-box;
-      text-align: center;
     }
     h1 {
       margin: 0;
-      font-size: 1.35rem;
-      font-weight: 700;
+      font-size: 1.25rem;
       color: var(--xkeeper-text-bright);
     }
-    p {
-      margin: 0;
-      max-width: 560px;
-      line-height: 1.6;
-      color: var(--xkeeper-text-dim);
-      font-size: 0.92rem;
-    }
-    code {
-      font-family: var(--xkeeper-font-mono);
-      font-size: 0.85em;
-      color: var(--xkeeper-text);
-      background: var(--xkeeper-well);
-      border: 1px solid var(--xkeeper-border);
+    .banner {
+      padding: var(--xkeeper-space-2) var(--xkeeper-space-3);
       border-radius: var(--xkeeper-radius-sm, 6px);
-      padding: 1px 6px;
+      font-size: 0.85rem;
     }
-    .health {
-      display: inline-flex;
+    .banner[data-mode='poll'] {
+      background: color-mix(in srgb, var(--xkeeper-status-working) 12%, transparent);
+      color: var(--xkeeper-status-working);
+      border: 1px solid var(--xkeeper-status-working-border, transparent);
+    }
+    .banner[data-mode='offline'] {
+      background: var(--xkeeper-status-failed-bg);
+      color: var(--xkeeper-status-failed);
+      border: 1px solid var(--xkeeper-status-failed-border);
+    }
+    .app {
+      background: var(--xkeeper-surface);
+      border: 1px solid var(--xkeeper-border);
+      border-radius: var(--xkeeper-radius-lg, 10px);
+      padding: var(--xkeeper-space-3) var(--xkeeper-space-4);
+    }
+    .app h2 {
+      margin: 0 0 var(--xkeeper-space-2);
+      font-size: 1rem;
+      color: var(--xkeeper-text-bright);
+    }
+    .app a {
+      color: inherit;
+      text-decoration: none;
+    }
+    .app a:hover h2 {
+      color: var(--xkeeper-accent-hover);
+    }
+    ul {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    li {
+      display: flex;
       align-items: center;
       gap: 8px;
-      padding: 6px 14px;
-      border-radius: var(--xkeeper-radius-full, 999px);
-      border: 1px solid var(--xkeeper-border);
-      background: var(--xkeeper-surface);
-      font-size: 0.85rem;
+      font-size: 0.88rem;
       color: var(--xkeeper-text-dim);
+      font-variant-numeric: tabular-nums;
+      cursor: pointer;
     }
-    .health .dot {
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      flex: 0 0 auto;
+    li[data-state='fatal'] {
+      color: var(--xkeeper-status-failed);
     }
-    .health[data-up='true'] .dot {
-      background: #3fd68f;
-      box-shadow: 0 0 8px rgba(63, 214, 143, 0.6);
+    li .glyph {
+      width: 1em;
+      text-align: center;
     }
-    .health[data-up='false'] .dot {
-      background: #ff6b6b;
+    .fatal-note {
+      color: var(--xkeeper-text-faint);
+      font-size: 0.8rem;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
-    .health[data-up='pending'] .dot {
-      background: var(--xkeeper-text-faint);
+    .empty {
+      padding: var(--xkeeper-space-6);
+      text-align: center;
+      color: var(--xkeeper-text-faint);
+    }
+    .empty code {
+      font-family: var(--xkeeper-font-mono, monospace);
+      color: var(--xkeeper-text-dim);
     }
   `
 
   connectedCallback(): void {
     super.connectedCallback()
-    this.probe()
+    this.console = new ConsoleController(this, this.store)
   }
 
-  private async probe(): Promise<void> {
-    try {
-      const res = await fetch('/api/health')
-      this.backendUp = res.ok
-    } catch {
-      this.backendUp = false
+  private get consoleState() {
+    return this.console?.snapshot ?? { doc: null, transport: 'connecting' as const }
+  }
+
+  private byApp(): Map<string, ProgramInfo[]> {
+    const map = new Map<string, ProgramInfo[]>()
+    for (const p of this.consoleState.doc?.programs ?? []) {
+      const list = map.get(p.app) ?? []
+      list.push(p)
+      map.set(p.app, list)
     }
+    return map
   }
 
-  protected render(): unknown {
-    const up = this.backendUp
+  private go(e: MouseEvent, path: string): void {
+    if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return
+    e.preventDefault()
+    navigate(path)
+  }
+
+  render() {
+    const { doc, transport } = this.consoleState
     return html`
-      <h1>Web 控制台建设中</h1>
-      <p>
-        xkeeper 的控制台界面（程序总览、状态徽章、启停控制、日志查看）按
-        <code>openspec</code> 的 <code>webui-ui</code> 能力规格在后续变更中实现。
-        本占位页仅用于验证前端与后端 <code>/api/health</code> 的链路。
-      </p>
-      <div class="health" data-up=${up === null ? 'pending' : String(up)}>
-        <span class="dot" aria-hidden="true"></span>
-        <span>
-          ${up === null ? '正在探测后端…' : up ? '后端可达 · /api/health ok' : '后端不可达 · 请启动 xkeeper webui'}
-        </span>
-      </div>
+      <h1>总览</h1>
+      ${transport === 'poll'
+        ? html`<div class="banner" data-mode="poll" role="status">
+            实时连接已断开 — 正以轮询方式刷新（数据可能略有延迟）
+          </div>`
+        : nothing}
+      ${transport === 'offline'
+        ? html`<div class="banner" data-mode="offline" role="alert">
+            后端不可达 — 显示的是最后已知数据（已过期）；恢复后将自动更新
+          </div>`
+        : nothing}
+      ${doc && doc.programs.length === 0
+        ? html`<div class="empty">
+              还没有应用。<code>xkeeper add &lt;目录&gt;</code> 注册后出现在这里。
+            </div>`
+        : nothing}
+      ${[...this.byApp()].map(
+        ([app, programs]) => html`
+          <section class="app">
+            <a
+              href=${`/app/${encodeURIComponent(app)}`}
+              @click=${(e: MouseEvent) => this.go(e, `/app/${encodeURIComponent(app)}`)}
+            >
+              <h2>▤ ${app}</h2>
+            </a>
+            <ul>
+              ${programs.map(
+                (p) => html`
+                  <li
+                    data-state=${p.state}
+                    @click=${() =>
+                      navigate(`/app/${encodeURIComponent(app)}/program/${encodeURIComponent(p.name)}`)}
+                  >
+                    <span class="glyph" aria-hidden="true">${stateGlyph(p.state)}</span>
+                    <xkeeper-status-badge slug=${p.state} label=${p.state} glyph=${stateGlyph(p.state)}
+                    ></xkeeper-status-badge>
+                    <span>${p.name}</span>
+                    ${p.fatal_reason ? html`<span class="fatal-note">${p.fatal_reason}</span>` : nothing}
+                  </li>
+                `,
+              )}
+            </ul>
+          </section>
+        `,
+      )}
     `
+  }
+}
+
+declare global {
+  interface HTMLElementTagNameMap {
+    'xkeeper-dashboard': XkeeperDashboard
   }
 }

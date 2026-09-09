@@ -10,8 +10,8 @@
 //! frames, see [`crate::api`]).
 
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -29,8 +29,9 @@ use tower_http::compression::CompressionLayer;
 
 use crate::api::{self, msg_type};
 use crate::assets;
+use crate::pump;
 use crate::pump::Stream;
-use crate::server::{program_info, status_doc, ProgramInfo, StatusDoc};
+use crate::server::{ProgramInfo, StatusDoc, program_info, status_doc};
 use crate::supervisor::{Command, Supervisor};
 
 /// Replay context when a client subscribes to a log stream.
@@ -42,6 +43,15 @@ const WS_HEARTBEAT: Duration = Duration::from_secs(30);
 /// How long an HTTP control request waits for the supervisor to execute it
 /// (a stop may block up to the program's stop_timeout).
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+/// One log frame carries multiple lines: flush at this size…
+const FRAME_BYTES: usize = 64 * 1024;
+/// …or this long after the first pending byte (latency bound).
+const FRAME_INTERVAL: Duration = Duration::from_millis(100);
+/// Log frames wait up to this long for a session-writer slot. Blocking (not
+/// closing) is what routes backpressure into the bounded rx queue, where
+/// loss is counted and surfaced as Gap markers; a truly dead client still
+/// frees the session when the budget lapses (and on sink errors).
+const LOG_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Deserialize)]
 struct LogQuery {
@@ -65,13 +75,10 @@ async fn programs(State(sup): State<Arc<Supervisor>>) -> Json<serde_json::Value>
     Json(json!({ "programs": status_doc(&sup).programs }))
 }
 
-async fn program_detail(
-    State(sup): State<Arc<Supervisor>>,
-    Path(name): Path<String>,
-) -> Response {
+async fn program_detail(State(sup): State<Arc<Supervisor>>, Path(name): Path<String>) -> Response {
     let st = sup.state.lock().unwrap();
     match st.programs.get(&name) {
-        Some(p) => Json(program_info(p)).into_response(),
+        Some(p) => Json(program_info(p, Some(&sup.metrics))).into_response(),
         None => api_error(StatusCode::NOT_FOUND, &format!("unknown program {name:?}")),
     }
 }
@@ -93,7 +100,7 @@ async fn program_logs(
                 return api_error(
                     StatusCode::BAD_REQUEST,
                     &format!("stream must be \"out\" or \"err\", got {other:?}"),
-                )
+                );
             }
         };
         (p.ring(stream), q.tail.unwrap_or(LOG_TAIL_DEFAULT))
@@ -114,14 +121,23 @@ async fn program_action(
     use std::sync::mpsc;
     let (tx, rx) = mpsc::channel();
     let cmd = match action.as_str() {
-        "start" => Command::Start { name, reply: Some(tx) },
-        "stop" => Command::Stop { name, reply: Some(tx) },
-        "restart" => Command::Restart { name, reply: Some(tx) },
+        "start" => Command::Start {
+            name,
+            reply: Some(tx),
+        },
+        "stop" => Command::Stop {
+            name,
+            reply: Some(tx),
+        },
+        "restart" => Command::Restart {
+            name,
+            reply: Some(tx),
+        },
         other => {
             return api_error(
                 StatusCode::NOT_FOUND,
                 &format!("unknown action {other:?} (start | stop | restart)"),
-            )
+            );
         }
     };
     sup.enqueue(cmd);
@@ -243,6 +259,8 @@ async fn ws_session(socket: WebSocket, sup: Arc<Supervisor>) {
     let mut heartbeat = tokio::time::interval(WS_HEARTBEAT);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut subs: HashMap<(String, Stream), tokio::task::JoinHandle<()>> = HashMap::new();
+    // A saturated session closes wholesale; subscribe tasks signal here.
+    let (close_tx, mut close_rx) = mpsc::channel::<()>(1);
 
     loop {
         tokio::select! {
@@ -276,7 +294,8 @@ async fn ws_session(socket: WebSocket, sup: Arc<Supervisor>) {
                                 let key = (program.clone(), stream);
                                 if let std::collections::hash_map::Entry::Vacant(e) = subs.entry(key.clone()) {
                                     e.insert(tokio::spawn(subscribe_logs(
-                                        sup.clone(), out_tx.clone(), program, stream,
+                                        sup.clone(), out_tx.clone(), close_tx.clone(),
+                                        program, stream,
                                     )));
                                 }
                             }
@@ -310,9 +329,20 @@ async fn ws_session(socket: WebSocket, sup: Arc<Supervisor>) {
                         let _ = out_tx.send(api::encode_ws_message(msg_type::STATUS, &payload)).await;
                     }
                 }
+                // Daemon shutting down: end the session so the console
+                // server's graceful drain (webui-api: 随守护进程退出) can
+                // complete instead of waiting on this connection forever.
+                if sup.state.lock().unwrap().shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
             }
             _ = heartbeat.tick() => {
                 let _ = out_tx.send(api::encode_ws_message(msg_type::HEARTBEAT, b"null")).await;
+            }
+            _ = close_rx.recv() => {
+                // A log subscriber hit sustained backpressure: drop the whole
+                // session; the client reconnects with backoff and resyncs.
+                break;
             }
         }
     }
@@ -323,11 +353,17 @@ async fn ws_session(socket: WebSocket, sup: Arc<Supervisor>) {
     writer.abort();
 }
 
-/// Replay the current tail once, then forward ring-buffer lines as they are
-/// pumped (log-management spec: follow pushes lines as they are written).
+/// Replay the current tail once, then forward ring-buffer batches as
+/// aggregated frames (one frame = many lines, bounded by [`FRAME_BYTES`] /
+/// [`FRAME_INTERVAL`]). Gap markers from the bounded subscription are sent
+/// as their own LOG_GAP frames, always ordered before subsequent content.
+/// If the session writer stays saturated past [`SEND_TIMEOUT`], the close
+/// channel is signalled so the whole session drops (webui-api: WS 日志批量
+/// 推送与背压; slow viewers never back up the pump).
 async fn subscribe_logs(
     sup: Arc<Supervisor>,
     out_tx: mpsc::Sender<Vec<u8>>,
+    close_tx: mpsc::Sender<()>,
     program: String,
     stream: Stream,
 ) {
@@ -345,41 +381,117 @@ async fn subscribe_logs(
     if !tail.is_empty() {
         let mut data = tail.join("\n");
         data.push('\n');
-        let _ = out_tx.send(api::encode_log_frame(&program, sb, data.as_bytes())).await;
+        if out_tx
+            .send(api::encode_log_frame(&program, sb, data.as_bytes()))
+            .await
+            .is_err()
+        {
+            return; // client went away
+        }
     }
 
-    // The ring's subscribe channel is a blocking std mpsc receiver; poll it
-    // without blocking the async runtime.
     let rx = ring.subscribe();
+    let mut frame: Vec<u8> = Vec::with_capacity(FRAME_BYTES * 2);
+    let mut deadline: Option<tokio::time::Instant> = None;
     loop {
-        let mut got = false;
-        while let Ok(line) = rx.try_recv() {
-            got = true;
-            let mut data = line;
-            data.push('\n');
-            if out_tx.send(api::encode_log_frame(&program, sb, data.as_bytes())).await.is_err() {
-                return; // client went away
+        // Drain what is queued. Frames flush mid-batch — never splitting a
+        // line, never dropping the remainder of a batch — so a frame is
+        // bounded at FRAME_BYTES + one line.
+        let mut drained_any = false;
+        while let Ok(item) = rx.try_recv() {
+            drained_any = true;
+            match item {
+                pump::SubItem::Lines(lines) => {
+                    for l in lines {
+                        frame.extend_from_slice(l.as_bytes());
+                        frame.push(b'\n');
+                        if frame.len() >= FRAME_BYTES {
+                            let payload = std::mem::take(&mut frame);
+                            deadline = None;
+                            if !send_frame(&out_tx, api::encode_log_frame(&program, sb, &payload))
+                                .await
+                            {
+                                saturate_close(&close_tx).await;
+                                return;
+                            }
+                        }
+                    }
+                }
+                pump::SubItem::Gap(n) => {
+                    // The marker must precede content that arrived after the
+                    // loss, so flush pending content first.
+                    if !frame.is_empty() {
+                        let payload = std::mem::take(&mut frame);
+                        deadline = None;
+                        if !send_frame(&out_tx, api::encode_log_frame(&program, sb, &payload)).await
+                        {
+                            saturate_close(&close_tx).await;
+                            return;
+                        }
+                    }
+                    // A gap marker is accounting the client is owed: wait for
+                    // a writer slot (past the ordinary saturation bound) so a
+                    // merely-slow client still learns what it missed.
+                    if !send_frame(&out_tx, api::encode_gap_frame(&program, sb, n)).await {
+                        saturate_close(&close_tx).await;
+                        return;
+                    }
+                }
             }
         }
-        if !got {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        if !frame.is_empty() && deadline.is_none() {
+            deadline = Some(tokio::time::Instant::now() + FRAME_INTERVAL);
         }
+        let due = deadline
+            .map(|d| tokio::time::Instant::now() >= d)
+            .unwrap_or(false);
+        if due && !frame.is_empty() {
+            let payload = std::mem::take(&mut frame);
+            deadline = None;
+            if !send_frame(&out_tx, api::encode_log_frame(&program, sb, &payload)).await {
+                saturate_close(&close_tx).await;
+                return;
+            }
+        }
+        // Idle (nothing drained, nothing pending): poll in slices. Anything
+        // in flight: short slices so throughput stays production-bound.
+        tokio::time::sleep(if !drained_any && frame.is_empty() {
+            Duration::from_millis(20)
+        } else {
+            Duration::from_millis(2)
+        })
+        .await;
     }
+}
+
+/// One frame to the session writer. Ordinary frames carry the saturation
+/// bound (a frozen network must free the session); gap frames wait far
+/// longer. False = give up and close this session.
+async fn send_frame(out_tx: &mpsc::Sender<Vec<u8>>, frame: Vec<u8>) -> bool {
+    match out_tx.send_timeout(frame, LOG_SEND_TIMEOUT).await {
+        Ok(()) => true,
+        Err(_) => false,
+    }
+}
+
+/// Signal the session loop to close after sustained writer saturation.
+async fn saturate_close(close_tx: &mpsc::Sender<()>) {
+    let _ = close_tx.send(()).await;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::CoreConfig;
+    use crate::config::DaemonConfig;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
     fn test_sup() -> Arc<Supervisor> {
-        let core = CoreConfig::default();
+        let config = DaemonConfig::default();
         let dir = std::env::temp_dir().join(format!("xkeeper-web-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
-        Supervisor::new(core, &dir).unwrap()
+        Supervisor::new(config, &dir).unwrap()
     }
 
     async fn get(app: Router, uri: &str) -> (StatusCode, axum::body::Bytes) {
@@ -388,7 +500,9 @@ mod tests {
             .await
             .unwrap();
         let status = resp.status();
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         (status, body)
     }
 
@@ -417,13 +531,366 @@ mod tests {
     #[test]
     fn status_delta_reports_only_changes() {
         let a = ProgramInfo {
-            app: "app".into(), name: "a".into(), state: "running".into(),
-            pid: Some(1), unhealthy: false, uptime_secs: 1.0, total_exits: 0,
-            restart_backoff: 1.0, last_exit: None, fatal_reason: None, wait_reason: None,
+            app: "app".into(),
+            name: "a".into(),
+            state: "running".into(),
+            pid: Some(1),
+            unhealthy: false,
+            uptime_secs: 1.0,
+            total_exits: 0,
+            restart_backoff: 1.0,
+            last_exit: None,
+            fatal_reason: None,
+            wait_reason: None,
+            cpu_percent: None,
+            mem_bytes: None,
+            log_rate: crate::metrics::LogRates::default(),
+            command: String::new(),
+            args: Vec::new(),
+            work_dir: String::new(),
         };
-        let b_changed = { let mut x = a.clone(); x.state = "backoff".into(); x };
+        let b_changed = {
+            let mut x = a.clone();
+            x.state = "backoff".into();
+            x
+        };
         let delta = status_delta(&[a.clone()], &[b_changed.clone()]);
         assert_eq!(delta, vec![b_changed]);
         assert!(status_delta(&[a.clone()], &[a]).is_empty());
+    }
+
+    #[test]
+    fn status_delta_reports_metric_changes() {
+        // webui-api: WS 增量携带指标变化 — a metric-only difference must
+        // produce a delta entry (the STATUS event then carries the new value).
+        let a = ProgramInfo {
+            app: "app".into(),
+            name: "a".into(),
+            state: "running".into(),
+            pid: Some(1),
+            unhealthy: false,
+            uptime_secs: 1.0,
+            total_exits: 0,
+            restart_backoff: 1.0,
+            last_exit: None,
+            fatal_reason: None,
+            wait_reason: None,
+            cpu_percent: None,
+            mem_bytes: None,
+            log_rate: crate::metrics::LogRates::default(),
+            command: String::new(),
+            args: Vec::new(),
+            work_dir: String::new(),
+        };
+        let mut b = a.clone();
+        b.cpu_percent = Some(37.5);
+        let delta = status_delta(&[a], &[b.clone()]);
+        assert_eq!(delta, vec![b]);
+    }
+
+    // -- metrics contract tests (webui-api: 投影携带指标) --------------------
+
+    use crate::config::{AppRaw, resolve_app};
+    use crate::metrics::{ProgramMetrics, SystemMetrics};
+    use crate::program::ManagedProgram;
+    use std::path::Path;
+
+    /// A supervisor with one declared program "m" and metric values injected
+    /// into the shared sampler table.
+    fn sup_with_metrics() -> (Arc<Supervisor>, String) {
+        let config = DaemonConfig::default();
+        let dir = std::env::temp_dir().join(format!("xk-web-metrics-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sup = Supervisor::new(config, &dir).unwrap();
+        let raw: AppRaw = toml::from_str("[program.m]\ncommand = 'true'\n").unwrap();
+        let app = resolve_app("demo", Path::new("x.toml"), &raw, None).unwrap();
+        let def = app.programs.into_iter().next().unwrap();
+        let name = def.name.clone();
+        {
+            let mut st = sup.state.lock().unwrap();
+            st.programs
+                .insert(name.clone(), ManagedProgram::new(def, dir, 10));
+        }
+        sup.metrics.set_program(
+            &name,
+            ProgramMetrics {
+                cpu_percent: Some(12.5),
+                mem_bytes: Some(4096),
+            },
+        );
+        sup.metrics.set_system(SystemMetrics {
+            cpu_percent: Some(3.4),
+            mem_used_bytes: 1024,
+            mem_total_bytes: 8192,
+        });
+        (sup, name)
+    }
+
+    #[tokio::test]
+    async fn overview_json_carries_metric_fields() {
+        let (sup, name) = sup_with_metrics();
+        let app = build_router(sup);
+        let (status, body) = get(app, "/api/overview").await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let p = &v["programs"][0];
+        assert_eq!(p["name"], name);
+        assert_eq!(p["cpu_percent"], 12.5);
+        assert_eq!(p["mem_bytes"], 4096);
+        assert!(
+            p["log_rate"]["out"]["w10"].is_number(),
+            "log_rate fields present"
+        );
+        assert_eq!(v["daemon"]["system"]["cpu_percent"], 3.4);
+        assert_eq!(v["daemon"]["system"]["mem_total_bytes"], 8192);
+    }
+
+    #[tokio::test]
+    async fn ws_snapshot_carries_metric_fields() {
+        let (sup, name) = sup_with_metrics();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sup2 = sup.clone();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, build_router(sup2)).await;
+        });
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .expect("ws connect");
+        let msg = ws.next().await.unwrap().unwrap();
+        let (t, payload) = api::decode_ws_message(&msg.into_data()).unwrap();
+        assert_eq!(t, msg_type::SNAPSHOT);
+        let doc: StatusDoc = rmp_serde::from_slice(&payload).unwrap();
+        let p = doc.programs.iter().find(|p| p.name == name).unwrap();
+        assert_eq!(p.cpu_percent, Some(12.5));
+        assert_eq!(p.mem_bytes, Some(4096));
+        assert_eq!(doc.daemon.system.cpu_percent, Some(3.4));
+    }
+
+    #[tokio::test]
+    async fn control_plane_status_carries_metrics() {
+        let (sup, name) = sup_with_metrics();
+        // Port 0 → OS-assigned ephemeral port; no clashes with other tests.
+        {
+            let mut st = sup.state.lock().unwrap();
+            st.config.daemon.port = 0;
+        }
+        let listener = crate::server::bind(&sup).expect("ephemeral bind");
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || crate::server::serve(sup, listener));
+
+        let resp = ureq::get(&format!("http://{addr}/v1/status"))
+            .call()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&resp.into_string().unwrap()).unwrap();
+        let p = v["programs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .expect("program in /v1/status");
+        assert_eq!(p["cpu_percent"], 12.5);
+        assert_eq!(p["mem_bytes"], 4096);
+        assert_eq!(v["daemon"]["system"]["cpu_percent"], 3.4);
+    }
+}
+
+#[cfg(test)]
+mod high_speed_tests {
+    use super::*;
+    use crate::config::{AppRaw, DaemonConfig, resolve_app};
+    use crate::program::ManagedProgram;
+    use crate::pump::SUB_CHANNEL_BATCHES;
+    use futures_util::{Sink, StreamExt};
+    use std::path::Path;
+    use std::time::Duration;
+    use tokio_tungstenite::tungstenite::Message as ClientMessage;
+    use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+
+    type ClientWs = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+    /// Supervisor + router on an ephemeral port + one declared program "m"
+    /// whose out-ring is directly pushable (stand-in for a firehose child).
+    async fn firehose_setup() -> (Arc<Supervisor>, String, ClientWs, Arc<pump::Ring>) {
+        let config = DaemonConfig::default();
+        let dir = std::env::temp_dir().join(format!("xk-hs-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sup = Supervisor::new(config, &dir).unwrap();
+        let raw: AppRaw = toml::from_str("[program.m]\ncommand = 'true'\n").unwrap();
+        let app = resolve_app("demo", Path::new("x.toml"), &raw, None).unwrap();
+        let def = app.programs.into_iter().next().unwrap();
+        let name = def.name.clone();
+        let ring = {
+            let mut st = sup.state.lock().unwrap();
+            let p = ManagedProgram::new(def, dir, 100000);
+            let ring = p.ring(Stream::Out);
+            st.programs.insert(name.clone(), p);
+            ring
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sup2 = sup.clone();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, build_router(sup2)).await;
+        });
+        let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .expect("ws connect");
+        (sup, name, ws, ring)
+    }
+
+    async fn subscribe<S>(ws: &mut S, program: &str, stream: &str)
+    where
+        S: Sink<ClientMessage> + Unpin,
+        S::Error: std::fmt::Debug,
+    {
+        let action = serde_json::json!({
+            "action": "subscribe", "program": program, "stream": stream
+        });
+        ws.send(ClientMessage::Binary(
+            serde_json::to_vec(&action).unwrap().into(),
+        ))
+        .await
+        .expect("subscribe send failed");
+        // Let the session spawn the subscriber (tail replay of an empty ring).
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    /// webui-api 多行单帧 + 内容完整: a fast producer whose client keeps up
+    /// must see every line, aggregated into far fewer frames than lines.
+    #[tokio::test]
+    async fn high_speed_output_delivers_every_line_in_multi_line_frames() {
+        let (_sup, name, mut ws, ring) = firehose_setup().await;
+        subscribe(&mut ws, &name, "out").await;
+
+        const WAVES: usize = 40;
+        const BATCHES_PER_WAVE: usize = 30;
+        const LINES_PER_BATCH: usize = 10;
+        let total = WAVES * BATCHES_PER_WAVE * LINES_PER_BATCH;
+
+        // Concurrent reader: a keeping-up client (reading while we produce)
+        // must see every line. Waves drain fully between sends: 30 batches
+        // per wave (< queue depth 64) with 50 ms gaps vs the subscriber's
+        // 20 ms poll, so at most one wave is ever queued.
+        let reader = tokio::spawn(async move {
+            let mut lines_seen = 0usize;
+            let mut log_frames = 0usize;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while lines_seen < total {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "timeout: {lines_seen}/{total} lines in {log_frames} frames"
+                );
+                let msg = ws.next().await.expect("ws closed early").unwrap();
+                let (t, payload) = api::decode_ws_message(&msg.into_data()).unwrap();
+                if t != msg_type::LOG {
+                    continue; // snapshot / status / heartbeat frames may interleave
+                }
+                let (_, _, data) = api::decode_log_frame(&rebuild(t, &payload)).unwrap();
+                lines_seen += data.lines().count();
+                log_frames += 1;
+            }
+            (lines_seen, log_frames)
+        });
+
+        for w in 0..WAVES {
+            for b in 0..BATCHES_PER_WAVE {
+                let lines: Vec<String> = (0..LINES_PER_BATCH)
+                    .map(|i| format!("w{w}b{b}l{i}-0123456789"))
+                    .collect();
+                ring.push_batch(&lines);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let (lines_seen, log_frames) = reader.await.unwrap();
+        assert_eq!(lines_seen, total, "a keeping-up client loses nothing");
+        assert!(
+            log_frames < total / 100,
+            "frames must aggregate many lines (got {log_frames} frames for {total} lines)"
+        );
+    }
+
+    /// decode_ws_message strips (and decompresses) the frame header; the
+    /// decode_*_frame helpers expect the full frame back.
+    fn rebuild(t: u8, payload: &[u8]) -> Vec<u8> {
+        let mut f = Vec::with_capacity(payload.len() + 1);
+        f.push(t);
+        f.extend_from_slice(payload);
+        f
+    }
+
+    /// webui-api 慢客户端收到丢弃标记: a stalled client overflows the bounded
+    /// subscriber queue; when it catches up, the loss arrives as an explicit
+    /// LOG_GAP frame, never mixed into log content.
+    #[tokio::test]
+    async fn stalled_client_receives_explicit_gap_frame() {
+        let (_sup, name, mut ws, ring) = firehose_setup().await;
+        subscribe(&mut ws, &name, "out").await;
+
+        // Synchronous burst on the single-threaded test runtime: the
+        // subscriber task cannot run mid-burst, so overflow is deterministic.
+        // Queue holds SUB_CHANNEL_BATCHES batches; the rest is dropped there.
+        const BURST: usize = SUB_CHANNEL_BATCHES + 200;
+        for i in 0..BURST {
+            ring.push_batch(&[format!("burst-{i}")]);
+        }
+        // Let the subscriber drain the queued batches (no Gap among them).
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Next delivery must start with the accumulated Gap.
+        ring.push_batch(&["trigger".to_string()]);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "gap frame never arrived"
+            );
+            let msg = ws.next().await.unwrap().unwrap();
+            let (t, payload) = api::decode_ws_message(&msg.into_data()).unwrap();
+            if t == msg_type::LOG_GAP {
+                let (prog, stream, dropped) = api::decode_gap_frame(&rebuild(t, &payload)).unwrap();
+                assert_eq!(prog, name);
+                assert_eq!(stream, 0);
+                assert_eq!(dropped, (BURST - SUB_CHANNEL_BATCHES) as u64);
+                // The stream continues: the trigger line follows.
+                let msg = ws.next().await.unwrap().unwrap();
+                let (t, payload) = api::decode_ws_message(&msg.into_data()).unwrap();
+                assert_eq!(t, msg_type::LOG);
+                let (_, _, data) = api::decode_log_frame(&rebuild(t, &payload)).unwrap();
+                assert!(
+                    data.contains("trigger"),
+                    "stream resumes after the gap: {data:?}"
+                );
+                return;
+            }
+            // (snapshot/status frames may precede; keep reading)
+        }
+    }
+
+    /// 3.4 落盘完整性: a large burst through the real pump path lands on disk
+    /// line-for-line while the ring stays bounded.
+    #[test]
+    fn pump_writes_every_line_to_disk_under_batching() {
+        let tmp = std::env::temp_dir().join(format!("xk-hs-disk-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let total = 50_000;
+        let text: String = (0..total)
+            .map(|i| format!("disk-{i}-0123456789abcdef\n"))
+            .collect();
+        let ring = pump::Ring::new(1000);
+        let path = tmp.join("d.log");
+        // max_size None: no rotation — file must hold every line.
+        pump::pump(
+            std::io::Cursor::new(text.into_bytes()),
+            ring.clone(),
+            path.clone(),
+            None,
+            2,
+        );
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content.lines().count(), total);
+        assert_eq!(ring.tail(total + 1).len(), 1000, "ring stays bounded");
+        let _ = std::fs::remove_dir_all(tmp);
     }
 }

@@ -3,7 +3,6 @@
 // the `webui-ui` capability and lands in follow-up changes.
 
 import './app-shell.js'
-import './views/dashboard.js'
 
 // Web Awesome theme + base styles (self-hosted, no CDN).
 import '@awesome.me/webawesome/dist/styles/webawesome.css'

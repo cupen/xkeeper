@@ -1,0 +1,46 @@
+# xkeeper daemon 配置模板（daemon.toml）—— 全局唯一：守护进程自身设置 + 所有 app 的公共默认值。
+#
+# 默认查找位置：Linux /etc/xkeeper/daemon.toml，Windows %APPDATA%\xkeeper\daemon.toml；
+# 可用 --config 覆盖：xkeeper --config conf/daemon.toml run
+# 文件可以不存在 —— 缺失时按本文件注释中的内置默认值运行。
+#
+# 校验本文件：xkeeper --config conf/daemon.toml validate
+
+[daemon]
+# 守护进程自身日志级别：trace | debug | info | warn | error
+log_level = "info"
+
+# 子进程 stdout/stderr 的落盘目录，必须是绝对路径。
+# 注意 /tmp 重启即清空；需要跨重启保留日志请改成如 /var/log/xkeeper。
+# Windows 下默认 %TEMP%\xkeeper\logs。
+log_dir = "/tmp/xkeeper/logs"
+
+# 守护循环巡检周期（秒），取值范围 (0, 60]
+monitor_interval = 1.0
+
+# 控制面 HTTP API 监听地址与端口；status/start/stop/log 等 CLI 与 webui 都走它。
+# 默认只绑回环地址；对外提供请自行评估鉴权。
+host = "127.0.0.1"
+port = 7310
+
+# 非空 = 控制面要求 Bearer 鉴权（CLI 与 webui 需携带同值）；空 = 不鉴权（仅回环使用）。
+auth_token = ""
+
+# 每个输出流在内存中保留的最近行数，`xkeeper log` 与 webui 实时日志的数据源。
+log_buffer_lines = 1000
+
+# app 注册目录：每个已注册 app 一个 <name>.toml 链接文件。
+# 相对路径相对于本配置文件所在目录。
+app_dir = "apps"
+
+# ---------------------------------------------------------------------------
+# 所有 app 的公共默认值（整个表可省略）。
+# 优先级：[program.*] 显式字段 > app 文件的 [app] 表 > 这里的 [app-default]。
+# 字段名与程序级字段一致（autorestart/exit_codes/restart_backoff/... 全集见
+# conf/app.toml 注释），下面只列最常用的：
+[app-default]
+autostart = true           # 随守护进程启动
+autorestart = "always"     # always | on-failure | never
+restart_backoff = 1.0      # 首次重启延迟（秒），指数退避到 max_restart_backoff
+# max_restart_backoff = 30.0
+# max_restarts = 0         # 0 = 不限次数

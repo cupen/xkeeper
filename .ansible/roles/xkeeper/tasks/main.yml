@@ -9,7 +9,7 @@
       - xkeeper_config_src is defined and xkeeper_config_src | length > 0
     fail_msg: >-
       必填变量缺失：xkeeper_binary_src（二进制路径或 URL）与
-      xkeeper_config_src（核心配置文件路径）必须由 extra-vars 或调用方提供。
+      xkeeper_config_src（daemon 配置文件路径）必须由 extra-vars 或调用方提供。
 
 - name: Classify binary source (URL or local path)
   ansible.builtin.set_fact:

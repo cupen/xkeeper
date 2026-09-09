@@ -27,7 +27,10 @@ pub fn checker_loop(tasks: TaskMap, report: impl Fn(String, bool) + Send + 'stat
         std::thread::sleep(Duration::from_secs(1));
         let snapshot: Vec<(String, HealthCheck)> = {
             let g = match tasks.lock() {
-                Ok(g) => g.iter().map(|(k, v)| (k.clone(), v.check.clone())).collect(),
+                Ok(g) => g
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.check.clone()))
+                    .collect(),
                 Err(_) => continue,
             };
             g
@@ -38,9 +41,15 @@ pub fn checker_loop(tasks: TaskMap, report: impl Fn(String, bool) + Send + 'stat
             if !due {
                 continue;
             }
-            next_due.insert(name.clone(), now + Duration::from_secs_f64(check.interval.max(1.0)));
+            next_due.insert(
+                name.clone(),
+                now + Duration::from_secs_f64(check.interval.max(1.0)),
+            );
             let ok = probe(&agent, &check);
-            debug!("health probe program[{name}]: {}", if ok { "ok" } else { "fail" });
+            debug!(
+                "health probe program[{name}]: {}",
+                if ok { "ok" } else { "fail" }
+            );
             report(name, ok);
         }
     }
@@ -149,7 +158,11 @@ mod tests {
             }
         });
         let agent = ureq::AgentBuilder::new().build();
-        assert!(http_ok(&agent, &format!("http://{addr}/"), Duration::from_secs(3)));
+        assert!(http_ok(
+            &agent,
+            &format!("http://{addr}/"),
+            Duration::from_secs(3)
+        ));
         h.join().ok();
     }
 }

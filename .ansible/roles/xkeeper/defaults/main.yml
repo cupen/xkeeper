@@ -3,7 +3,7 @@
 # 由调用方（extra-vars 或调用 playbook）提供，缺省即触发断言失败。
 
 xkeeper_binary_dest: /usr/local/bin/xkeeper
-xkeeper_config_dest: /etc/xkeeper.toml
+xkeeper_config_dest: /etc/xkeeper/daemon.toml
 xkeeper_service_name: xkeeper
 xkeeper_service_user: ""
 xkeeper_force_overwrite: false

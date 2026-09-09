@@ -1,0 +1,66 @@
+# xkeeper app 部署配置模板。
+#
+# 用法：把本文件复制到你的应用部署目录并改名为 xkeeper.toml，改好 command 后
+# 在该目录执行：xkeeper add . --name <app名>
+# app 名默认取目录名；程序名即 [program.<名字>] 的键，也是日志文件名，全局不可重复。
+#
+# 优先级：[program.*] 显式字段 > [app] 表 > daemon 配置的 [app-default]。
+# 校验本文件：xkeeper validate --path /path/to/xkeeper.toml
+
+[app]
+# 描述信息，仅展示用
+description = "我的应用"
+# —— 以下全部可选，省略则继承 [app-default] / 内置默认值 ——
+autostart = true           # 随守护进程启动
+# priority = 0             # 数字小的先启动
+autorestart = "always"     # always | on-failure | never
+# exit_codes = [0]         # on-failure 时视为“失败”的退出码
+# restart_backoff = 1.0    # 首次重启延迟（秒），指数退避
+# max_restart_backoff = 30.0
+# max_restarts = 0         # 0 = 不限次数
+# backoff_reset_after = 60.0   # 稳定运行超过该秒数后重置退避计数
+# startsecs = 1.0          # 存活满该秒数才算启动成功
+# startretries = 3         # 启动失败重试预算，耗尽后进入 fatal 不再拉起
+# stop_timeout = 10.0      # 优雅停止的最长等待（秒），超时强杀
+# restart_on_unhealthy = false # 健康探测连续失败时是否重启
+# log_max_size = "50MB"    # 单文件超过即轮转；"0" = 关闭轮转
+# log_rotate_keep = 2      # 保留的轮转份数（每流盘上最多 1+2 个文件）
+
+# ---------------------------------------------------------------------------
+# 程序定义：每个 [program.<名字>] 一个子进程。名字用于日志文件与 CLI/webui 展示。
+[program.main]
+# 启动命令，二选一：
+#   单行 command —— 按空白分词（支持引号），不经 shell，无管道/变量/重定向；
+#   或 command + args 数组 —— 两者同时给出会报错。
+command = "/opt/myapp/myserver --port 8080"
+# args = ["/opt/myapp/myserver", "--port", "8080"]
+
+# 工作目录：相对于本文件所在目录，缺省即配置文件所在目录。
+# work_dir = "."
+# 额外环境变量（在继承的父环境之上叠加）。
+# env = { RUST_LOG = "info", TMPDIR = "/tmp" }
+# 依赖的程序名（可跨 app），依赖未注册会校验失败；启动顺序按依赖与 priority 排。
+# depends_on = []
+
+# —— 以下与 [app] 表同名的字段含义一致，写在程序上优先级最高 ——
+# startsecs = 1.0
+# startretries = 3
+# stop_timeout = 10.0
+# autorestart = "always"
+# exit_codes = [0]
+# restart_backoff = 1.0
+# max_restart_backoff = 30.0
+# max_restarts = 0
+# backoff_reset_after = 60.0
+# restart_on_unhealthy = false
+# log_max_size = "50MB"
+# log_rotate_keep = 2
+
+# 健康探测（可选）：三种写法
+#   health_check = "http://127.0.0.1:8080/health"   # HTTP GET，2xx 视为健康
+#   health_check = "tcp://127.0.0.1:8080"           # TCP 能建连即健康
+#   health_check = "curl -fsS http://127.0.0.1/health"  # 自定义命令，退出码 0 即健康
+# health_interval = 10        # 探测间隔（秒）
+# health_timeout = 2          # 单次探测超时（秒）
+# health_retries = 3          # 连续失败多少次判定不健康
+# health_start_period = 5     # 启动宽限期（秒），期内失败不计入 retries

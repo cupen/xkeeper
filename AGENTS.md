@@ -7,11 +7,12 @@ stdout/stderr 落盘、Ctrl+C / SIGTERM 优雅停机、Windows Job Object 清理
 ## Architecture
 
 - `src/main.rs` — CLI 入口：`run`（纯守护）| `webui`（守护 + Web 控制台）|
-  `validate`；控制子命令 `status/start/stop/restart/log/pid/reload/shutdown`
+  `validate` | `edit`（编辑器打开 daemon 配置 + 校验）；控制子命令
+  `status/start/stop/restart/log/pid/reload/shutdown`
   走本地 HTTP API；`add/remove/list` 管理 app 注册表。
 - `src/supervisor.rs` — 守护循环（7 态状态机 × 程序），命令队列唯一写者；
   `src/registry.rs` — app 注册表（app_dir 链接）；`src/config.rs` — 分层配置
-  （core + app 部署文件）；`src/pump.rs` — 输出接管/轮转/环形缓冲；
+  （daemon + app 部署文件）；`src/pump.rs` — 输出接管/轮转/环形缓冲；
   `src/health.rs` — 健康探测；`src/client.rs` — CLI HTTP 客户端。
 - `src/server.rs` — 控制平面：std 手写 HTTP（`/v1/*`，可选 Bearer 鉴权），
   状态投影（`StatusDoc`/`ProgramInfo`）由此导出。
@@ -34,7 +35,7 @@ pnpm install
 pnpm exec tsc --noEmit && pnpm test && pnpm build   # 类型检查 + 测试 + 产出 dist/，之后 cargo build 重新嵌入
 pnpm dev                               # HMR dev server（:5273），代理 /api /health /ws → 后端（:9877）
 
-cargo run -- validate                  # 校验 core + 全部注册应用
+cargo run -- validate                  # 校验 daemon 配置 + 全部注册应用
 cargo run -- webui --listen 127.0.0.1:9877   # 守护 + Web 控制台
 cargo run -- status                    # 控制面 CLI（默认端口 7310）
 ```

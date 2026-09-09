@@ -76,6 +76,35 @@ export class XkeeperStatusBadge extends LitElement {
       border-color: var(--xkeeper-status-dormant-border);
       color: var(--xkeeper-status-dormant);
     }
+    /* Daemon lifecycle slugs (process-management capability) map onto the
+       same status token families — one visual language for all states. */
+    .badge[data-status='running'] {
+      background: var(--xkeeper-status-done-bg);
+      border-color: var(--xkeeper-status-done-border);
+      color: var(--xkeeper-status-done);
+    }
+    .badge[data-status='starting'],
+    .badge[data-status='stopping'] {
+      background: var(--xkeeper-status-starting-bg);
+      border-color: var(--xkeeper-status-starting-border);
+      color: var(--xkeeper-status-starting);
+    }
+    .badge[data-status='backoff'] {
+      background: var(--xkeeper-status-working-bg);
+      border-color: var(--xkeeper-status-working-border);
+      color: var(--xkeeper-status-working);
+    }
+    .badge[data-status='exited'],
+    .badge[data-status='stopped'] {
+      background: var(--xkeeper-status-dormant-bg);
+      border-color: var(--xkeeper-status-dormant-border);
+      color: var(--xkeeper-status-dormant);
+    }
+    .badge[data-status='fatal'] {
+      background: var(--xkeeper-status-failed-bg);
+      border-color: var(--xkeeper-status-failed-border);
+      color: var(--xkeeper-status-failed);
+    }
     .glyph {
       font-size: 0.9em;
       line-height: 1;

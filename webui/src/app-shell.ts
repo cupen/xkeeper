@@ -13,14 +13,28 @@
 import { LitElement, css, html } from 'lit'
 import { customElement, state } from 'lit/decorators.js'
 import { matchRoute, navigate, type RouteDef } from './router.js'
+import { ConsoleController, consoleStore } from './lib/store.js'
+import type { ProgramInfo } from './lib/types.js'
 
-// Exported for tests: the route resolution audit iterates these. The
-// placeholder console ships a single route; deep links to unknown paths
-// fall through to the dashboard like any unmatched path.
-export const ROUTES: RouteDef[] = [{ id: 'dashboard', pattern: '/' }]
+// Views (side-effect imports register the custom elements).
+import './views/dashboard.js'
+import './views/app-overview.js'
+import './views/program-detail.js'
+import './components/console-tree.js'
+import './components/overview-bar.js'
+
+// Exported for tests: the route resolution audit iterates these. Deep links
+// to unknown paths fall through to the dashboard like any unmatched path.
+export const ROUTES: RouteDef[] = [
+  { id: 'dashboard', pattern: '/' },
+  { id: 'app', pattern: '/app/:app' },
+  { id: 'program', pattern: '/app/:app/program/:program' },
+]
 
 @customElement('xkeeper-app')
 export class XkeeperApp extends LitElement {
+  private console = new ConsoleController(this, consoleStore)
+
   @state() private routeId: string = 'dashboard'
 
   private params: Record<string, string> = {}
@@ -56,6 +70,11 @@ export class XkeeperApp extends LitElement {
       padding: var(--xkeeper-space-4) var(--xkeeper-space-3);
       display: flex;
       flex-direction: column;
+    }
+    xkeeper-console-tree {
+      margin-top: var(--xkeeper-space-3);
+      flex: 1;
+      min-height: 0;
     }
     .brand {
       display: flex;
@@ -100,6 +119,12 @@ export class XkeeperApp extends LitElement {
       min-height: 0;
       display: flex;
       flex-direction: column;
+      padding: var(--xkeeper-space-3) var(--xkeeper-space-4);
+      gap: var(--xkeeper-space-3);
+      box-sizing: border-box;
+    }
+    xkeeper-overview-bar {
+      flex: 0 0 auto;
     }
     .outlet {
       flex: 1;
@@ -186,17 +211,46 @@ export class XkeeperApp extends LitElement {
     }
   }
 
+  private programsOf(app: string): ProgramInfo[] {
+    return this.console.snapshot.doc?.programs.filter((p) => p.app === app) ?? []
+  }
+
   protected render(): unknown {
+    const { doc } = this.console.snapshot
+    const apps = [...new Set((doc?.programs ?? []).map((p) => p.app))].map((name) => ({
+      name,
+      programs: this.programsOf(name),
+    }))
+    const selectedApp = this.routeId === 'app' || this.routeId === 'program'
+      ? decodeURIComponent(this.params['app'] ?? '')
+      : ''
+    const selectedProgram =
+      this.routeId === 'program' ? decodeURIComponent(this.params['program'] ?? '') : ''
     return html`
       <nav aria-label="Primary">
         <a class="brand" href="/">
           <span class="mark" aria-hidden="true">xk</span>
           <span class="name">xkeeper<small>console</small></span>
         </a>
+        <xkeeper-console-tree
+          .apps=${apps}
+          selectedApp=${selectedApp}
+          selectedProgram=${selectedProgram}
+        ></xkeeper-console-tree>
       </nav>
       <main>
+        <xkeeper-overview-bar></xkeeper-overview-bar>
         <div class="outlet" data-route=${this.routeId}>
-          <xkeeper-dashboard .params=${this.params}></xkeeper-dashboard>
+          ${this.routeId === 'program'
+            ? html`<xkeeper-program-detail
+                .app=${decodeURIComponent(this.params['app'] ?? '')}
+                .program=${decodeURIComponent(this.params['program'] ?? '')}
+              ></xkeeper-program-detail>`
+            : this.routeId === 'app'
+              ? html`<xkeeper-app-overview
+                  .app=${decodeURIComponent(this.params['app'] ?? '')}
+                ></xkeeper-app-overview>`
+              : html`<xkeeper-dashboard></xkeeper-dashboard>`}
         </div>
       </main>
     `

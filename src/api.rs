@@ -16,6 +16,9 @@ pub mod msg_type {
     pub const LOG: u8 = 3;
     pub const HEARTBEAT: u8 = 4;
     pub const ERROR: u8 = 5;
+    /// A subscriber fell behind: N lines of one stream were dropped for it.
+    /// Its own frame type so structural markers never mix with log content.
+    pub const LOG_GAP: u8 = 6;
     /// Payloads at least this large are zlib-compressed (flag bit 7).
     pub const COMPRESS_THRESHOLD: usize = 512;
 }
@@ -89,6 +92,40 @@ pub fn decode_log_frame(frame: &[u8]) -> Result<(String, u8, String), String> {
     Ok((name, stream, data))
 }
 
+/// Encode a gap frame: type byte, u16 name length, program name, stream
+/// byte (0 = stdout, 1 = stderr), u64 dropped-line count (big-endian).
+/// Fixed-width binary header, deliberately not text — a loss marker must
+/// never be confusable with program output.
+pub fn encode_gap_frame(program: &str, stream: u8, dropped: u64) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(program.len() + 12);
+    frame.push(msg_type::LOG_GAP);
+    frame.extend_from_slice(&(program.len() as u16).to_be_bytes());
+    frame.extend_from_slice(program.as_bytes());
+    frame.push(stream);
+    frame.extend_from_slice(&dropped.to_be_bytes());
+    frame
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn decode_gap_frame(frame: &[u8]) -> Result<(String, u8, u64), String> {
+    if frame.first() != Some(&msg_type::LOG_GAP) {
+        return Err("not a gap frame".into());
+    }
+    if frame.len() < 4 {
+        return Err("truncated gap frame".into());
+    }
+    let name_len = u16::from_be_bytes([frame[1], frame[2]]) as usize;
+    let end = 3 + name_len;
+    if frame.len() < end + 1 + 8 {
+        return Err("truncated gap frame".into());
+    }
+    let name = String::from_utf8(frame[3..end].to_vec()).map_err(|e| e.to_string())?;
+    let stream = frame[end];
+    let mut n = [0u8; 8];
+    n.copy_from_slice(&frame[end + 1..end + 9]);
+    Ok((name, stream, u64::from_be_bytes(n)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,7 +145,10 @@ mod tests {
         let payload = vec![b'a'; msg_type::COMPRESS_THRESHOLD * 4];
         let frame = encode_ws_message(msg_type::SNAPSHOT, &payload);
         assert_ne!(frame[0] & 0x80, 0, "large payload must be flagged");
-        assert!(frame.len() < payload.len(), "zlib must shrink repeated data");
+        assert!(
+            frame.len() < payload.len(),
+            "zlib must shrink repeated data"
+        );
         let (t, p) = decode_ws_message(&frame).unwrap();
         assert_eq!(t, msg_type::SNAPSHOT);
         assert_eq!(p, payload);
@@ -127,5 +167,22 @@ mod tests {
             frame.len(),
             "hello\nworld\n".len() + 1 + 2 + "demo-ping".len() + 1
         );
+    }
+
+    #[test]
+    fn gap_frame_roundtrip() {
+        let frame = encode_gap_frame("demo", 0, 4242);
+        let (name, stream, dropped) = decode_gap_frame(&frame).unwrap();
+        assert_eq!(name, "demo");
+        assert_eq!(stream, 0);
+        assert_eq!(dropped, 4242);
+        // Fixed header: 1 type + 2 name-len + name + 1 stream + 8 count.
+        assert_eq!(frame.len(), 12 + "demo".len());
+        assert_ne!(
+            decode_log_frame(&frame),
+            Ok(("demo".into(), 0, String::new()))
+        );
+        assert!(decode_gap_frame(&frame[..frame.len() - 1]).is_err());
+        assert!(decode_gap_frame(&encode_log_frame("x", 0, b"y")).is_err());
     }
 }
