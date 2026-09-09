@@ -51,9 +51,14 @@
 
 ### Requirement: 离线可用
 
-add / remove / list MUST NOT 依赖守护进程运行：守护进程离线时 SHALL 直接维护 `app_dir` 链接完成操作；守护进程在线时 SHALL 在持久化后通过控制 API 触发同步，使命令执行结果与守护进程实际状态一致。
+add / remove / list MUST NOT 依赖守护进程运行：守护进程离线时 SHALL 直接维护 `app_dir` 链接完成操作（离线时 MUST NOT 因无法同步而报错）；守护进程在线时 SHALL 在持久化后通过控制 API 触发同步，使命令执行结果与守护进程实际状态一致。在线同步失败 SHALL 视为本次命令失败：错误信息 MUST 说明注册已持久化但守护进程未同步及补救方式（`xkeeper reload`），并以非零码退出，MUST NOT 仅以警告带过。
 
 #### Scenario: 离线批量注册后启动
 
 - **WHEN** 守护进程停止状态下依次 add 两个应用，随后启动守护进程
 - **THEN** 两个应用按 priority 与依赖关系全部自动拉起
+
+#### Scenario: 在线同步失败不静默
+
+- **WHEN** 守护进程在线但其 reload 失败时执行 `xkeeper add`
+- **THEN** 注册已持久化到 `app_dir`，命令以非零码退出，错误信息说明守护进程未同步并提示重跑 `xkeeper reload`

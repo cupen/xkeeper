@@ -1,6 +1,6 @@
 # App config sample — lives INSIDE the app's deployment directory as
 # xkeeper.toml. Register it from that directory with:  xkeeper add . --name demo
-# Program-explicit fields override [app], which overrides core [app-default].
+# Program-explicit fields override [app], which overrides daemon [app-default].
 
 [app]
 description = "Demo app kept alive by xkeeper"

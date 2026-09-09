@@ -73,17 +73,17 @@ shell SHALL 支持以下内置命令，语义与对应单发 CLI 子命令一致
 
 ### Requirement: shell 单命令模式
 
-`xkeeper shell -c "<命令>"` SHALL 执行该单条 shell 命令后立即退出，退出码遵循控制面
+`xkeeper shell -e "<命令>"` SHALL 执行该单条 shell 命令后立即退出，退出码遵循控制面
 CLI 的同一约定（0 成功；1 一般错误；3 守护进程不可达）。该模式 SHALL 不进入交互界面。
 
 #### Scenario: 脚本化调用
 
-- **WHEN** 执行 `xkeeper shell -c "status"` 且守护进程运行中
+- **WHEN** 执行 `xkeeper shell -e "status"` 且守护进程运行中
 - **THEN** 输出状态表格后立即退出，退出码 0
 
 #### Scenario: 单命令模式守护不可达
 
-- **WHEN** 守护进程未启动时执行 `xkeeper shell -c "status"`
+- **WHEN** 守护进程未启动时执行 `xkeeper shell -e "status"`
 - **THEN** 输出守护进程不可达提示，退出码为 3
 
 ### Requirement: system webui 辅助命令

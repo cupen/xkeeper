@@ -7,12 +7,12 @@
 
 ### Requirement: playbook 分发二进制并注册服务
 
-`xkeeper` Ansible role（`.ansible/roles/xkeeper`，本机入口 `.ansible/site.yml`）SHALL 在每台目标机上完成：将 xkeeper 二进制分发到目标路径、安装核心配置到目标机、执行 `xkeeper service install --now` 注册 systemd 服务并启动。二进制来源 MUST 支持两种变量指定方式：控制机上的本地文件路径，或可下载的 URL。核心配置 MUST 由变量指定控制机上的本地文件路径，复制到目标机的平台默认核心配置路径。
+`xkeeper` Ansible role（`.ansible/roles/xkeeper`，本机入口 `.ansible/site.yml`）SHALL 在每台目标机上完成：将 xkeeper 二进制分发到目标路径、安装daemon 配置到目标机、执行 `xkeeper service install --now` 注册 systemd 服务并启动。二进制来源 MUST 支持两种变量指定方式：控制机上的本地文件路径，或可下载的 URL。daemon 配置 MUST 由变量指定控制机上的本地文件路径，复制到目标机的平台默认daemon 配置路径。
 
 #### Scenario: 部署到全新主机
 
-- **WHEN** 目标机无任何 xkeeper 痕迹，用户以变量指定本地二进制文件与核心配置文件后执行 playbook
-- **THEN** 二进制与核心配置出现在目标机默认路径，`systemctl is-enabled xkeeper` 返回 enabled 且服务处于 running 状态
+- **WHEN** 目标机无任何 xkeeper 痕迹，用户以变量指定本地二进制文件与daemon 配置文件后执行 playbook
+- **THEN** 二进制与daemon 配置出现在目标机默认路径，`systemctl is-enabled xkeeper` 返回 enabled 且服务处于 running 状态
 
 #### Scenario: URL 来源分发二进制
 
@@ -21,7 +21,7 @@
 
 ### Requirement: 检测到既有安装时默认快速失败
 
-playbook 在对目标机做任何变更（写文件、注册服务、重启、停止）之前 SHALL 预检该机是否已存在 xkeeper 安装，检测手段 MUST 覆盖：同名 systemd unit 已存在、服务处于运行状态、默认二进制路径或默认核心配置路径已有文件。发现任一痕迹时 playbook MUST 立即失败（fail fast），失败信息 MUST 说明检测到的具体痕迹、未做任何修改的原因，以及如何使用强制覆盖变量绕过；且 MUST NOT 已对目标机产生任何变更。
+playbook 在对目标机做任何变更（写文件、注册服务、重启、停止）之前 SHALL 预检该机是否已存在 xkeeper 安装，检测手段 MUST 覆盖：同名 systemd unit 已存在、服务处于运行状态、默认二进制路径或默认daemon 配置路径已有文件。发现任一痕迹时 playbook MUST 立即失败（fail fast），失败信息 MUST 说明检测到的具体痕迹、未做任何修改的原因，以及如何使用强制覆盖变量绕过；且 MUST NOT 已对目标机产生任何变更。
 
 #### Scenario: 目标机已运行 xkeeper 服务
 
@@ -30,7 +30,7 @@ playbook 在对目标机做任何变更（写文件、注册服务、重启、�
 
 #### Scenario: 目标机仅有残留文件
 
-- **WHEN** 目标机无 systemd unit 但默认核心配置路径已存在文件，用户未设置强制覆盖变量执行 playbook
+- **WHEN** 目标机无 systemd unit 但默认daemon 配置路径已存在文件，用户未设置强制覆盖变量执行 playbook
 - **THEN** playbook 失败退出并指明检测到的残留路径，该文件内容未被修改
 
 #### Scenario: 预检通过后正常部署
@@ -45,7 +45,7 @@ playbook 在对目标机做任何变更（写文件、注册服务、重启、�
 #### Scenario: 强制覆盖执行重部署
 
 - **WHEN** 目标机已有运行中的 xkeeper 服务，用户设置强制覆盖变量为真后执行 playbook
-- **THEN** playbook 覆盖二进制与核心配置，服务以新内容重启，最终处于 running 状态
+- **THEN** playbook 覆盖二进制与daemon 配置，服务以新内容重启，最终处于 running 状态
 
 #### Scenario: 强制变量缺省时无可交互泄漏
 
@@ -67,7 +67,7 @@ playbook 在对目标机做任何变更（写文件、注册服务、重启、�
 
 #### Scenario: 免 inventory 本机冒烟测试
 
-- **WHEN** 用户按说明文档准备二进制与核心配置后，在 `.ansible/` 下直接执行 `ansible-playbook site.yml`
+- **WHEN** 用户按说明文档准备二进制与daemon 配置后，在 `.ansible/` 下直接执行 `ansible-playbook site.yml`
 - **THEN** 本机完成部署且服务注册成功，全程无需编写或修改 inventory
 
 #### Scenario: 扩展到多主机
