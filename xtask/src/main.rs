@@ -2,6 +2,9 @@
 //!
 //! - `cargo run -p xtask -- test`   full verification suite (fmt + backend
 //!   tests + frontend typecheck/tests/build + rebuild)
+//! - `cargo run -p xtask -- e2e`     acceptance e2e: CLI scenarios (detect/
+//!     apply/scope/--restart/add) + a real-browser webui pass (pending badge,
+//!   app-scoped apply, result feedback) against the REAL daemon binary.
 //! - `cargo run -p xtask -- stress` firehose end-to-end against the REAL
 //!   daemon binary: ~10MB/s paced generator, a live WS subscriber, and the
 //!   zero-backpressure / gap-marker / disk-integrity verification
@@ -17,6 +20,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 
+mod e2e;
 mod stress;
 
 #[derive(clap::Parser)]
@@ -30,6 +34,16 @@ enum Cmd {
     /// Run the full verification suite (fmt, backend tests, frontend
     /// typecheck/tests/build, rebuild).
     Test,
+    /// Acceptance e2e: CLI scenarios + browser-driven webui checks against a
+    /// real daemon (apply-workflow change).
+    E2e {
+        /// Keep the temp workspace (daemon config, app files, logs).
+        #[arg(long)]
+        keep: bool,
+        /// Skip the browser (playwright) pass.
+        #[arg(long)]
+        no_browser: bool,
+    },
     /// Firehose stress + zero-backpressure verification against a real daemon.
     Stress {
         /// Seconds of full-speed consumption (phase 1).
@@ -61,6 +75,10 @@ fn main() -> Result<()> {
             slow_secs,
             catchup_secs,
             keep,
+        }),
+        Cmd::E2e { keep, no_browser } => e2e::run(e2e::Args {
+            keep,
+            no_browser,
         }),
     }
 }

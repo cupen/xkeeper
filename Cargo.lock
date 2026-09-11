@@ -1766,6 +1766,7 @@ dependencies = [
  "anyhow",
  "clap",
  "futures-util",
+ "serde_json",
  "tokio",
  "tokio-tungstenite 0.26.2",
 ]

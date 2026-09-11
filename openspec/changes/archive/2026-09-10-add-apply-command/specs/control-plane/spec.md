@@ -1,10 +1,6 @@
-# control-plane Specification
+# control-plane Specification Delta — add-apply-command
 
-## Purpose
-
-定义 xkeeper 的本地控制平面：守护进程暴露的 HTTP JSON API（端点、鉴权、错误码）与映射到该 API 的 CLI 控制命令（含退出码约定），使用户可以查询和操控运行中的守护进程。
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: 本地 HTTP API
 
@@ -55,19 +51,6 @@
 
 - **WHEN** 发送 `POST /v1/shutdown`
 - **THEN** 守护进程按关闭流程停止全部程序后进程退出
-### Requirement: API 鉴权
-
-未配置鉴权时，API 仅依赖回环绑定保护。配置了 `[daemon] auth_token` 后，除健康探测外，所有请求 SHALL 要求 `Authorization: Bearer <token>`；缺失或不匹配 SHALL 返回 401。
-
-#### Scenario: 配置 token 后拒绝匿名请求
-
-- **WHEN** 配置了 `auth_token` 且请求未携带正确的 Authorization 头
-- **THEN** 返回 401，程序状态不被泄露
-
-#### Scenario: 配置 token 后放行正确请求
-
-- **WHEN** 请求携带正确的 Bearer token
-- **THEN** 正常返回 200 响应
 
 ### Requirement: CLI 控制命令
 
@@ -92,32 +75,3 @@
 
 - **WHEN** 配置无 pending 时执行 `xkeeper apply`
 - **THEN** 输出「无变更」提示，退出码 0，无程序受影响
-### Requirement: 启动冲突处理
-
-守护进程启动时若控制端口已被占用，SHALL 以明确的错误信息退出（非零码），提示可能已有实例在运行；同机重复启动 SHALL NOT 静默成功。
-
-#### Scenario: 端口被占用时拒绝启动
-
-- **WHEN** 第二个守护进程实例以相同配置启动
-- **THEN** 启动失败，错误信息指出端口占用与已运行实例的可能
-
-### Requirement: shell 与 system 子命令
-
-单二进制 SHALL 另提供两个客户端入口：
-
-- `xkeeper shell`：交互式 REPL（详见 `shell-client` 能力规范），经控制面 API 与根进程
-  通信，`-e "<命令>"` 进入单命令模式；
-- `xkeeper system webui [url]`：本地辅助命令，探测/拉起 webui 并用系统默认浏览器打开。
-
-两者 SHALL 遵循既有退出码约定：0 成功；1 一般错误；2 配置错误；3 守护进程不可达。
-`system webui` 拉起根进程失败 SHALL 归入退出码 1。
-
-#### Scenario: shell 纳入退出码约定
-
-- **WHEN** 守护进程未启动时执行 `xkeeper shell -e "status"`
-- **THEN** 输出守护进程不可达提示，退出码为 3
-
-#### Scenario: system webui 拉起失败
-
-- **WHEN** `xkeeper system webui` 尝试拉起根进程但启动失败（如端口被占用）
-- **THEN** 输出失败原因，退出码为 1

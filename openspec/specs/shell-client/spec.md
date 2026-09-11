@@ -37,7 +37,9 @@ shell SHALL 支持以下内置命令，语义与对应单发 CLI 子命令一致
 - `start|stop|restart <name>`：执行对应动作，未知程序报错；
 - `pid <name>`：输出程序 pid 或 `not running`；
 - `log <name> [-f] [--tail N] [--stream out|err]`：查看日志，`-f` 跟随输出；
-- `reload`：热更新配置；
+- `reload`：重扫并检出待应用变更，输出 pending 预览（不应用）；
+- `pending`：输出当前待应用变更清单（逐程序 changed、app 级注册变化、检出错误）；
+- `apply [<app> [<program>]] [--restart]`：应用待应用变更，输出与 `xkeeper apply` 一致的逐程序结果表格；
 - `shutdown`：请求守护进程优雅退出，随后 shell SHOULD 因守护不可达提示并可用 `exit` 离开；
 - `open`：探测 webui 可达性（`GET /api/health`），可达则调用系统默认浏览器打开控制台，
   不可达时输出明确提示且不启动浏览器；
@@ -61,6 +63,16 @@ shell SHALL 支持以下内置命令，语义与对应单发 CLI 子命令一致
 - **WHEN** shell 中输入 `restart web`
 - **THEN** 请求经控制面 API 下发，程序状态迁移与 `xkeeper restart web` 一致
 
+#### Scenario: 在 shell 中应用变更
+
+- **WHEN** 配置存在 pending 时 shell 中输入 `apply myapp`
+- **THEN** 输出与 `xkeeper apply myapp` 一致的逐程序结果，仅作用于该 app
+
+#### Scenario: 在 shell 中查看 pending
+
+- **WHEN** 配置存在 pending 时 shell 中输入 `pending`
+- **THEN** 输出变更程序与 app 注册变化清单；无变更时输出「无变更」
+
 #### Scenario: open 打开 webui
 
 - **WHEN** webui 在默认端口可达且输入 `open`
@@ -70,7 +82,6 @@ shell SHALL 支持以下内置命令，语义与对应单发 CLI 子命令一致
 
 - **WHEN** webui 未启动且输入 `open`
 - **THEN** 输出"webui 未启动"的提示（含启动方式提示），不启动浏览器，shell 不退出
-
 ### Requirement: shell 单命令模式
 
 `xkeeper shell -e "<命令>"` SHALL 执行该单条 shell 命令后立即退出，退出码遵循控制面

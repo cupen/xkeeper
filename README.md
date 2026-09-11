@@ -14,7 +14,7 @@ Linux 与 Windows 上行为一致：崩溃自动拉起、启动顺序与依赖�
          │  └─ control API  127.0.0.1:7310 /v1/*（可选 Bearer 鉴权）         │
          └───────────────△─────────────────────────────────────────────────┘
                          │ HTTP JSON
-   xkeeper status/start/stop/restart/log/pid/reload/shutdown
+   xkeeper status/start/stop/restart/log/pid/reload/apply/shutdown
    xkeeper add/remove/list        ← 离线可用，在线时自动同步
 ```
 
@@ -56,7 +56,9 @@ xkeeper run
 xkeeper status
 xkeeper stop myapp-程序名
 xkeeper log <程序名> --tail 50 -f
-xkeeper reload                 # 重读 daemon + 全部 app 配置（按应用隔离失败）
+xkeeper reload                 # 重扫配置并检出待应用变更（pending），不触碰任何进程
+xkeeper apply                  # 应用待应用变更（apply demo / apply demo web 限定范围）
+xkeeper apply --restart        # 无变更的程序也重启（手动停止的保持停止）
 xkeeper shutdown
 ```
 
@@ -117,6 +119,24 @@ restart_on_unhealthy = true # unhealthy 触发与崩溃一致的重启
 仍留在 `<daemon 配置目录>/logs`，不会自动迁移。已有 `log_dir = "logs"` 等相对路径
 配置会被拒绝启动，需改为绝对路径。
 
+## 配置变更：检出与应用（两阶段）
+
+编辑 app 配置或 daemon 配置后，守护进程会在一个巡检周期内自动检出差异
+（pending），**不会**触碰任何进程。`xkeeper apply` 显式应用：
+
+- `apply` 应用全部 pending；`apply <app>` / `apply <app> <program>` 限定范围，
+  不影响范围外的应用；
+- 配置有变化的程序：停止 → 以新定义重建 → 原先在跑则重新拉起（手动停止的
+  保持停止，只更新定义）；
+- `apply --restart`：无配置变更的程序也重启——但手动停止的（stopped/exited/
+  fatal）保持停止，崩溃退避中的（backoff）立即拉起；
+- 无待应用变更时 `apply` 什么都不做（幂等，退出码 0）。
+
+`xkeeper reload` 现在只「重扫 + 检出 + 输出预览」。**迁移说明**：依赖
+「reload 即生效」的脚本请改为 `xkeeper reload && xkeeper apply`（或直接
+`xkeeper apply`）。`xkeeper add/remove` 在线同步同样进入 pending，需
+`apply` 后才拉起/停止对应程序。
+
 ## 状态机与重启语义
 
 ```
@@ -139,7 +159,8 @@ restart_on_unhealthy = true # unhealthy 触发与崩溃一致的重启
 
 守护进程在 `host:port`（默认回环 7310）提供 JSON API：
 `GET /v1/health|status|programs|programs/{name}|programs/{name}/logs`，
-`POST /v1/programs/{name}/start|stop|restart`、`/v1/reload`、`/v1/shutdown`。
+`POST /v1/programs/{name}/start|stop|restart`、`/v1/reload`（检出 pending 并返回预览）、
+`GET /v1/pending`、`POST /v1/apply`、`/v1/shutdown`。
 配置 `auth_token` 后除 `/v1/health` 外都要求 `Authorization: Bearer <token>`。
 `GET /v1/programs/{name}/logs?stream=out|err&tail=N&follow=1` 支持流式跟随。
 
@@ -159,7 +180,7 @@ xkeeper shell -e "status"            # 单命令模式：执行一条后退出�
 
 内置命令：`status`（对齐表格：NAME/APP/STATE/PID/RESTARTS/UNHEALTHY）、
 `start|stop|restart <name>`、`pid <name>`、`log <name> [-f] [--tail N] [--stream out|err]`、
-`reload`、`shutdown`、`open`（用系统浏览器打开 webui 控制台）、`help`/`?`、`exit`/`quit`。
+`pending`、`apply [<app> [<program>]] [--restart]`、`shutdown`、`open`（用系统浏览器打开 webui 控制台）、`help`/`?`、`exit`/`quit`。
 
 ### 一键打开控制台（`xkeeper system webui`）
 

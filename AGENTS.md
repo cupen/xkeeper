@@ -35,6 +35,8 @@ pnpm install
 pnpm exec tsc --noEmit && pnpm test && pnpm build   # 类型检查 + 测试 + 产出 dist/，之后 cargo build 重新嵌入
 pnpm dev                               # HMR dev server（:5273），代理 /api /health /ws → 后端（:9877）
 
+cargo run -p xtask -- e2e             # 验收 e2e：CLI 检出/apply/范围/--restart/add 场景
+                                       #   + playwright 驱动真实浏览器的 webui 交互（--no-browser 跳过浏览器段）
 cargo run -- validate                  # 校验 daemon 配置 + 全部注册应用
 cargo run -- webui --listen 127.0.0.1:9877   # 守护 + Web 控制台
 cargo run -- status                    # 控制面 CLI（默认端口 7310）
