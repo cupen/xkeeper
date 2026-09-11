@@ -18,7 +18,7 @@ use anyhow::{Context, Result};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 
-use crate::supervisor::{Command, Supervisor};
+use crate::supervisor::{ApplyScope, Command, Supervisor};
 
 const MAX_FOLLOWS: usize = 8;
 const MAX_HEADER_BYTES: usize = 32 * 1024;
@@ -61,6 +61,9 @@ pub(crate) struct ProgramInfo {
 pub(crate) struct StatusDoc {
     pub daemon: DaemonInfo,
     pub programs: Vec<ProgramInfo>,
+    /// Detected-but-not-applied config changes (apply-workflow spec);
+    /// backward-compatible addition sourced from the detection pass.
+    pub pending: crate::supervisor::PendingDoc,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -98,6 +101,7 @@ pub(crate) fn status_doc(sup: &Arc<Supervisor>) -> StatusDoc {
             config_source: sup.config_path().display().to_string(),
         },
         programs,
+        pending: st.pending.clone(),
     }
 }
 
@@ -215,8 +219,8 @@ fn handle_connection(sup: &Arc<Supervisor>, token: &str, stream: TcpStream) {
         return;
     }
 
-    // Headers (bounded). We never accept request bodies; a small body is
-    // drained if a client sends one.
+    // Headers (bounded). Only /v1/apply accepts a body; elsewhere a small
+    // body is drained.
     let mut total = 0usize;
     let mut headers = HashMap::new();
     loop {
@@ -237,15 +241,23 @@ fn handle_connection(sup: &Arc<Supervisor>, token: &str, stream: TcpStream) {
             headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
         }
     }
-    if let Some(len) = headers
+    let body: Vec<u8> = match headers
         .get("content-length")
         .and_then(|v| v.parse::<usize>().ok())
     {
-        if len > 0 {
-            let mut sink = vec![0u8; len.min(64 * 1024)];
-            let _ = reader.read_exact(&mut sink);
+        Some(len) if len > 0 => {
+            if len > 64 * 1024 {
+                let _ = writer.write_all(&err_bytes(431, "body too large"));
+                return;
+            }
+            let mut buf = vec![0u8; len];
+            if reader.read_exact(&mut buf).is_err() {
+                return;
+            }
+            buf
         }
-    }
+        _ => Vec::new(),
+    };
 
     let (path, query) = match target.split_once('?') {
         Some((p, q)) => (p.to_string(), q.to_string()),
@@ -284,6 +296,7 @@ fn handle_connection(sup: &Arc<Supervisor>, token: &str, stream: TcpStream) {
                         config_source: sup.config_path().display().to_string(),
                     },
                     programs,
+                    pending: st.pending.clone(),
                 },
             )
         }
@@ -344,8 +357,69 @@ fn handle_connection(sup: &Arc<Supervisor>, token: &str, stream: TcpStream) {
             let (tx, rx) = mpsc::channel();
             sup.enqueue(Command::Reload { reply: Some(tx) });
             match rx.recv_timeout(Duration::from_secs(60)) {
-                Ok(Ok(msg)) => json_bytes(200, serde_json::json!({ "result": msg })),
+                // The reply text is the rendered preview; the structured
+                // doc rides along in state.pending (same source as /v1/pending).
+                Ok(Ok(msg)) => {
+                    let pending = sup.state.lock().unwrap().pending.clone();
+                    json_bytes(
+                        200,
+                        serde_json::json!({ "result": msg, "pending": pending }),
+                    )
+                }
                 Ok(Err(e)) => err_bytes(400, &format!("{e:#}")),
+                Err(_) => err_bytes(500, "supervisor did not answer in time"),
+            }
+        }
+        ("GET", ["v1", "pending"]) => {
+            let pending = sup.state.lock().unwrap().pending.clone();
+            json_bytes(200, pending)
+        }
+        ("POST", ["v1", "apply"]) => {
+            let req: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            let app = req.get("app").and_then(|v| v.as_str()).map(String::from);
+            let program = req.get("program").and_then(|v| v.as_str()).map(String::from);
+            let restart = req.get("restart").and_then(|v| v.as_bool()).unwrap_or(false);
+            // Scope validation against the registered apps/programs.
+            let (known_app, known_program) = {
+                let st = sup.state.lock().unwrap();
+                let app_ok = match &app {
+                    Some(a) => st.apps.iter().any(|r| &r.name == a),
+                    None => true,
+                };
+                let prog_ok = match (&app, &program) {
+                    (Some(a), Some(p)) => st
+                        .programs
+                        .get(p)
+                        .map(|x| &x.def.app == a)
+                        .unwrap_or(false),
+                    _ => true,
+                };
+                (app_ok, prog_ok)
+            };
+            if !known_app {
+                let a = app.clone().unwrap_or_default();
+                let _ = writer.write_all(&err_bytes(404, &format!("unknown app {a:?}")));
+                return;
+            }
+            if !known_program {
+                let p = program.clone().unwrap_or_default();
+                let _ = writer.write_all(&err_bytes(404, &format!("unknown program {p:?}")));
+                return;
+            }
+            let scope = match (app, program) {
+                (Some(a), Some(p)) => ApplyScope::Program(a, p),
+                (Some(a), None) => ApplyScope::App(a),
+                _ => ApplyScope::All,
+            };
+            let (tx, rx) = mpsc::channel();
+            sup.enqueue(Command::Apply {
+                scope,
+                restart,
+                reply: Some(tx),
+            });
+            match rx.recv_timeout(Duration::from_secs(120)) {
+                Ok(Ok(msg)) => json_bytes(200, serde_json::json!({ "result": msg })),
+                Ok(Err(e)) => err_bytes(409, &format!("{e:#}")),
                 Err(_) => err_bytes(500, "supervisor did not answer in time"),
             }
         }
@@ -524,6 +598,7 @@ mod tests {
                 config_source: "/tmp/xkeeper.toml".into(),
             },
             programs: vec![info],
+            pending: crate::supervisor::PendingDoc::default(),
         }
     }
 

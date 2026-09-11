@@ -125,7 +125,7 @@ pub fn compute_timeout_stop_sec(config_path: &Path) -> u64 {
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
-        let apps = crate::registry::list(&config, config_dir)?;
+        let apps = crate::registry::ListedApp::good(crate::registry::list(&config, config_dir)?);
         let mut max = 0.0f64;
         for listed in apps {
             let (raw, _) = crate::config::AppRaw::load(&listed.path)?;
