@@ -18,13 +18,13 @@ import {
   decodeLogFrame,
   encodeAction,
 } from './frames.js'
-import { MSG, type ProgramInfo, type StatusDoc } from './types.js'
+import { MSG, type PendingDoc, type ProgramInfo, type StatusDoc } from './types.js'
 
 export type WsState = 'connecting' | 'open' | 'closed'
 
 export interface WsClientHandlers {
   snapshot(doc: StatusDoc): void
-  delta(programs: ProgramInfo[]): void
+  delta(programs: ProgramInfo[], pending?: PendingDoc): void
   log(program: string, stream: 0 | 1, text: string): void
   gap(program: string, stream: 0 | 1, skipped: number): void
   error(message: string): void
@@ -141,8 +141,20 @@ export class WsClient {
         this.handlers.snapshot(decodeDoc<StatusDoc>(payload))
         return
       case MSG.STATUS: {
-        const programs = decodeDoc<ProgramInfo[]>(payload)
-        this.handlers.delta(programs)
+        // The payload is a JSON object {programs, pending?} since the
+        // apply-workflow change; decode defensively (old servers sent a
+        // bare program array).
+        const text = new TextDecoder().decode(payload)
+        try {
+          const parsed = JSON.parse(text) as {
+            programs?: ProgramInfo[]
+            pending?: PendingDoc
+          }
+          this.handlers.delta(parsed.programs ?? [], parsed.pending)
+        } catch {
+          const programs = decodeDoc<ProgramInfo[]>(payload)
+          this.handlers.delta(programs)
+        }
         return
       }
       case MSG.LOG: {

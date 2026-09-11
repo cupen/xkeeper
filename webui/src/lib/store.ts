@@ -12,7 +12,7 @@
  */
 
 import { loadRefreshMs, saveRefreshMs, type RefreshMs } from './prefs.js'
-import type { ProgramInfo, StatusDoc, StreamId } from './types.js'
+import type { PendingDoc, ProgramInfo, StatusDoc, StreamId } from './types.js'
 import { WsClient, type WsState } from './ws-client.js'
 import type { ReactiveController, ReactiveControllerHost } from 'lit'
 
@@ -52,6 +52,7 @@ export class ConsoleStore {
         this.doc = {
           daemon: doc.daemon,
           programs: [...doc.programs].sort(byAppThenName),
+          pending: doc.pending ?? emptyPending(),
         }
         this.setTransport('live')
         this.stopPolling()
@@ -62,9 +63,10 @@ export class ConsoleStore {
         }
         this.emit()
       },
-      delta: (programs) => {
+      delta: (programs, pending) => {
         if (!this.doc) return
         this.mergeDelta(programs)
+        if (pending !== undefined) this.doc = { ...this.doc, pending }
         this.emit()
       },
       log: (program, stream, text) => {
@@ -120,6 +122,41 @@ export class ConsoleStore {
     this.emit()
   }
 
+  // -- apply -------------------------------------------------------------------
+
+  /** The current pending projection (never null; empty when in sync). */
+  get pending(): PendingDoc {
+    return this.doc?.pending ?? emptyPending()
+  }
+
+  /**
+   * Apply pending changes via the control-plane API. Scope mirrors the CLI:
+   * app + optional program restrict the blast radius; restart also restarts
+   * unchanged programs (user-stopped ones stay stopped — server semantics).
+   * Returns the rendered result text (or throws with the API error).
+   */
+  async apply(opts: { app?: string; program?: string; restart?: boolean } = {}): Promise<string> {
+    const body: Record<string, unknown> = { restart: opts.restart ?? false }
+    if (opts.app) body['app'] = opts.app
+    if (opts.program) body['program'] = opts.program
+    const res = await fetch('/api/apply', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    const v = (await res.json().catch(() => null)) as { result?: string; error?: string } | null
+    if (!res.ok) throw new Error(v?.error ?? `HTTP ${res.status}`)
+    // The WS delta / next poll refreshes state; nudge immediately for UI
+    // snappiness by re-polling the overview once.
+    void this.pollOnceIfNotLive()
+    return v?.result ?? 'applied'
+  }
+
+  private async pollOnceIfNotLive(): Promise<void> {
+    if (this.transport === 'live' && this.client) return
+    await this.pollOnce()
+  }
+
   // -- log subscriptions ------------------------------------------------------
 
   subscribeLogs(program: string, stream: StreamId): void {
@@ -163,7 +200,11 @@ export class ConsoleStore {
     if (!this.doc) return
     const byName = new Map(this.doc.programs.map((p) => [p.name, p]))
     for (const p of programs) byName.set(p.name, p)
-    this.doc = { daemon: this.doc.daemon, programs: [...byName.values()].sort(byAppThenName) }
+    this.doc = {
+      daemon: this.doc.daemon,
+      programs: [...byName.values()].sort(byAppThenName),
+      pending: this.doc.pending,
+    }
   }
 
   private async pollOnce(): Promise<void> {
@@ -171,7 +212,11 @@ export class ConsoleStore {
       const res = await fetch('/api/overview')
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const doc = (await res.json()) as StatusDoc
-      this.doc = { daemon: doc.daemon, programs: [...doc.programs].sort(byAppThenName) }
+      this.doc = {
+        daemon: doc.daemon,
+        programs: [...doc.programs].sort(byAppThenName),
+        pending: doc.pending ?? emptyPending(),
+      }
       // Polling succeeded → the backend is reachable (degraded but alive).
       if (this.transport !== 'live') this.setTransport('poll')
       this.emit()
@@ -205,6 +250,10 @@ export class ConsoleStore {
 
 function byAppThenName(a: ProgramInfo, b: ProgramInfo): number {
   return (a.app + '\u0000' + a.name).localeCompare(b.app + '\u0000' + b.name)
+}
+
+function emptyPending(): PendingDoc {
+  return { programs: [], apps_added: [], apps_removed: [], daemon_hints: [], errors: [] }
 }
 
 /** Lit reactive controller: bind a component to the console store. */

@@ -84,6 +84,7 @@ function doc(): StatusDoc {
       uptime_secs: 90,
       config_source: '/tmp/xkeeper.toml',
     },
+    pending: { programs: [], apps_added: [], apps_removed: [], daemon_hints: [], errors: [] },
     programs: [
       program('demo', 'web', 'running', true),
       program('demo', 'worker', 'fatal', false),

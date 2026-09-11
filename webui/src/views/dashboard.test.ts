@@ -59,6 +59,7 @@ function doc(): StatusDoc {
       uptime_secs: 5,
       config_source: '/t',
     },
+    pending: { programs: [], apps_added: [], apps_removed: [], daemon_hints: [], errors: [] },
     programs: [
       program('healthy', 'running', null),
       program('sick', 'fatal', 'start failed 5 times'),

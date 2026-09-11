@@ -57,6 +57,7 @@ function doc(programs: ProgramInfo[]): StatusDoc {
       config_source: '/t',
     },
     programs,
+    pending: { programs: [], apps_added: [], apps_removed: [], daemon_hints: [], errors: [] },
   }
 }
 
@@ -216,6 +217,48 @@ describe('store', () => {
     store.setRefreshInterval(5000)
     expect(store.refreshInterval).toBe(5000)
     expect(localStorage.getItem('xkeeper.refresh_ms')).toBe('5000')
+    store.stop()
+  })
+  it('tracks pending changes from snapshot and STATUS deltas (apply-workflow)', async () => {
+    const { store, ws } = openStore()
+    const withPending = doc([prog('a')])
+    withPending.pending = {
+      programs: [{ app: 'a', program: 'p1', running: true }],
+      apps_added: ['b'],
+      apps_removed: [],
+      daemon_hints: [],
+      errors: [],
+    }
+    ws.serverFrame(frameFor(MSG.SNAPSHOT, encode(withPending as never)))
+    await new Promise((r) => setTimeout(r, 0))
+    expect(store.pending.programs).toEqual([{ app: 'a', program: 'p1', running: true }])
+    expect(store.pending.apps_added).toEqual(['b'])
+
+    // A pending-clearing delta (post-apply) empties the projection. The
+    // server sends STATUS as JSON text ({programs, pending}).
+    const cleared = doc([prog('a')])
+    const payload = JSON.stringify({ programs: [], pending: cleared.pending })
+    ws.serverFrame(frameFor(MSG.STATUS, new TextEncoder().encode(payload) as never))
+    await new Promise((r) => setTimeout(r, 0))
+    expect(store.pending.programs).toEqual([])
+    store.stop()
+  })
+
+  it('apply() posts the scope to /api/apply and surfaces the result', async () => {
+    const { store } = openStore()
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ result: 'applied: 1 program change(s)' }),
+      })
+      .mockResolvedValueOnce({ ok: true, json: async () => doc([prog('a')]) })
+    vi.stubGlobal('fetch', fetchMock)
+    const msg = await store.apply({ app: 'demo', restart: true })
+    expect(msg).toContain('applied')
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit]
+    expect(url).toBe('/api/apply')
+    expect(JSON.parse(String(init.body))).toEqual({ restart: true, app: 'demo' })
     store.stop()
   })
 })

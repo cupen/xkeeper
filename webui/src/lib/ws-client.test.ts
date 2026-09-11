@@ -76,7 +76,7 @@ describe('ws-client', () => {
     vi.stubGlobal('WebSocket', FakeWebSocket as unknown as typeof WebSocket)
     FakeWebSocket.instances = []
     const events: string[] = []
-    const doc = { daemon: {} as never, programs: [] as never[] }
+    const doc = { daemon: {} as never, programs: [] as never[], pending: { programs: [], apps_added: [], apps_removed: [], daemon_hints: [], errors: [] } }
     const client = new WsClient('ws://test/ws', {
       snapshot: (d) => events.push(`snapshot:${(d as typeof doc).programs.length === 0}`),
       delta: (p) => events.push(`delta:${p.length}`),

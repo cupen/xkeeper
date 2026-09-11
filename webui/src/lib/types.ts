@@ -58,9 +58,25 @@ export interface ProgramInfo {
   work_dir: string
 }
 
+export interface PendingProgram {
+  app: string
+  program: string
+  running: boolean
+}
+
+/** Detected-but-not-applied config changes (server: supervisor::PendingDoc). */
+export interface PendingDoc {
+  programs: PendingProgram[]
+  apps_added: string[]
+  apps_removed: string[]
+  daemon_hints: string[]
+  errors: string[]
+}
+
 export interface StatusDoc {
   daemon: DaemonInfo
   programs: ProgramInfo[]
+  pending: PendingDoc
 }
 
 /** Log stream direction (matches the server's stream byte). */

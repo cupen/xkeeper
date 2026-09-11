@@ -9,7 +9,7 @@
 import { LitElement, css, html } from 'lit'
 import { customElement, property, state } from 'lit/decorators.js'
 import { nothing } from 'lit'
-import { ConsoleController, consoleStore } from '../lib/store.js'
+import { ConsoleController, consoleStore, type ConsoleStore } from '../lib/store.js'
 import type { ProgramInfo } from '../lib/types.js'
 import {
   formatBytes,
@@ -31,9 +31,19 @@ import { navigate } from '../router.js'
 export class XkeeperAppOverview extends LitElement {
   @property() app = ''
 
-  private console = new ConsoleController(this, consoleStore)
+  /** Injectable for tests; defaults to the shared singleton. */
+  @property({ attribute: false }) store: ConsoleStore = consoleStore
+
+  private console: ConsoleController | null = null
+
+  connectedCallback(): void {
+    super.connectedCallback()
+    this.console = new ConsoleController(this, this.store)
+  }
 
   @state() private rateWindow: RateWindowS = loadRateWindowS()
+  @state() private applying = false
+  @state() private applyFeedback: { ok: boolean; text: string } | null = null
 
   static styles = css`
     :host {
@@ -135,6 +145,56 @@ export class XkeeperAppOverview extends LitElement {
       color: var(--xkeeper-text-faint);
       font-size: 0.9rem;
     }
+    .apply-strip {
+      display: flex;
+      align-items: center;
+      gap: var(--xkeeper-space-3);
+      padding: var(--xkeeper-space-2) var(--xkeeper-space-4);
+      background: color-mix(in srgb, var(--xkeeper-accent-strong, #6366f1) 12%, var(--xkeeper-surface));
+      border: 1px solid color-mix(in srgb, var(--xkeeper-accent-strong, #6366f1) 35%, var(--xkeeper-border));
+      border-radius: var(--xkeeper-radius-lg, 10px);
+      font-size: 0.84rem;
+    }
+    .apply-strip .count {
+      color: var(--xkeeper-text-bright);
+      font-weight: 600;
+    }
+    .apply-strip button {
+      margin-left: auto;
+      border: 1px solid transparent;
+      background: var(--xkeeper-accent-strong, #6366f1);
+      color: var(--xkeeper-accent-ink, #fff);
+      font: inherit;
+      font-weight: 600;
+      padding: 4px 14px;
+      border-radius: var(--xkeeper-radius-sm, 6px);
+      cursor: pointer;
+    }
+    .apply-strip button:disabled {
+      opacity: 0.55;
+      cursor: default;
+    }
+    .apply-strip .feedback {
+      color: var(--xkeeper-text-dim);
+      white-space: pre-wrap;
+      max-width: 52ch;
+      max-height: 8em;
+      overflow-y: auto;
+      font-size: 0.78rem;
+    }
+    .apply-strip .feedback[data-error='true'] {
+      color: var(--xkeeper-status-failed, #ef4444);
+    }
+    .changed-mark {
+      margin-left: 6px;
+      padding: 1px 7px;
+      border-radius: 999px;
+      font-size: 0.68rem;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      background: color-mix(in srgb, var(--xkeeper-accent-strong, #6366f1) 22%, transparent);
+      color: var(--xkeeper-text-bright);
+    }
     .empty {
       padding: var(--xkeeper-space-6);
       text-align: center;
@@ -143,7 +203,7 @@ export class XkeeperAppOverview extends LitElement {
   `
 
   private programsOf(app: string): ProgramInfo[] {
-    return this.console.snapshot.doc?.programs.filter((p) => p.app === app) ?? []
+    return this.console?.snapshot.doc?.programs.filter((p) => p.app === app) ?? []
   }
 
   private rateOf(p: ProgramInfo, stream: 'out' | 'err'): number {
@@ -161,6 +221,36 @@ export class XkeeperAppOverview extends LitElement {
     }
   }
 
+  private pendingSet(): Set<string> {
+    return new Set(
+      (this.console?.snapshot.doc?.pending.programs ?? [])
+        .filter((x) => x.app === this.app)
+        .map((x) => x.program),
+    )
+  }
+
+  private async onApply(): Promise<void> {
+    if (this.applying) return
+    const count = this.pendingSet().size
+    if (
+      !window.confirm(
+        `应用 app「${this.app}」的待应用变更（${count} 个程序）？\n变更的程序停止后以新定义重建；手动停止的保持停止。\n不影响其他应用。`,
+      )
+    ) {
+      return
+    }
+    this.applying = true
+    this.applyFeedback = null
+    try {
+      const r = await this.store.apply({ app: this.app })
+      this.applyFeedback = { ok: true, text: r }
+    } catch (e) {
+      this.applyFeedback = { ok: false, text: String(e instanceof Error ? e.message : e) }
+    } finally {
+      this.applying = false
+    }
+  }
+
   private onWindowChange(e: Event): void {
     this.rateWindow = Number((e.target as HTMLSelectElement).value) as RateWindowS
     saveRateWindowS(this.rateWindow)
@@ -172,6 +262,7 @@ export class XkeeperAppOverview extends LitElement {
 
   render() {
     const programs = this.programsOf(this.app)
+    const pendingSet = this.pendingSet()
     return html`
       <header>
         <h1>▤ ${this.app}</h1>
@@ -185,6 +276,22 @@ export class XkeeperAppOverview extends LitElement {
           </select>
         </label>
       </header>
+      ${pendingSet.size > 0 || this.applyFeedback
+        ? html`<div class="apply-strip" role="alert">
+            <span><span class="count">${pendingSet.size}</span> 个程序配置有变化（待应用）</span>
+            <button ?disabled=${this.applying} @click=${() => void this.onApply()}>
+              ${this.applying ? '应用中…' : 'Apply 此应用'}
+            </button>
+            ${this.applyFeedback
+              ? html`<span
+                  class="feedback"
+                  data-error=${!this.applyFeedback.ok}
+                  role="status"
+                  >${this.applyFeedback.text}</span
+                >`
+              : nothing}
+          </div>`
+        : nothing}
       ${programs.length === 0
         ? html`<div class="empty">该应用没有声明任何程序</div>`
         : html`
@@ -209,7 +316,12 @@ export class XkeeperAppOverview extends LitElement {
                       @click=${() => this.openDetail(p.name)}
                       title="查看 ${p.name} 详情"
                     >
-                      <td><span class="name-cell"><span class="glyph" aria-hidden="true">${stateGlyph(p.state)}</span>${p.name}</span></td>
+                      <td>
+                        <span class="name-cell"
+                          ><span class="glyph" aria-hidden="true">${stateGlyph(p.state)}</span
+                          >${p.name}</span
+                        >${pendingSet.has(p.name) ? html`<span class="changed-mark">待应用</span>` : nothing}
+                      </td>
                       <td>
                         <xkeeper-status-badge slug=${p.state} label=${p.state} glyph=${stateGlyph(p.state)}
                         ></xkeeper-status-badge>
