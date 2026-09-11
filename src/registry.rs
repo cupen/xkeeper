@@ -16,6 +16,17 @@ pub struct ListedApp {
     pub name: String,
     pub path: PathBuf,
     pub description: Option<String>,
+    /// Set when the config file exists but is broken (parse/read failure).
+    /// Detection isolates such apps instead of treating them as removed.
+    pub broken: Option<String>,
+}
+
+
+impl ListedApp {
+    /// Only the apps whose config loaded cleanly.
+    pub fn good(apps: Vec<ListedApp>) -> Vec<ListedApp> {
+        apps.into_iter().filter(|a| a.broken.is_none()).collect()
+    }
 }
 
 /// `<app_dir>/<name>.toml` for a given app name.
@@ -75,10 +86,29 @@ pub fn list(config: &DaemonConfig, config_dir: &Path) -> Result<Vec<ListedApp>> 
                     description: raw.app.as_ref().and_then(|m| m.description.clone()),
                     name,
                     path: real,
+                    broken: None,
                 }),
-                Err(e) => warn!("registered app {name:?} fails to parse: {e}"),
+                // Keep the entry so the supervisor can isolate it explicitly
+                // (broken file ≠ unregistered); non-supervisor callers filter.
+                Err(e) => {
+                    warn!("registered app {name:?} fails to parse: {e}");
+                    out.push(ListedApp {
+                        description: None,
+                        name,
+                        path: real,
+                        broken: Some(format!("app config fails to parse: {e}")),
+                    })
+                }
             },
-            Err(e) => warn!("registered app {name:?} cannot be read: {e}"),
+            Err(e) => {
+                warn!("registered app {name:?} cannot be read: {e}");
+                out.push(ListedApp {
+                    description: None,
+                    name,
+                    path: real,
+                    broken: Some(format!("app config cannot be read: {e}")),
+                })
+            }
         }
     }
     Ok(out)

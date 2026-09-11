@@ -27,13 +27,29 @@ impl Client {
     }
 
     fn call(&self, method: &str, path: &str) -> Result<serde_json::Value> {
+        self.call_with_body(method, path, &serde_json::json!({}))
+    }
+
+    fn call_with_body(
+        &self,
+        method: &str,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
         let mut r = self
             .agent
             .request(method, &format!("{}{}", self.base, path));
         if !self.token.is_empty() {
             r = r.set("Authorization", &format!("Bearer {}", self.token));
         }
-        let resp = r.call().map_err(|e| unreachable(e))?;
+        let has_body = body.as_object().map(|o| !o.is_empty()).unwrap_or(false);
+        let resp = if has_body {
+            r.set("Content-Type", "application/json")
+                .send_string(&body.to_string())
+                .map_err(|e| unreachable(e))?
+        } else {
+            r.call().map_err(|e| unreachable(e))?
+        };
         let status = resp.status();
         let text = resp.into_string().unwrap_or_default();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::json!({}));
@@ -68,6 +84,21 @@ impl Client {
 
     pub fn reload(&self) -> Result<serde_json::Value> {
         self.call("POST", "/v1/reload")
+    }
+
+    pub fn pending(&self) -> Result<serde_json::Value> {
+        self.call("GET", "/v1/pending")
+    }
+
+    pub fn apply(&self, app: Option<&str>, program: Option<&str>, restart: bool) -> Result<serde_json::Value> {
+        let mut body = serde_json::json!({ "restart": restart });
+        if let Some(a) = app {
+            body["app"] = serde_json::Value::String(a.to_string());
+        }
+        if let Some(p) = program {
+            body["program"] = serde_json::Value::String(p.to_string());
+        }
+        self.call_with_body("POST", "/v1/apply", &body)
     }
 
     pub fn shutdown(&self) -> Result<serde_json::Value> {

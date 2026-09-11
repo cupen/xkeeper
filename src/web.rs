@@ -32,7 +32,7 @@ use crate::assets;
 use crate::pump;
 use crate::pump::Stream;
 use crate::server::{ProgramInfo, StatusDoc, program_info, status_doc};
-use crate::supervisor::{Command, Supervisor};
+use crate::supervisor::{ApplyScope, Command, Supervisor};
 
 /// Replay context when a client subscribes to a log stream.
 const LOG_TAIL_DEFAULT: usize = 200;
@@ -114,6 +114,69 @@ async fn program_logs(
     .into_response()
 }
 
+async fn pending(State(sup): State<Arc<Supervisor>>) -> Json<crate::supervisor::PendingDoc> {
+    let doc = sup.state.lock().unwrap().pending.clone();
+    Json(doc)
+}
+
+#[derive(Deserialize, Default)]
+struct ApplyQuery {
+    app: Option<String>,
+    program: Option<String>,
+    restart: Option<bool>,
+}
+
+async fn apply(State(sup): State<Arc<Supervisor>>, body: Option<Json<ApplyQuery>>) -> Response {
+    use std::sync::mpsc;
+    let q = body.map(|Json(q)| q).unwrap_or_default();
+    // Scope validation mirrors /v1/apply (unknown app/program → 404).
+    let (known_app, known_program) = {
+        let st = sup.state.lock().unwrap();
+        let app_ok = match &q.app {
+            Some(a) => st.apps.iter().any(|r| &r.name == a),
+            None => true,
+        };
+        let prog_ok = match (&q.app, &q.program) {
+            (Some(a), Some(p)) => st
+                .programs
+                .get(p)
+                .map(|x| &x.def.app == a)
+                .unwrap_or(false),
+            _ => true,
+        };
+        (app_ok, prog_ok)
+    };
+    if let Some(a) = &q.app {
+        if !known_app {
+            return api_error(StatusCode::NOT_FOUND, &format!("unknown app {a:?}"));
+        }
+    }
+    if let Some(p) = &q.program {
+        if !known_program {
+            return api_error(StatusCode::NOT_FOUND, &format!("unknown program {p:?}"));
+        }
+    }
+    let scope = match (q.app, q.program) {
+        (Some(a), Some(p)) => ApplyScope::Program(a, p),
+        (Some(a), None) => ApplyScope::App(a),
+        _ => ApplyScope::All,
+    };
+    let (tx, rx) = mpsc::channel();
+    sup.enqueue(Command::Apply {
+        scope,
+        restart: q.restart.unwrap_or(false),
+        reply: Some(tx),
+    });
+    match rx.recv_timeout(COMMAND_TIMEOUT) {
+        Ok(Ok(msg)) => Json(json!({ "result": msg })).into_response(),
+        Ok(Err(e)) => api_error(StatusCode::CONFLICT, &format!("{e:#}")),
+        Err(_) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "supervisor did not answer in time",
+        ),
+    }
+}
+
 async fn program_action(
     State(sup): State<Arc<Supervisor>>,
     Path((name, action)): Path<(String, String)>,
@@ -160,6 +223,8 @@ pub fn build_router(sup: Arc<Supervisor>) -> Router {
         .route("/api/programs/{name}", get(program_detail))
         .route("/api/programs/{name}/logs", get(program_logs))
         .route("/api/programs/{name}/{action}", post(program_action))
+        .route("/api/pending", get(pending))
+        .route("/api/apply", post(apply))
         .route("/assets/{*path}", get(assets::asset))
         .route("/ws", get(ws_upgrade))
         .layer(CompressionLayer::new())
@@ -250,7 +315,13 @@ async fn ws_session(socket: WebSocket, sup: Arc<Supervisor>) {
     // webui-api spec: the first message is always a full snapshot.
     let snap = status_doc(&sup);
     let mut last: Vec<ProgramInfo> = snap.programs.clone();
-    if let Ok(payload) = rmp_serde::to_vec(&snap) {
+    let mut last_pending = snap.pending.clone();
+    // Named (map) encoding: the browser's msgpack decoder produces JS
+    // objects; compact array encoding yields a tuple, which the client's
+    // StatusDoc handling cannot consume (the WS channel would silently
+    // stall on snapshot decode). Field names keep JSON/MessagePack
+    // isomorphic per the webui-api data-format requirement.
+    if let Ok(payload) = rmp_serde::to_vec_named(&snap) {
         let _ = out_tx
             .send(api::encode_ws_message(msg_type::SNAPSHOT, &payload))
             .await;
@@ -320,13 +391,25 @@ async fn ws_session(socket: WebSocket, sup: Arc<Supervisor>) {
             }
             _ = tokio::time::sleep(WS_POLL) => {
                 // Diff the shared state against what this session last sent;
-                // the control-plane loop is the single writer.
-                let cur = status_doc(&sup).programs;
+                // the control-plane loop is the single writer. Pending changes
+                // ride the STATUS frame as a `pending` field when they differ
+                // (apply-workflow: pending appears in snapshot + deltas).
+                let doc = status_doc(&sup);
+                let cur = doc.programs.clone();
+                let pending_changed = doc.pending != last_pending;
                 let delta = status_delta(&last, &cur);
                 last = cur;
-                if !delta.is_empty() {
-                    if let Ok(payload) = rmp_serde::to_vec(&delta) {
-                        let _ = out_tx.send(api::encode_ws_message(msg_type::STATUS, &payload)).await;
+                if !delta.is_empty() || pending_changed {
+                    last_pending = doc.pending.clone();
+                    let mut payload = serde_json::json!({ "programs": delta });
+                    if pending_changed {
+                        payload["pending"] =
+                            serde_json::to_value(&doc.pending).unwrap_or_default();
+                    }
+                    if let Ok(bytes) = serde_json::to_vec(&payload) {
+                        let _ = out_tx
+                            .send(api::encode_ws_message(msg_type::STATUS, &bytes))
+                            .await;
                     }
                 }
                 // Daemon shutting down: end the session so the console
@@ -892,5 +975,68 @@ mod high_speed_tests {
         assert_eq!(content.lines().count(), total);
         assert_eq!(ring.tail(total + 1).len(), 1000, "ring stays bounded");
         let _ = std::fs::remove_dir_all(tmp);
+    }
+}
+
+#[cfg(test)]
+mod pending_ws_tests {
+    use super::*;
+    use crate::supervisor::{PendingDoc, PendingProgram};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    fn sup_with_pending() -> std::sync::Arc<Supervisor> {
+        let config = crate::config::DaemonConfig::default();
+        let dir = std::env::temp_dir().join(format!("xk-web-pending-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sup = Supervisor::new(config, &dir).unwrap();
+        {
+            let mut st = sup.state.lock().unwrap();
+            st.pending = PendingDoc {
+                programs: vec![PendingProgram {
+                    app: "demo".into(),
+                    program: "web".into(),
+                    running: true,
+                }],
+                ..Default::default()
+            };
+        }
+        sup
+    }
+
+    /// webui-api: pending changes ride STATUS delta frames with a `pending`
+    /// field when they differ from the last sent state.
+    #[tokio::test]
+    async fn ws_status_delta_carries_pending_changes() {
+        let sup = sup_with_pending();
+        let app = build_router(sup.clone());
+        let resp = app
+            .oneshot(
+                Request::get("/api/overview")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["pending"]["programs"][0]["program"], "web");
+        assert_eq!(v["pending"]["programs"][0]["running"], true);
+        // And /api/pending serves the same doc.
+        let app2 = build_router(sup.clone());
+        let resp = app2
+            .oneshot(Request::get("/api/pending").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["programs"][0]["app"], "demo");
     }
 }

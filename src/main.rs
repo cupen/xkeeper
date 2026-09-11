@@ -92,6 +92,17 @@ enum Cmd {
     },
     /// Reload daemon config and all registered apps (per-app atomic)
     Reload,
+    /// Apply pending config changes (scope: all | <app> | <app> <program>)
+    Apply {
+        /// Restrict the apply to one app (and optionally one program)
+        #[arg(default_value = None)]
+        app: Option<String>,
+        #[arg(default_value = None)]
+        program: Option<String>,
+        /// Also restart unchanged programs (user-stopped ones stay stopped)
+        #[arg(long)]
+        restart: bool,
+    },
     /// Stop all programs and exit the daemon
     Shutdown,
     /// Register an app (a directory with xkeeper.toml, or a config file path)
@@ -257,6 +268,20 @@ fn dispatch(cli: &Cli) -> Result<()> {
             );
             Ok(())
         }),
+        Some(Cmd::Apply {
+            app,
+            program,
+            restart,
+        }) => client_cmd(&config_path, |c| {
+            let v = c.apply(app.as_deref(), program.as_deref(), *restart)?;
+            println!(
+                "{}",
+                v.get("result")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("applied")
+            );
+            Ok(())
+        }),
         Some(Cmd::Shutdown) => client_cmd(&config_path, |c| {
             let v = c.shutdown()?;
             println!(
@@ -383,7 +408,7 @@ fn dispatch(cli: &Cli) -> Result<()> {
         Some(Cmd::List) => {
             let config = client::load_config(&config_path)?;
             let config_dir = config_dir_of(&config_path);
-            let apps = registry::list(&config, &config_dir)?;
+            let apps = registry::ListedApp::good(registry::list(&config, &config_dir)?);
             if apps.is_empty() {
                 println!(
                     "no apps registered (use `xkeeper add <dir>` in an app deployment directory)"
@@ -426,16 +451,13 @@ fn config_dir_of(config_path: &Path) -> PathBuf {
 fn sync_if_online(config: &DaemonConfig) -> Result<()> {
     let c = client::Client::from_config(config);
     if c.health().is_ok() {
-        let v = c.reload().with_context(|| {
-            "registry change persisted, but the running daemon failed to reload; \
-             run `xkeeper reload` once the problem is fixed"
+        // reload = rescan + detect only: the registry change enters pending;
+        // `xkeeper apply` makes it take effect (app-registry spec).
+        c.reload().with_context(|| {
+            "registry change persisted, but the running daemon failed to rescan; \
+             run `xkeeper reload` once the problem is fixed, then `xkeeper apply`"
         })?;
-        println!(
-            "daemon synced: {}",
-            v.get("result")
-                .and_then(|r| r.as_str())
-                .unwrap_or("reloaded")
-        );
+        println!("daemon synced: registration is pending — run `xkeeper apply` to take effect");
     }
     Ok(())
 }
@@ -489,7 +511,7 @@ fn validate(config_path: &Path, single: Option<&Path>) -> Result<()> {
         );
     }
     let config_dir = config_dir_of(config_path);
-    let apps = registry::list(&config, &config_dir)?;
+    let apps = registry::ListedApp::good(registry::list(&config, &config_dir)?);
     let mut resolved = Vec::new();
     for l in &apps {
         let (raw, _) = config::AppRaw::load(&l.path)?;
@@ -698,6 +720,7 @@ fn run_daemon(config_path: &Path, webui_listen: Option<String>) -> Result<()> {
 
 #[cfg(test)]
 mod edit_tests {
+    static EDIT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     use super::*;
 
     #[cfg(unix)]
@@ -710,6 +733,7 @@ mod edit_tests {
     #[test]
     #[cfg(unix)]
     fn edit_creates_missing_config_and_passes() {
+        let _guard = EDIT_TEST_LOCK.lock().unwrap();
         let dir = temp_root("create");
         let path = dir.join("nested").join("daemon.toml");
         // `true` exits 0 without touching the file.
@@ -726,6 +750,10 @@ mod edit_tests {
     #[test]
     #[cfg(unix)]
     fn edit_reports_invalid_result_with_config_exit_code() {
+        // Spawning a real editor process here is flaky under full-parallel
+        // test load (observed sporadic failures only in `cargo test` runs);
+        // serialize the editor-spawning tests.
+        let _guard = EDIT_TEST_LOCK.lock().unwrap();
         let dir = temp_root("invalid");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("daemon.toml");
@@ -791,7 +819,7 @@ mod sync_tests {
         let r = sync_if_online(&config);
         let err = r.err().expect("reload failure while online must error");
         assert!(
-            err.to_string().contains("failed to reload"),
+            err.to_string().contains("failed to rescan"),
             "error must explain the sync failure: {err:#}"
         );
         server.join().unwrap();

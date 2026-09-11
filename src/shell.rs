@@ -27,6 +27,12 @@ pub(crate) enum ShellCmd {
         stream: String,
     },
     Reload,
+    Pending,
+    Apply {
+        app: Option<String>,
+        program: Option<String>,
+        restart: bool,
+    },
     Shutdown,
     Open,
     Help,
@@ -47,6 +53,8 @@ pub(crate) fn parse_line(line: &str) -> Result<Option<ShellCmd>> {
         "pid" => ShellCmd::Pid(one_arg(head, args)?),
         "log" => parse_log(args)?,
         "reload" => ShellCmd::Reload,
+        "pending" => ShellCmd::Pending,
+        "apply" => parse_apply(args)?,
         "shutdown" => ShellCmd::Shutdown,
         "open" => ShellCmd::Open,
         "help" | "?" => ShellCmd::Help,
@@ -54,6 +62,37 @@ pub(crate) fn parse_line(line: &str) -> Result<Option<ShellCmd>> {
         other => bail!("unknown command {other:?}{}", similar_hint(other)),
     };
     Ok(Some(cmd))
+}
+
+/// Parse `apply [<app> [<program>]] [--restart]`.
+fn parse_apply(args: &[String]) -> Result<ShellCmd> {
+    let mut app = None;
+    let mut program = None;
+    let mut restart = false;
+    let mut positional = 0;
+    for a in args {
+        if a == "--restart" {
+            restart = true;
+        } else if a.starts_with("--") {
+            bail!("unknown flag {a:?} (only --restart is supported)");
+        } else if positional == 0 {
+            app = Some(a.clone());
+            positional = 1;
+        } else if positional == 1 {
+            program = Some(a.clone());
+            positional = 2;
+        } else {
+            bail!("apply takes at most two positional args: <app> <program>");
+        }
+    }
+    if app.is_none() && program.is_some() {
+        bail!("apply <program> needs an app first: apply <app> <program>");
+    }
+    Ok(ShellCmd::Apply {
+        app,
+        program,
+        restart,
+    })
 }
 
 /// Split on whitespace, honoring double/single quotes (enough for
@@ -144,8 +183,8 @@ fn parse_log(args: &[String]) -> Result<ShellCmd> {
 
 /// Naive "did you mean" for the unknown-command hint.
 fn similar_hint(input: &str) -> String {
-    const COMMANDS: [&str; 11] = [
-        "status", "start", "stop", "restart", "pid", "log", "reload", "shutdown", "open", "help",
+    const COMMANDS: [&str; 13] = [
+        "status", "start", "stop", "restart", "pid", "log", "reload", "pending", "apply", "shutdown", "open", "help",
         "exit",
     ];
     let input = input.to_lowercase();
@@ -188,7 +227,11 @@ Built-in commands:
   pid <name>                          print a program's pid
   log <name> [-f] [--tail N] [--stream out|err]
                                       view program logs
-  reload                              hot-reload daemon config and all registered apps
+  reload                              rescan config and show pending changes (no restarts)
+  pending                             show pending (detected but not applied) changes
+  apply [<app> [<program>]] [--restart]
+                                      apply pending changes; --restart restarts unchanged
+                                      programs too (user-stopped ones stay stopped)
   shutdown                            stop all programs and exit the daemon
   open                                open the web console in the system browser
   help (or ?)                         show this help
@@ -305,6 +348,51 @@ fn execute(c: &Client, cmd: &ShellCmd, webui_url: &str) -> Result<Outcome> {
                 v.get("result")
                     .and_then(|r| r.as_str())
                     .unwrap_or("reloaded")
+            );
+            Ok(Outcome::Continue)
+        }
+        ShellCmd::Pending => {
+            let v = c.pending()?;
+            let programs = v
+                .get("programs")
+                .and_then(|p| p.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if programs.is_empty() {
+                println!("no pending changes");
+            } else {
+                println!("pending changes ({}):", programs.len());
+                for p in programs {
+                    let app = p.get("app").and_then(|x| x.as_str()).unwrap_or("?");
+                    let prog = p.get("program").and_then(|x| x.as_str()).unwrap_or("?");
+                    let state = if p.get("running").and_then(|x| x.as_bool()).unwrap_or(false) {
+                        "running"
+                    } else {
+                        "stopped"
+                    };
+                    println!("  {app}.{prog} [{state}] config changed");
+                }
+            }
+            for key in ["apps_added", "apps_removed", "daemon_hints", "errors"] {
+                if let Some(list) = v.get(key).and_then(|x| x.as_array()) {
+                    for item in list {
+                        println!("  {}", item.as_str().unwrap_or_default());
+                    }
+                }
+            }
+            Ok(Outcome::Continue)
+        }
+        ShellCmd::Apply {
+            app,
+            program,
+            restart,
+        } => {
+            let v = c.apply(app.as_deref(), program.as_deref(), *restart)?;
+            println!(
+                "{}",
+                v.get("result")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("applied")
             );
             Ok(Outcome::Continue)
         }
@@ -592,6 +680,36 @@ mod tests {
         assert_eq!(parse("exit"), Some(ShellCmd::Exit));
         assert_eq!(parse("status"), Some(ShellCmd::Status));
         assert_eq!(parse("reload"), Some(ShellCmd::Reload));
+        assert_eq!(parse("pending"), Some(ShellCmd::Pending));
+        assert_eq!(
+            parse("apply"),
+            Some(ShellCmd::Apply {
+                app: None,
+                program: None,
+                restart: false
+            })
+        );
+        assert_eq!(
+            parse("apply myapp --restart"),
+            Some(ShellCmd::Apply {
+                app: Some("myapp".into()),
+                program: None,
+                restart: true
+            })
+        );
+        assert_eq!(
+            parse("apply myapp web"),
+            Some(ShellCmd::Apply {
+                app: Some("myapp".into()),
+                program: Some("web".into()),
+                restart: false
+            })
+        );
+        assert!(parse_line("apply --bogus").is_err());
+        assert!(
+            parse_line("apply a b c").is_err(),
+            "too many positional args"
+        );
         assert_eq!(parse("open"), Some(ShellCmd::Open));
         assert_eq!(parse("shutdown"), Some(ShellCmd::Shutdown));
     }
