@@ -947,7 +947,14 @@ try {{
 console.log('BROWSER PASS OK');
 "###,
         webui = ws.webui_port,
-        alpha = ws.root.join("app-alpha/xkeeper.toml").display(),
+        // Forward slashes: a raw Windows path would put `\x`-style escapes
+        // into the JS string literal (node fs accepts `/` everywhere).
+        alpha = ws
+            .root
+            .join("app-alpha/xkeeper.toml")
+            .display()
+            .to_string()
+            .replace('\\', "/"),
     )
 }
 
