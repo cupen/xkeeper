@@ -963,8 +963,15 @@ mod tests {
         assert!(err.contains("absolute"), "error must state the rule: {err}");
         let empty: DaemonConfig = toml::from_str("[daemon]\nlog_dir = \"\"\n").unwrap();
         assert!(empty.validate().is_err());
+        // An absolute path needs a drive letter on Windows (escaped for a
+        // TOML basic string).
+        let ok_dir = if cfg!(windows) {
+            "C:\\\\var\\\\log\\\\xkeeper"
+        } else {
+            "/var/log/xkeeper"
+        };
         let ok: DaemonConfig =
-            toml::from_str("[daemon]\nlog_dir = \"/var/log/xkeeper\"\n").unwrap();
+            toml::from_str(&format!("[daemon]\nlog_dir = \"{ok_dir}\"\n")).unwrap();
         ok.validate().unwrap();
     }
 

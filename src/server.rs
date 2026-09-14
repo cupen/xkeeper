@@ -18,7 +18,7 @@ use anyhow::{Context, Result};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 
-use crate::supervisor::{ApplyScope, Command, Supervisor};
+use crate::supervisor::{Command, Supervisor};
 
 const MAX_FOLLOWS: usize = 8;
 const MAX_HEADER_BYTES: usize = 32 * 1024;
@@ -377,39 +377,26 @@ fn handle_connection(sup: &Arc<Supervisor>, token: &str, stream: TcpStream) {
         ("POST", ["v1", "apply"]) => {
             let req: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
             let app = req.get("app").and_then(|v| v.as_str()).map(String::from);
-            let program = req.get("program").and_then(|v| v.as_str()).map(String::from);
-            let restart = req.get("restart").and_then(|v| v.as_bool()).unwrap_or(false);
-            // Scope validation against the registered apps/programs.
-            let (known_app, known_program) = {
-                let st = sup.state.lock().unwrap();
-                let app_ok = match &app {
-                    Some(a) => st.apps.iter().any(|r| &r.name == a),
-                    None => true,
-                };
-                let prog_ok = match (&app, &program) {
-                    (Some(a), Some(p)) => st
-                        .programs
-                        .get(p)
-                        .map(|x| &x.def.app == a)
-                        .unwrap_or(false),
-                    _ => true,
-                };
-                (app_ok, prog_ok)
-            };
-            if !known_app {
-                let a = app.clone().unwrap_or_default();
-                let _ = writer.write_all(&err_bytes(404, &format!("unknown app {a:?}")));
-                return;
-            }
-            if !known_program {
-                let p = program.clone().unwrap_or_default();
-                let _ = writer.write_all(&err_bytes(404, &format!("unknown program {p:?}")));
-                return;
-            }
-            let scope = match (app, program) {
-                (Some(a), Some(p)) => ApplyScope::Program(a, p),
-                (Some(a), None) => ApplyScope::App(a),
-                _ => ApplyScope::All,
+            let program = req
+                .get("program")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let restart = req
+                .get("restart")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            // Scope validation + the `all` keyword resolve in the supervisor
+            // (single source shared with /api/apply).
+            let scope = match crate::supervisor::resolve_apply_scope(
+                sup,
+                app.as_deref(),
+                program.as_deref(),
+            ) {
+                Ok(s) => s,
+                Err(msg) => {
+                    let _ = writer.write_all(&err_bytes(404, &msg));
+                    return;
+                }
             };
             let (tx, rx) = mpsc::channel();
             sup.enqueue(Command::Apply {

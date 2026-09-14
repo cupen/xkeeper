@@ -76,10 +76,7 @@ fn main() -> Result<()> {
             catchup_secs,
             keep,
         }),
-        Cmd::E2e { keep, no_browser } => e2e::run(e2e::Args {
-            keep,
-            no_browser,
-        }),
+        Cmd::E2e { keep, no_browser } => e2e::run(e2e::Args { keep, no_browser }),
     }
 }
 

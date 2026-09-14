@@ -32,7 +32,7 @@ use crate::assets;
 use crate::pump;
 use crate::pump::Stream;
 use crate::server::{ProgramInfo, StatusDoc, program_info, status_doc};
-use crate::supervisor::{ApplyScope, Command, Supervisor};
+use crate::supervisor::{Command, Supervisor};
 
 /// Replay context when a client subscribes to a log stream.
 const LOG_TAIL_DEFAULT: usize = 200;
@@ -129,37 +129,15 @@ struct ApplyQuery {
 async fn apply(State(sup): State<Arc<Supervisor>>, body: Option<Json<ApplyQuery>>) -> Response {
     use std::sync::mpsc;
     let q = body.map(|Json(q)| q).unwrap_or_default();
-    // Scope validation mirrors /v1/apply (unknown app/program → 404).
-    let (known_app, known_program) = {
-        let st = sup.state.lock().unwrap();
-        let app_ok = match &q.app {
-            Some(a) => st.apps.iter().any(|r| &r.name == a),
-            None => true,
-        };
-        let prog_ok = match (&q.app, &q.program) {
-            (Some(a), Some(p)) => st
-                .programs
-                .get(p)
-                .map(|x| &x.def.app == a)
-                .unwrap_or(false),
-            _ => true,
-        };
-        (app_ok, prog_ok)
-    };
-    if let Some(a) = &q.app {
-        if !known_app {
-            return api_error(StatusCode::NOT_FOUND, &format!("unknown app {a:?}"));
-        }
-    }
-    if let Some(p) = &q.program {
-        if !known_program {
-            return api_error(StatusCode::NOT_FOUND, &format!("unknown program {p:?}"));
-        }
-    }
-    let scope = match (q.app, q.program) {
-        (Some(a), Some(p)) => ApplyScope::Program(a, p),
-        (Some(a), None) => ApplyScope::App(a),
-        _ => ApplyScope::All,
+    // Scope validation + the `all` keyword resolve in the supervisor — the
+    // same source as /v1/apply (unknown app/program → 404).
+    let scope = match crate::supervisor::resolve_apply_scope(
+        &sup,
+        q.app.as_deref(),
+        q.program.as_deref(),
+    ) {
+        Ok(s) => s,
+        Err(msg) => return api_error(StatusCode::NOT_FOUND, &msg),
     };
     let (tx, rx) = mpsc::channel();
     sup.enqueue(Command::Apply {
@@ -1012,11 +990,7 @@ mod pending_ws_tests {
         let sup = sup_with_pending();
         let app = build_router(sup.clone());
         let resp = app
-            .oneshot(
-                Request::get("/api/overview")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::get("/api/overview").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);

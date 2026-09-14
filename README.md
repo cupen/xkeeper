@@ -32,6 +32,13 @@ Linux 与 Windows 上行为一致：崩溃自动拉起、启动顺序与依赖�
   `app_dir` 里出现 `<name>.toml` 链接指向配置本体——这就是注册记录；
   `xkeeper list` 扫描它，`xkeeper remove` 删除它（部署文件永不删除）。
   Windows 无符号链接权限时降级为硬链接（见下方"注意"）。
+- **裸程序脚手架**：`xkeeper add ./path/to/proc --name abc` 对可执行程序直接
+  生成 `app_dir/abc.toml`（真实文件，注册记录即文件本身）：command 写绝对
+  路径，`work_dir` 缺省为执行 add 时的目录，另有 `--args "<字符串>"`/
+  `--env K=V`（可重复）/`--workdir <路径>`。重复执行同名 add 会以本次参数
+  **全量再生**该文件（文件上的手改会被覆盖），内容有差异时提示需先
+  `xkeeper apply`；`--apply` 在注册后立即对该 app 应用。`xkeeper remove`
+  对这类生成记录连带删除文件并打印路径。
 
 字段优先级（高 → 低）：`[program.*]` 显式字段 > app 配置 `[app]` 表 >
 daemon `[app-default]` > 内置默认。`autostart`/`priority` 是应用级字段。
@@ -45,8 +52,9 @@ xkeeper edit                   # 可选：用 $VISUAL/$EDITOR（缺省 vi/notepa
                                #   不存在则创建；保存退出后自动校验，非法以退出码 2 报告
 
 # 1. 在你的应用部署目录写一个 xkeeper.toml（见 examples/demo-app）
-# 2. 注册（空配置也能先跑起来）
+# 2. 注册（空配置也能先跑起来）；或从可执行程序直接脚手架生成：
 cd /opt/myapp && xkeeper add . --name myapp --autostart
+xkeeper add /opt/srv/web-server --name abc --args "--port 8080" --env LOG=debug --apply
 xkeeper list
 
 # 3. 启动守护进程（默认空无一物，只拉起已注册应用）
@@ -57,10 +65,13 @@ xkeeper status
 xkeeper stop myapp-程序名
 xkeeper log <程序名> --tail 50 -f
 xkeeper reload                 # 重扫配置并检出待应用变更（pending），不触碰任何进程
-xkeeper apply                  # 应用待应用变更（apply demo / apply demo web 限定范围）
+xkeeper apply                  # 应用待应用变更（apply all 等价；apply demo / apply demo web 限定范围）
 xkeeper apply --restart        # 无变更的程序也重启（手动停止的保持停止）
 xkeeper shutdown
 ```
+
+> `all` 是 apply 的全量保留字：`xkeeper apply all` 与裸 `xkeeper apply`
+> 严格等价，因此应用名不能叫 `all`（add 会拒绝并说明保留字）。
 
 ## 配置示例
 
@@ -124,7 +135,8 @@ restart_on_unhealthy = true # unhealthy 触发与崩溃一致的重启
 编辑 app 配置或 daemon 配置后，守护进程会在一个巡检周期内自动检出差异
 （pending），**不会**触碰任何进程。`xkeeper apply` 显式应用：
 
-- `apply` 应用全部 pending；`apply <app>` / `apply <app> <program>` 限定范围，
+- `apply` 应用全部 pending；`apply all` 与缺省严格等价（`all` 为全量保留字，
+  不可用作应用名）；`apply <app>` / `apply <app> <program>` 限定范围，
   不影响范围外的应用；
 - 配置有变化的程序：停止 → 以新定义重建 → 原先在跑则重新拉起（手动停止的
   保持停止，只更新定义）；

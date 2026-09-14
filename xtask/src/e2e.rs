@@ -1,14 +1,21 @@
-//! Acceptance e2e for the apply-workflow change (`cargo run -p xtask -- e2e`).
+//! Acceptance e2e for the apply-workflow + app-registry changes
+//! (`cargo run -p xtask -- e2e`).
 //!
 //! Drives the REAL daemon binary end-to-end, in two passes:
 //!
 //! - CLI pass — the acceptance checklist as executable scenarios (spec:
-//!   apply-workflow, configuration, control-plane, shell-client, app-registry):
+//!   apply-workflow, configuration, control-plane, shell-client,
+//!   app-registry):
 //!   A. detect does not touch processes (periodic + reload preview),
 //!   B. scoped apply leaves other apps untouched,
 //!   C. --restart restarts unchanged programs but never a user-stopped one,
 //!   D. online `add` enters pending and starts on apply,
-//!   E. no-change apply is idempotent.
+//!   E. no-change apply is idempotent,
+//!   G. add-process scaffold: offline `--apply` fails loudly (exit 3) and
+//!      `--env` parse errors exit 2 (G0, daemon not yet running) → generate →
+//!      apply → no-change re-add → changed re-add + `apply all` → `--apply`
+//!      one-step (app-scoped) → reserved `all` rejected → remove deletes the
+//!      generated file and stops the program.
 //! - webui pass — a real browser (playwright, chromium) against the embedded
 //!   console: the pending badge appears after a disk edit, "Apply 此应用"
 //!   (app-scope) confirms and applies, the result text renders, and a second
@@ -58,11 +65,13 @@ fn setup_workspace(tag: &str) -> Result<Workspace> {
     }
     let control_port = free_port()?;
     let webui_port = free_port()?;
+    // Forward slashes in the TOML basic string: a raw Windows path would
+    // put invalid `\U`-style escapes into the config.
+    let log_dir = root.join("logs").to_string_lossy().replace('\\', "/");
     std::fs::write(
         root.join("daemon.toml"),
         format!(
-            "[daemon]\nhost = \"127.0.0.1\"\nport = {control_port}\nlog_dir = \"{}/logs\"\nlog_level = \"warn\"\nmonitor_interval = 0.5\n",
-            root.display()
+            "[daemon]\nhost = \"127.0.0.1\"\nport = {control_port}\nlog_dir = \"{log_dir}\"\nlog_level = \"warn\"\nmonitor_interval = 0.5\n",
         ),
     )?;
     std::fs::write(
@@ -73,19 +82,35 @@ fn setup_workspace(tag: &str) -> Result<Workspace> {
         root.join("app-beta/xkeeper.toml"),
         "[app]\nautostart = true\n\n[program.job]\ncommand = \"sleep 100000\"\nstartsecs = 0.2\n",
     )?;
-    std::os::unix::fs::symlink(
-        root.join("app-alpha/xkeeper.toml"),
-        root.join("apps/alpha.toml"),
+    link_registration(
+        &root.join("app-alpha/xkeeper.toml"),
+        &root.join("apps/alpha.toml"),
     )?;
-    std::os::unix::fs::symlink(
-        root.join("app-beta/xkeeper.toml"),
-        root.join("apps/beta.toml"),
+    link_registration(
+        &root.join("app-beta/xkeeper.toml"),
+        &root.join("apps/beta.toml"),
     )?;
     Ok(Workspace {
         root,
         control_port,
         webui_port,
     })
+}
+
+/// Register a config as `app_dir/<name>.toml` — symlink where available,
+/// hard-link fallback (unprivileged Windows), mirroring registry::make_link.
+fn link_registration(target: &Path, link: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link)?;
+    }
+    #[cfg(windows)]
+    {
+        if std::os::windows::fs::symlink_file(target, link).is_err() {
+            std::fs::hard_link(target, link)?;
+        }
+    }
+    Ok(())
 }
 
 // -- daemon lifecycle --------------------------------------------------------
@@ -95,15 +120,18 @@ struct Daemon {
 }
 
 fn spawn_daemon(bin: &Path, ws: &Workspace) -> Result<Daemon> {
-    // The daemon must not inherit our stdio (see stress.rs for the reasons).
+    // The daemon must not inherit our stdio (see stress.rs for the reasons),
+    // but its output lands in workspace files so a crash leaves evidence.
+    let out = std::fs::File::create(ws.root.join("daemon.out.log"))?;
+    let err = out.try_clone()?;
     let mut child = Command::new(bin)
         .arg("--config")
         .arg(ws.root.join("daemon.toml"))
         .arg("webui")
         .arg("--listen")
         .arg(format!("127.0.0.1:{}", ws.webui_port))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(out))
+        .stderr(Stdio::from(err))
         .spawn()
         .context("spawn daemon")?;
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -116,7 +144,10 @@ fn spawn_daemon(bin: &Path, ws: &Workspace) -> Result<Daemon> {
             bail!("daemon exited during startup");
         }
         let ok = Command::new("curl")
-            .args(["-sf", &format!("http://127.0.0.1:{}/api/health", ws.webui_port)])
+            .args([
+                "-sf",
+                &format!("http://127.0.0.1:{}/api/health", ws.webui_port),
+            ])
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false);
@@ -171,9 +202,51 @@ fn cli(bin: &Path, ws: &Workspace, args: &[&str]) -> Result<String> {
     Ok(stdout)
 }
 
+/// Run the CLI expecting FAILURE; returns (success, exit code, stdout+stderr).
+fn cli_try(bin: &Path, ws: &Workspace, args: &[&str]) -> Result<(bool, i32, String)> {
+    let out = Command::new(bin)
+        .arg("--config")
+        .arg(ws.config_arg())
+        .args(args)
+        .output()
+        .with_context(|| format!("run xkeeper {:?}", args))?;
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let code = out.status.code().unwrap_or(-1);
+    Ok((out.status.success(), code, combined))
+}
+
+/// A `sleep` executable for the scaffold scenarios: standard locations on
+/// unix, PATH search elsewhere (Git for Windows ships one).
+fn find_sleep() -> Result<PathBuf> {
+    if cfg!(unix) {
+        for p in ["/usr/bin/sleep", "/bin/sleep"] {
+            if Path::new(p).is_file() {
+                return Ok(PathBuf::from(p));
+            }
+        }
+    }
+    let exe = if cfg!(windows) { "sleep.exe" } else { "sleep" };
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            let cand = dir.join(exe);
+            if cand.is_file() {
+                return Ok(cand);
+            }
+        }
+    }
+    bail!("no `sleep` executable found — needed by the scaffold e2e scenario");
+}
+
 fn api(ws: &Workspace, path: &str) -> Result<String> {
     let out = Command::new("curl")
-        .args(["-sf", &format!("http://127.0.0.1:{}{path}", ws.control_port)])
+        .args([
+            "-sf",
+            &format!("http://127.0.0.1:{}{path}", ws.control_port),
+        ])
         .output()
         .context("curl control plane")?;
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
@@ -222,7 +295,11 @@ fn wait_pending_empty(ws: &Workspace) -> Result<()> {
     loop {
         let v = api(ws, "/v1/pending")?;
         let v: serde_json::Value = serde_json::from_str(&v)?;
-        if v.get("programs").and_then(|p| p.as_array()).map(|a| a.is_empty()).unwrap_or(true) {
+        if v.get("programs")
+            .and_then(|p| p.as_array())
+            .map(|a| a.is_empty())
+            .unwrap_or(true)
+        {
             return Ok(());
         }
         if Instant::now() > deadline {
@@ -241,6 +318,97 @@ fn expect(cond: bool, what: &str) -> Result<()> {
         bail!("assertion failed: {what}");
     }
     println!("    ok: {what}");
+    Ok(())
+}
+
+// -- offline pass ----------------------------------------------------------------
+
+/// Runs BEFORE the daemon exists: an explicit `add --apply` that did not take
+/// effect must be visible (exit 3 + remedy, config kept), and `--env` parse
+/// errors must exit with the config code before anything is registered.
+fn offline_pass(bin: &Path, ws: &Workspace) -> Result<()> {
+    let sleep = find_sleep()?;
+
+    step("G0. offline `add --apply` fails loudly: exit 3, config path + remedy");
+    let (ok, code, combined) = cli_try(
+        bin,
+        ws,
+        &[
+            "add",
+            sleep.to_str().unwrap(),
+            "--name",
+            "offline-demo",
+            "--apply",
+        ],
+    )?;
+    expect(!ok, "offline add --apply fails")?;
+    expect(
+        code == 3,
+        &format!("exit code is 3 (daemon unreachable), got {code}"),
+    )?;
+    expect(combined.contains("offline"), "error names the offline cause")?;
+    expect(
+        combined.contains("offline-demo.toml"),
+        "error names the generated config file",
+    )?;
+    expect(
+        combined.contains("xkeeper apply offline-demo"),
+        "error names the remedy",
+    )?;
+    expect(
+        ws.root.join("apps/offline-demo.toml").is_file(),
+        "the generated config is kept for the retry",
+    )?;
+
+    step("G0b. `--env` without '=' / with an empty key exits 2 (config error)");
+    let (ok, code, combined) = cli_try(
+        bin,
+        ws,
+        &[
+            "add",
+            sleep.to_str().unwrap(),
+            "--name",
+            "env-bad",
+            "--env",
+            "NOEQUALS",
+        ],
+    )?;
+    expect(
+        !ok && code == 2,
+        &format!("--env missing '=' exits 2, got {code}"),
+    )?;
+    expect(combined.contains("--env"), "error names the offending flag")?;
+    expect(
+        !ws.root.join("apps/env-bad.toml").exists(),
+        "bad --env registers nothing",
+    )?;
+    let (ok, code, _) = cli_try(
+        bin,
+        ws,
+        &[
+            "add",
+            sleep.to_str().unwrap(),
+            "--name",
+            "env-bad",
+            "--env",
+            "=v",
+        ],
+    )?;
+    expect(
+        !ok && code == 2,
+        &format!("empty --env key exits 2, got {code}"),
+    )?;
+    expect(
+        !ws.root.join("apps/env-bad.toml").exists(),
+        "empty --env key registers nothing",
+    )?;
+
+    // Clean the offline registration so the daemon pass starts clean.
+    let out = cli(bin, ws, &["remove", "offline-demo"])?;
+    expect(
+        out.contains("generated config file removed"),
+        "offline remove deletes the generated file",
+    )?;
     Ok(())
 }
 
@@ -265,18 +433,28 @@ fn cli_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     // Periodic detection window (monitor_interval 0.5s).
     std::thread::sleep(Duration::from_secs(2));
     let v: serde_json::Value = serde_json::from_str(&api(ws, "/v1/pending")?)?;
-    let progs = v.get("programs").and_then(|p| p.as_array()).cloned().unwrap_or_default();
+    let progs = v
+        .get("programs")
+        .and_then(|p| p.as_array())
+        .cloned()
+        .unwrap_or_default();
     expect(
         progs.len() == 1 && progs[0].get("program").and_then(|p| p.as_str()) == Some("worker"),
         "periodic detect published worker as changed (no manual reload)",
     )?;
-    expect(pid_of(ws, "worker")? == Some(worker_pid), "worker still runs the old definition")?;
+    expect(
+        pid_of(ws, "worker")? == Some(worker_pid),
+        "worker still runs the old definition",
+    )?;
     let out = cli(bin, ws, &["reload"])?;
     expect(
         out.contains("worker") && out.contains("run `xkeeper apply`"),
         "reload prints a preview, applies nothing",
     )?;
-    expect(pid_of(ws, "worker")? == Some(worker_pid), "reload left worker alone")?;
+    expect(
+        pid_of(ws, "worker")? == Some(worker_pid),
+        "reload left worker alone",
+    )?;
 
     step("B. scoped apply leaves other apps untouched");
     // Give beta a pending change too.
@@ -293,9 +471,16 @@ fn cli_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     )?;
     let new_worker = wait_running(ws, "worker")?;
     expect(new_worker != worker_pid, "worker restarted (pid changed)")?;
-    expect(pid_of(ws, "job")? == Some(job_pid), "beta job untouched by alpha-scoped apply")?;
+    expect(
+        pid_of(ws, "job")? == Some(job_pid),
+        "beta job untouched by alpha-scoped apply",
+    )?;
     let v: serde_json::Value = serde_json::from_str(&api(ws, "/v1/pending")?)?;
-    let progs = v.get("programs").and_then(|p| p.as_array()).cloned().unwrap_or_default();
+    let progs = v
+        .get("programs")
+        .and_then(|p| p.as_array())
+        .cloned()
+        .unwrap_or_default();
     expect(
         progs.len() == 1 && progs[0].get("program").and_then(|p| p.as_str()) == Some("job"),
         "beta's pending survived the alpha apply",
@@ -319,7 +504,10 @@ fn cli_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     )?;
     // job (unchanged, running) was restarted by --restart; catch its new pid.
     let job2 = pid_of(ws, "job")?;
-    expect(job2.is_some() && job2 != Some(job_pid), "job was restarted by --restart")?;
+    expect(
+        job2.is_some() && job2 != Some(job_pid),
+        "job was restarted by --restart",
+    )?;
 
     step("D. online add enters pending and starts on apply");
     let gamma = ws.root.join("app-gamma");
@@ -328,21 +516,33 @@ fn cli_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         gamma.join("xkeeper.toml"),
         "[app]\nautostart = true\n\n[program.gamma]\ncommand = \"sleep 100000\"\nstartsecs = 0.2\n",
     )?;
-    let out = cli(bin, ws, &["add", gamma.to_str().unwrap(), "--name", "gamma"])?;
+    let out = cli(
+        bin,
+        ws,
+        &["add", gamma.to_str().unwrap(), "--name", "gamma"],
+    )?;
     expect(
         out.contains("registration is pending"),
         "add sync reports pending (not immediate start)",
     )?;
-    expect(pid_of(ws, "gamma")?.is_none(), "gamma not started before apply")?;
+    expect(
+        pid_of(ws, "gamma")?.is_none(),
+        "gamma not started before apply",
+    )?;
     let out = cli(bin, ws, &["apply"])?;
     expect(out.contains("gamma"), "apply picked the new app up")?;
     wait_running(ws, "gamma")?;
 
     step("shell: pending + apply single-command mode");
     let out = cli(bin, ws, &["shell", "-e", "pending"])?;
-    expect(out.contains("no pending changes"), "shell pending is clean after full apply")?;
+    expect(
+        out.contains("no pending changes"),
+        "shell pending is clean after full apply",
+    )?;
     let out = cli(bin, ws, &["shell", "-e", "apply alpha"])?;
     expect(out.contains("no changes"), "shell scoped apply idempotent")?;
+
+    scaffold_pass(bin, ws)?;
 
     // Re-sync disk with the running definitions so the browser pass starts
     // from a clean slate (worker currently runs sleep 200000 after step B).
@@ -351,6 +551,233 @@ fn cli_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         "[app]\nautostart = true\n\n[program.web]\ncommand = \"sleep 100000\"\nstartsecs = 0.2\n\n[program.worker]\ncommand = \"sleep 200000\"\nstartsecs = 0.2\n",
     )?;
     wait_pending_empty(ws)
+}
+
+/// Scenario G (add-process-scaffold): generate from an executable, apply,
+/// regenerate, `--apply`, the `all` reserved word, and remove-file semantics.
+fn scaffold_pass(bin: &Path, ws: &Workspace) -> Result<()> {
+    let sleep = find_sleep()?;
+    let apps = ws.root.join("apps");
+
+    step("G1. add scaffold generates a real config with absolute paths");
+    let out = cli(
+        bin,
+        ws,
+        &[
+            "add",
+            sleep.to_str().unwrap(),
+            "--name",
+            "abc",
+            "--args",
+            "100000",
+            "--env",
+            "XK_E2E=1",
+        ],
+    )?;
+    expect(out.contains("generated"), "add prints the generated file")?;
+    expect(
+        out.contains("pending"),
+        "online sync reports the pending registration",
+    )?;
+    expect(
+        out.contains("changed"),
+        "first generation is announced as changed",
+    )?;
+    // Full non-interactive summary (app-registry: 注册与再生成功后完整打印).
+    expect(
+        out.contains("app[abc]") && out.contains("program[abc]"),
+        "summary names the app and the program",
+    )?;
+    expect(
+        out.contains("command:") && out.contains(sleep.to_string_lossy().as_ref()),
+        "summary prints the absolute command",
+    )?;
+    expect(out.contains("args:") && out.contains("100000"), "summary prints the args")?;
+    expect(
+        out.contains("env:") && out.contains("XK_E2E=1"),
+        "summary prints the env",
+    )?;
+    expect(out.contains("work_dir:"), "summary prints the work_dir")?;
+    let abc_file = apps.join("abc.toml");
+    expect(abc_file.is_file(), "apps/abc.toml is a real file")?;
+    let abc_text = std::fs::read_to_string(&abc_file)?;
+    expect(abc_text.contains("XK_E2E"), "env written into the generated file")?;
+    // toml emits Windows paths as single-quoted literal strings; accept both
+    // quote styles when extracting the value.
+    let wd = abc_text
+        .split("work_dir")
+        .nth(1)
+        .and_then(|rest| {
+            let open = rest.find(['"', '\''])?;
+            let rest = &rest[open + 1..];
+            rest.find(['"', '\'']).map(|end| &rest[..end])
+        })
+        .unwrap_or_default();
+    expect(
+        wd.starts_with('/') || (wd.len() > 2 && wd.as_bytes()[1] == b':'),
+        &format!("work_dir in the file is absolute: {wd:?}"),
+    )?;
+    // Round-trip through config load: the generated file must validate and
+    // the command must have been written as an absolute path.
+    let generated = cli(bin, ws, &["validate", &abc_file.to_string_lossy()])?;
+    expect(
+        generated.contains("abc") && generated.contains("program(s)"),
+        "generated config passes validate",
+    )?;
+    expect(
+        generated.contains(sleep.to_string_lossy().as_ref()),
+        "validated command is the absolute executable path",
+    )?;
+    expect(pid_of(ws, "abc")?.is_none(), "abc not started before apply")?;
+    // list scans app_dir and shows the scaffolded record like any other.
+    let out = cli(bin, ws, &["list"])?;
+    expect(out.contains("abc"), "list shows the scaffolded app name")?;
+    expect(
+        out.contains("abc.toml"),
+        "list shows the scaffolded record path",
+    )?;
+
+    step("G2. apply abc starts the scaffolded program");
+    let out = cli(bin, ws, &["apply", "abc"])?;
+    expect(out.contains("abc"), "scoped apply picked up abc")?;
+    let abc_pid = wait_running(ws, "abc")?;
+
+    step("G3. identical re-add reports no change");
+    let out = cli(
+        bin,
+        ws,
+        &[
+            "add",
+            sleep.to_str().unwrap(),
+            "--name",
+            "abc",
+            "--args",
+            "100000",
+            "--env",
+            "XK_E2E=1",
+        ],
+    )?;
+    expect(out.contains("no change"), "identical re-add is a no change")?;
+    expect(
+        pid_of(ws, "abc")? == Some(abc_pid),
+        "no-change re-add does not touch the running program",
+    )?;
+
+    step("G4. changed re-add, a second pending app, then `apply all` takes both");
+    let out = cli(
+        bin,
+        ws,
+        &[
+            "add",
+            sleep.to_str().unwrap(),
+            "--name",
+            "abc",
+            "--args",
+            "200000",
+        ],
+    )?;
+    expect(
+        out.contains("changed") && out.contains("xkeeper apply abc"),
+        "changed re-add points at the remedy",
+    )?;
+    let out = cli(
+        bin,
+        ws,
+        &[
+            "add",
+            sleep.to_str().unwrap(),
+            "--name",
+            "fox",
+            "--args",
+            "100000",
+        ],
+    )?;
+    expect(out.contains("changed"), "fox first generation is changed")?;
+    let out = cli(bin, ws, &["apply", "all"])?;
+    expect(out.contains("abc"), "`apply all` applied abc's change")?;
+    expect(
+        out.contains("fox"),
+        "`apply all` also applied the other pending app (full-registry scope)",
+    )?;
+    let abc_pid2 = wait_running(ws, "abc")?;
+    expect(abc_pid2 != abc_pid, "abc restarted with the new args")?;
+    wait_running(ws, "fox")?;
+
+    step("G5. add --apply is one step and app-scoped (other pending survives)");
+    // Give alpha a pending change; delta's app-scoped --apply must not touch it.
+    let worker_before = pid_of(ws, "worker")?;
+    std::fs::write(
+        ws.root.join("app-alpha/xkeeper.toml"),
+        "[app]\nautostart = true\n\n[program.web]\ncommand = \"sleep 100000\"\nstartsecs = 0.2\n\n[program.worker]\ncommand = \"sleep 300000\"\nstartsecs = 0.2\n",
+    )?;
+    cli(bin, ws, &["reload"])?; // publish the pending preview
+    let out = cli(
+        bin,
+        ws,
+        &["add", sleep.to_str().unwrap(), "--name", "delta", "--apply"],
+    )?;
+    expect(out.contains("generated"), "delta scaffold generated")?;
+    expect(out.contains("-> start"), "apply result shows delta started")?;
+    wait_running(ws, "delta")?;
+    let v: serde_json::Value = serde_json::from_str(&api(ws, "/v1/pending")?)?;
+    let progs = v
+        .get("programs")
+        .and_then(|p| p.as_array())
+        .cloned()
+        .unwrap_or_default();
+    expect(
+        progs.iter()
+            .any(|p| p.get("program").and_then(|x| x.as_str()) == Some("worker")),
+        "alpha's pending survived delta's app-scoped --apply",
+    )?;
+    expect(
+        pid_of(ws, "worker")? == worker_before && worker_before.is_some(),
+        "delta's --apply did not restart alpha's worker",
+    )?;
+    // Restore alpha's disk to the applied content so no pending leaks on.
+    std::fs::write(
+        ws.root.join("app-alpha/xkeeper.toml"),
+        "[app]\nautostart = true\n\n[program.web]\ncommand = \"sleep 100000\"\nstartsecs = 0.2\n\n[program.worker]\ncommand = \"sleep 200000\"\nstartsecs = 0.2\n",
+    )?;
+    cli(bin, ws, &["reload"])?;
+    wait_pending_empty(ws)?;
+
+    step("G6. `--name all` is rejected (reserved apply-all keyword)");
+    let (ok, _code, combined) =
+        cli_try(bin, ws, &["add", sleep.to_str().unwrap(), "--name", "all"])?;
+    expect(!ok, "add --name all fails")?;
+    expect(
+        combined.contains("reserved"),
+        "error explains the reserved word",
+    )?;
+
+    step("G7. remove deletes the generated file, keeps external bodies");
+    let out = cli(bin, ws, &["remove", "abc"])?;
+    expect(
+        out.contains("generated config file removed"),
+        "remove announces the deleted file",
+    )?;
+    expect(!abc_file.exists(), "apps/abc.toml is gone")?;
+    let out = cli(bin, ws, &["remove", "fox"])?;
+    expect(
+        out.contains("generated config file removed"),
+        "fox's generated file is deleted too",
+    )?;
+    expect(!apps.join("fox.toml").exists(), "apps/fox.toml is gone")?;
+    // A link registration (gamma) is removed without touching the external
+    // deployment file — whatever the message says, the body must survive
+    // (on Windows the record is a hard link, so the message differs).
+    let out = cli(bin, ws, &["remove", "gamma"])?;
+    expect(out.contains("unregistered"), "gamma unregistered")?;
+    expect(
+        ws.root.join("app-gamma/xkeeper.toml").is_file(),
+        "gamma's xkeeper.toml still exists",
+    )?;
+    // Apply the removals: the stopped programs disappear from the status.
+    cli(bin, ws, &["apply"])?;
+    expect(pid_of(ws, "abc")?.is_none(), "abc's program stopped and gone")?;
+    expect(pid_of(ws, "fox")?.is_none(), "fox's program stopped and gone")?;
+    Ok(())
 }
 
 // -- browser pass -----------------------------------------------------------------
@@ -537,6 +964,8 @@ pub(crate) fn run(args: Args) -> Result<()> {
         ws.webui_port,
         ws.control_port
     );
+    // Offline scenarios first: the daemon must NOT be running yet.
+    offline_pass(&bin, &ws)?;
     let mut daemon = spawn_daemon(&bin, &ws)?;
     let result = (|| {
         cli_pass(&bin, &ws)?;
@@ -551,7 +980,10 @@ pub(crate) fn run(args: Args) -> Result<()> {
     shutdown_daemon(&ws, &mut daemon);
     let outcome = match result {
         Ok(()) => {
-            println!("\nACCEPTANCE E2E PASSED ({:.1}s)", started.elapsed().as_secs_f64());
+            println!(
+                "\nACCEPTANCE E2E PASSED ({:.1}s)",
+                started.elapsed().as_secs_f64()
+            );
             Ok(())
         }
         Err(e) => {

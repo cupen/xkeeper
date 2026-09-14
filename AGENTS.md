@@ -9,9 +9,11 @@ stdout/stderr 落盘、Ctrl+C / SIGTERM 优雅停机、Windows Job Object 清理
 - `src/main.rs` — CLI 入口：`run`（纯守护）| `webui`（守护 + Web 控制台）|
   `validate` | `edit`（编辑器打开 daemon 配置 + 校验）；控制子命令
   `status/start/stop/restart/log/pid/reload/shutdown`
-  走本地 HTTP API；`add/remove/list` 管理 app 注册表。
+  走本地 HTTP API；`add/remove/list` 管理 app 注册表（add 按路径形态分派：
+  目录/`.toml` → 既有注册；其他普通文件 → 脚手架生成 `app_dir/<name>.toml`，
+  `apply all` 中 `all` 为全量保留字，不可作应用名）。
 - `src/supervisor.rs` — 守护循环（7 态状态机 × 程序），命令队列唯一写者；
-  `src/registry.rs` — app 注册表（app_dir 链接）；`src/config.rs` — 分层配置
+  `src/registry.rs` — app 注册表（app_dir 链接 + 脚手架生成文件）；`src/config.rs` — 分层配置
   （daemon + app 部署文件）；`src/pump.rs` — 输出接管/轮转/环形缓冲；
   `src/health.rs` — 健康探测；`src/client.rs` — CLI HTTP 客户端。
 - `src/server.rs` — 控制平面：std 手写 HTTP（`/v1/*`，可选 Bearer 鉴权），

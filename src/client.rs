@@ -90,7 +90,12 @@ impl Client {
         self.call("GET", "/v1/pending")
     }
 
-    pub fn apply(&self, app: Option<&str>, program: Option<&str>, restart: bool) -> Result<serde_json::Value> {
+    pub fn apply(
+        &self,
+        app: Option<&str>,
+        program: Option<&str>,
+        restart: bool,
+    ) -> Result<serde_json::Value> {
         let mut body = serde_json::json!({ "restart": restart });
         if let Some(a) = app {
             body["app"] = serde_json::Value::String(a.to_string());

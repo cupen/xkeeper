@@ -36,6 +36,8 @@ use crate::supervisor::Supervisor;
 const EXIT_OK: i32 = 0;
 const EXIT_ERROR: i32 = 1;
 const EXIT_CONFIG: i32 = 2;
+/// Client contract: 3 = daemon unreachable (`add --apply` offline, etc.).
+const EXIT_UNREACHABLE: i32 = 3;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -92,9 +94,12 @@ enum Cmd {
     },
     /// Reload daemon config and all registered apps (per-app atomic)
     Reload,
-    /// Apply pending config changes (scope: all | <app> | <app> <program>)
+    /// Apply pending config changes (scope: all | <app> | <app> <program>).
+    /// The literal `all` means everything (same as no argument) and is a
+    /// reserved word — it can never select an app named "all".
     Apply {
-        /// Restrict the apply to one app (and optionally one program)
+        /// Restrict the apply to one app (and optionally one program);
+        /// the literal `all` applies everything
         #[arg(default_value = None)]
         app: Option<String>,
         #[arg(default_value = None)]
@@ -105,11 +110,18 @@ enum Cmd {
     },
     /// Stop all programs and exit the daemon
     Shutdown,
-    /// Register an app (a directory with xkeeper.toml, or a config file path)
+    /// Register an app: a directory with xkeeper.toml, a config file path,
+    /// or an executable program (scaffolds a fresh config in app_dir).
+    /// Re-running `add` on the same executable regenerates its whole config
+    /// from the given flags — manual edits to the generated file are
+    /// overwritten.
     Add {
-        /// App directory (containing xkeeper.toml) or a config file path
+        /// App directory (containing xkeeper.toml), a config file path, or
+        /// an executable program to scaffold a config from
         #[arg(default_value = ".")]
         path: PathBuf,
+        /// App name (default: directory name, or the executable's file
+        /// name without extension for scaffolds; `all` is reserved)
         #[arg(long)]
         name: Option<String>,
         #[arg(long)]
@@ -124,8 +136,24 @@ enum Cmd {
         restart_backoff: Option<f64>,
         #[arg(long)]
         priority: Option<i32>,
+        /// (scaffold) startup args as one string, split like a shell line:
+        /// --args "--port 8080 --mode x"
+        #[arg(long)]
+        args: Option<String>,
+        /// (scaffold) environment variable K=V; repeat for more
+        #[arg(long = "env")]
+        envs: Vec<String>,
+        /// (scaffold) working directory for the program
+        /// (default: the directory `add` runs in)
+        #[arg(long)]
+        workdir: Option<PathBuf>,
+        /// Apply this app right after registering (errors out when the
+        /// daemon is offline — the config is kept either way)
+        #[arg(long)]
+        apply: bool,
     },
-    /// Unregister an app (the deployment config is kept)
+    /// Unregister an app: external deployment configs are kept; a
+    /// scaffold-generated record (a real file inside app_dir) is deleted
     Remove { name: String },
     /// List registered apps
     List,
@@ -316,13 +344,19 @@ fn dispatch(cli: &Cli) -> Result<()> {
             autorestart,
             restart_backoff,
             priority,
+            args,
+            envs,
+            workdir,
+            apply: apply_now,
         }) => {
             let config = client::load_config(&config_path)?;
             let config_dir = config_dir_of(&config_path);
 
-            // v0.1 single-file configs are recognized and converted first.
+            // v0.1 single-file configs are recognized and converted first
+            // (only real .toml candidates — anything else may be a binary
+            // executable destined for the scaffold flow).
             let mut target = path.clone();
-            if path.is_file() {
+            if path.is_file() && path.extension().map(|x| x == "toml").unwrap_or(false) {
                 let text = std::fs::read_to_string(&path)
                     .with_context(|| format!("cannot read {}", path.display()))?;
                 if config::looks_legacy(&text) {
@@ -340,6 +374,24 @@ fn dispatch(cli: &Cli) -> Result<()> {
                     }
                     target = imp.new_file;
                 }
+            }
+
+            // --env K=V (repeatable): missing '=' or an empty key is a
+            // config-level error.
+            let mut env = std::collections::BTreeMap::new();
+            for kv in envs {
+                let (k, v) = match kv.split_once('=') {
+                    Some(pair) => pair,
+                    None => {
+                        eprintln!("xkeeper: error: --env expects K=V, got {kv:?}");
+                        std::process::exit(EXIT_CONFIG);
+                    }
+                };
+                if k.trim().is_empty() {
+                    eprintln!("xkeeper: error: --env key must not be empty: {kv:?}");
+                    std::process::exit(EXIT_CONFIG);
+                }
+                env.insert(k.to_string(), v.to_string());
             }
 
             let opts = AddOptions {
@@ -362,17 +414,71 @@ fn dispatch(cli: &Cli) -> Result<()> {
                 },
                 restart_backoff: *restart_backoff,
                 priority: *priority,
+                args: args.clone(),
+                env: if env.is_empty() { None } else { Some(env) },
+                workdir: workdir.clone(),
             };
-            let app = registry::add(&config, &config_dir, &target, &opts)?;
-            println!("app[{app}] registered");
+            let result = registry::add(&config, &config_dir, &target, &opts)?;
+            if result.scaffolded {
+                println!("generated {}", result.file.display());
+                println!("app[{}] program[{}]", result.app, result.program);
+                println!("  command:  {}", result.command);
+                if result.args.is_empty() {
+                    println!("  args:     (none)");
+                } else {
+                    println!("  args:     {}", shell_join(&result.args));
+                }
+                if result.env.is_empty() {
+                    println!("  env:      (none)");
+                } else {
+                    let kv: Vec<String> =
+                        result.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                    println!("  env:      {}", kv.join(" "));
+                }
+                println!("  work_dir: {}", result.work_dir.display());
+                if result.changed {
+                    println!(
+                        "changed: run `xkeeper apply {}` (or bare `xkeeper apply`) to take effect",
+                        result.app
+                    );
+                } else {
+                    println!("no change: generated config is already up to date");
+                }
+            } else {
+                println!("app[{}] registered", result.app);
+            }
             sync_if_online(&config)?;
+
+            if *apply_now {
+                match apply_after_add(&config, &result.app, &result.file) {
+                    AddApplyOutcome::Applied(text) => println!("{text}"),
+                    AddApplyOutcome::Offline(msg) => {
+                        eprintln!("xkeeper: error: {msg}");
+                        std::process::exit(EXIT_UNREACHABLE);
+                    }
+                    AddApplyOutcome::Failed(msg, code) => {
+                        eprintln!("xkeeper: error: {msg}");
+                        std::process::exit(code);
+                    }
+                }
+            }
             Ok(())
         }
         Some(Cmd::Remove { name }) => {
             let config = client::load_config(&config_path)?;
             let config_dir = config_dir_of(&config_path);
-            registry::remove(&config, &config_dir, name)?;
-            println!("app[{name}] unregistered (deployment config kept)");
+            let removed = registry::remove(&config, &config_dir, name)?;
+            if removed.deleted_file {
+                println!(
+                    "app[{name}] unregistered (generated config file removed: {})",
+                    removed.path.display()
+                );
+            } else {
+                println!(
+                    "app[{name}] unregistered (deployment config kept at {})",
+                    removed.path.display()
+                );
+            }
             sync_if_online(&config)?;
             Ok(())
         }
@@ -436,6 +542,21 @@ fn parse_restart(s: &str) -> Result<RestartPolicy> {
     })
 }
 
+/// Render argv as one paste-able line (quoting mirrors the quote-aware
+/// `config::split_command` rules, so the output round-trips).
+fn shell_join(args: &[String]) -> String {
+    args.iter()
+        .map(|a| {
+            if a.chars().any(|c| c.is_whitespace()) {
+                format!("\"{a}\"")
+            } else {
+                a.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn config_dir_of(config_path: &Path) -> PathBuf {
     config_path
         .parent()
@@ -468,6 +589,9 @@ fn client_cmd(config_path: &Path, f: impl FnOnce(&client::Client) -> Result<()>)
     match f(&c) {
         Ok(()) => Ok(()),
         Err(e) => {
+            // Exit with the class code, but never silently — the message is
+            // the only trace of what the control plane answered.
+            eprintln!("xkeeper: error: {e:#}");
             std::process::exit(client::exit_code_of(&e));
         }
     }
@@ -482,6 +606,45 @@ fn action_cmd(config_path: &Path, name: &str, action: &str) -> Result<()> {
         );
         Ok(())
     })
+}
+
+// -- add --apply --------------------------------------------------------------
+
+/// Outcome of `add --apply`: the caller prints `Applied`/the message and
+/// terminates with the outcome's exit code (0 for `Applied`). Kept free of
+/// `process::exit` so tests can drive the offline/API-error branches.
+#[derive(Debug)]
+enum AddApplyOutcome {
+    /// The control-plane result text (rendered apply result).
+    Applied(String),
+    /// Daemon offline: message explains that the config was generated and
+    /// names the remedy (`xkeeper apply <app>`); exit code 3.
+    Offline(String),
+    /// The daemon answered but the apply failed: message + exit code.
+    Failed(String, i32),
+}
+
+/// `add --apply`: apply one app right after registering (app scope only —
+/// other apps' pending is untouched). An explicit request that did not take
+/// effect must be visible: offline is a non-zero exit with the remedy.
+fn apply_after_add(config: &DaemonConfig, app: &str, file: &Path) -> AddApplyOutcome {
+    let c = client::Client::from_config(config);
+    if c.health().is_err() {
+        return AddApplyOutcome::Offline(format!(
+            "daemon is offline — the config for app[{app}] is at {}; \
+             start the daemon and run `xkeeper apply {app}` to take effect",
+            file.display()
+        ));
+    }
+    match c.apply(Some(app), None, false) {
+        Ok(v) => AddApplyOutcome::Applied(
+            v.get("result")
+                .and_then(|r| r.as_str())
+                .unwrap_or("applied")
+                .to_string(),
+        ),
+        Err(e) => AddApplyOutcome::Failed(format!("{e:#}"), client::exit_code_of(&e)),
+    }
 }
 
 // -- validate ---------------------------------------------------------------
@@ -719,6 +882,7 @@ fn run_daemon(config_path: &Path, webui_listen: Option<String>) -> Result<()> {
 }
 
 #[cfg(test)]
+#[cfg(unix)] // every test in here needs a real editor process (/bin/sh)
 mod edit_tests {
     static EDIT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     use super::*;
@@ -831,5 +995,88 @@ mod sync_tests {
     fn offline_sync_is_a_silent_success() {
         let config = config_with_port(1).unwrap(); // loopback:1 is never open
         sync_if_online(&config).expect("offline sync must be a silent success");
+    }
+
+    /// add --apply offline: the config is already on disk, so the failure
+    /// must be visible (exit 3) and name the remedy — never a silent no-op.
+    #[test]
+    fn add_apply_offline_reports_generated_config_and_remedy() {
+        let config = config_with_port(1).unwrap(); // loopback:1 is never open
+        match apply_after_add(&config, "abc", Path::new("apps/abc.toml")) {
+            AddApplyOutcome::Offline(msg) => {
+                assert!(msg.contains("offline"), "names the offline cause: {msg}");
+                assert!(msg.contains("apps/abc.toml"), "names the config: {msg}");
+                assert!(msg.contains("xkeeper apply abc"), "names the remedy: {msg}");
+            }
+            other => panic!("offline add --apply must be Offline, got {other:?}"),
+        }
+    }
+
+    /// add --apply online: one health probe + one app-scoped apply; the
+    /// rendered control-plane result comes back (fake daemon, sync_tests
+    /// style).
+    #[test]
+    fn add_apply_online_runs_app_scoped_apply() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut sock, _) = listener.accept().unwrap();
+                // Read the full request: headers to the blank line, then the
+                // Content-Length body (it may arrive in a separate segment).
+                let mut raw = Vec::new();
+                let mut byte = [0u8; 1];
+                while !raw.ends_with(b"\r\n\r\n") {
+                    if std::io::Read::read(&mut sock, &mut byte).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    raw.push(byte[0]);
+                }
+                let head = String::from_utf8_lossy(&raw).to_string();
+                let len: usize = head
+                    .to_ascii_lowercase()
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                let mut body_bytes = vec![0u8; len];
+                if len > 0 {
+                    std::io::Read::read_exact(&mut sock, &mut body_bytes).unwrap();
+                }
+                let req = format!(
+                    "{}{}",
+                    head.lines().next().unwrap_or(""),
+                    String::from_utf8_lossy(&body_bytes)
+                );
+                let (status, body) = if req.starts_with("GET /v1/health") {
+                    ("200 OK", "{}".to_string())
+                } else {
+                    assert!(req.starts_with("POST /v1/apply"), "apply is POSTed: {req}");
+                    assert!(
+                        req.contains("\"app\": \"abc\"") || req.contains("\"app\":\"abc\""),
+                        "app scope rides in the body: {req}"
+                    );
+                    (
+                        "200 OK",
+                        "{\"result\":\"changed:\\n  abc.abc -> start\"}".to_string(),
+                    )
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                std::io::Write::write_all(&mut sock, resp.as_bytes()).unwrap();
+            }
+        });
+
+        let config = config_with_port(port).unwrap();
+        match apply_after_add(&config, "abc", Path::new("apps/abc.toml")) {
+            AddApplyOutcome::Applied(text) => {
+                assert!(text.contains("abc.abc -> start"), "result text: {text}");
+            }
+            other => panic!("online add --apply must be Applied, got {other:?}"),
+        }
+        server.join().unwrap();
     }
 }

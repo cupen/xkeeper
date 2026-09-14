@@ -67,6 +67,62 @@ impl ApplyScope {
     }
 }
 
+/// The literal `all` in an apply scope is the whole-registry keyword
+/// (`apply all` == bare `apply`), not an app name. `registry::add` rejects
+/// registering an app named `all` so the two can never collide
+/// (apply-workflow spec).
+pub const ALL_KEYWORD: &str = "all";
+
+/// Validate apply-scope request parts against the registered apps/programs
+/// and resolve them into an [`ApplyScope`]. Single source shared by
+/// `/v1/apply` (server.rs) and `/api/apply` (web.rs): the `all` keyword and
+/// the unknown app/program 404s must never drift apart.
+///
+/// `Err` carries the user-facing message ("unknown app/program ...").
+pub fn resolve_apply_scope(
+    sup: &Supervisor,
+    app: Option<&str>,
+    program: Option<&str>,
+) -> Result<ApplyScope, String> {
+    if app == Some(ALL_KEYWORD) {
+        // `all` is the reserved full-scope keyword and never addresses a
+        // real app (registry::add rejects it), so `apply all <program>`
+        // has no coherent meaning — reject instead of silently ignoring
+        // the program part.
+        if program.is_some() {
+            return Err(format!(
+                "{ALL_KEYWORD:?} is the full-scope keyword and takes no program argument"
+            ));
+        }
+        return Ok(ApplyScope::All);
+    }
+    let st = sup.state.lock().unwrap();
+    if let Some(a) = app {
+        // Loaded apps validate directly; a freshly registered app may only
+        // be pending (detected on disk, not applied yet) — it is still a
+        // valid target (apply-workflow: a new app's programs start when
+        // they enter the apply scope).
+        let known = st.apps.iter().any(|r| r.name == a)
+            || registry::list(&st.config, &st.config_dir)
+                .map(|listed| listed.iter().any(|l| l.name == a && l.broken.is_none()))
+                .unwrap_or(false);
+        if !known {
+            return Err(format!("unknown app {a:?}"));
+        }
+        if let Some(p) = program {
+            let known = st.programs.get(p).map(|x| x.def.app == a).unwrap_or(false);
+            if !known {
+                return Err(format!("unknown program {p:?}"));
+            }
+        }
+    }
+    Ok(match (app, program) {
+        (Some(a), Some(p)) => ApplyScope::Program(a.to_string(), p.to_string()),
+        (Some(a), None) => ApplyScope::App(a.to_string()),
+        _ => ApplyScope::All,
+    })
+}
+
 #[derive(Clone)]
 pub struct AppRecord {
     pub name: String,
@@ -252,7 +308,10 @@ impl Supervisor {
         let mut resolved: Vec<ResolvedApp> = Vec::new();
         for l in &listed {
             if let Some(reason) = &l.broken {
-                error!("app[{}] failed to load at startup (skipped): {}", l.name, reason);
+                error!(
+                    "app[{}] failed to load at startup (skipped): {}",
+                    l.name, reason
+                );
                 continue;
             }
             match registry::reload_app(&l.name, &l.path, config.app_default.as_ref()) {
@@ -503,8 +562,7 @@ impl Supervisor {
             // the disk-side definitions we parsed last time (NOT the running
             // ones: a changed file stays "changed" until applied).
             if !rescan
-                && file_stamp(&l.path).map(|s| stamps_now.get(&l.path) == Some(&s))
-                    == Some(true)
+                && file_stamp(&l.path).map(|s| stamps_now.get(&l.path) == Some(&s)) == Some(true)
             {
                 let cached = cached_defs.lock().unwrap().get(&l.path).cloned();
                 if let Some(a) = cached {
@@ -522,7 +580,10 @@ impl Supervisor {
             }
             match registry::reload_app(&l.name, &l.path, defaults.as_ref()) {
                 Ok(a) => {
-                    cached_defs.lock().unwrap().insert(l.path.clone(), a.clone());
+                    cached_defs
+                        .lock()
+                        .unwrap()
+                        .insert(l.path.clone(), a.clone());
                     new_records.push(AppRecord {
                         name: a.name.clone(),
                         path: a.path.clone(),
@@ -919,9 +980,8 @@ impl Supervisor {
                 .iter()
                 .filter(|p| p.action.contains("restart") || p.action == "start")
                 .count();
-            result.summary = format!(
-                "applied: {changed} program change(s), {restarted} restart/start(s)"
-            );
+            result.summary =
+                format!("applied: {changed} program change(s), {restarted} restart/start(s)");
         }
         self.sync_health_tasks();
         self.start_eligible();
@@ -1046,7 +1106,10 @@ pub fn render_pending(doc: &PendingDoc) -> String {
         out.push(format!("pending changes ({}):", doc.programs.len()));
         for p in &doc.programs {
             let state = if p.running { "running" } else { "stopped" };
-            out.push(format!("  {}.{} [{state}] config changed", p.app, p.program));
+            out.push(format!(
+                "  {}.{} [{state}] config changed",
+                p.app, p.program
+            ));
         }
     }
     for a in &doc.apps_added {
@@ -1084,8 +1147,7 @@ pub fn render_apply(r: &ApplyResult) -> String {
         .iter()
         .filter(|p| p.action == "none" || p.action == "keep-stopped")
         .collect();
-    let removed: Vec<&ProgramAction> =
-        r.programs.iter().filter(|p| p.action == "remove").collect();
+    let removed: Vec<&ProgramAction> = r.programs.iter().filter(|p| p.action == "remove").collect();
 
     if r.programs.is_empty() && r.apps_added.is_empty() && r.apps_removed.is_empty() {
         out.push("no changes".into());
@@ -1142,6 +1204,20 @@ mod tests {
         SEQ.fetch_add(1, Ordering::Relaxed) ^ ((std::process::id() as u64) << 32)
     }
 
+    /// Register `target` as `app_dir/<name>.toml` for tests, mirroring
+    /// `registry::make_link` (symlink; hard-link fallback where symlinks
+    /// need privileges, e.g. unprivileged Windows).
+    fn link_for_test(target: &Path, link: &Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)]
+        {
+            if std::os::windows::fs::symlink_file(target, link).is_err() {
+                std::fs::hard_link(target, link).unwrap();
+            }
+        }
+    }
+
     fn setup(app_name: &str, toml_text: &str) -> (Arc<Supervisor>, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("xk-apply-{}-{}", unique_tag(), app_name));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1150,8 +1226,10 @@ mod tests {
         std::fs::write(&cfg_path, "").unwrap();
         let app_file = dir.join("xkeeper.toml");
         std::fs::write(&app_file, toml_text).unwrap();
-        std::os::unix::fs::symlink(&app_file, dir.join("apps").join(format!("{app_name}.toml")))
-            .unwrap();
+        link_for_test(
+            &app_file,
+            &dir.join("apps").join(format!("{app_name}.toml")),
+        );
 
         let (config, _) = DaemonConfig::load_or_default(&cfg_path).unwrap();
         let sup = Supervisor::new(config, &dir).unwrap();
@@ -1176,7 +1254,11 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         let st = sup.state.lock().unwrap();
-        let got = st.programs.get(name).map(|p| p.state()).unwrap_or(ProgramState::Fatal);
+        let got = st
+            .programs
+            .get(name)
+            .map(|p| p.state())
+            .unwrap_or(ProgramState::Fatal);
         panic!("program {name} never reached {want:?}, got {got:?}");
     }
 
@@ -1184,13 +1266,23 @@ mod tests {
     /// pending preview while the program's state and pid are untouched.
     #[test]
     fn reload_detects_without_touching_programs() {
-        let (sup, app_file) = setup("demo", "[app]\nautostart = true\n[program.p]\ncommand = 'sleep 30'\nstartsecs = 0.0\n");
+        let (sup, app_file) = setup(
+            "demo",
+            "[app]\nautostart = true\n[program.p]\ncommand = 'sleep 30'\nstartsecs = 0.0\n",
+        );
         wait_state(&sup, "p", ProgramState::Running);
         let pid_before = sup.state.lock().unwrap().programs["p"].pid();
 
-        std::fs::write(&app_file, "[app]\nautostart = true\n[program.p]\ncommand = 'sleep 60'\nstartsecs = 0.0\n").unwrap();
+        std::fs::write(
+            &app_file,
+            "[app]\nautostart = true\n[program.p]\ncommand = 'sleep 60'\nstartsecs = 0.0\n",
+        )
+        .unwrap();
         let out = sup.cmd_reload().unwrap();
-        assert!(out.contains("p"), "preview lists the changed program: {out}");
+        assert!(
+            out.contains("p"),
+            "preview lists the changed program: {out}"
+        );
 
         {
             let st = sup.state.lock().unwrap();
@@ -1210,7 +1302,10 @@ mod tests {
     /// apply-workflow: apply with nothing pending is a no-op.
     #[test]
     fn apply_with_no_changes_is_idempotent() {
-        let (sup, _) = setup("demo", "[app]\nautostart = false\n[program.p]\ncommand = 'true'\nstartsecs = 0.0\n");
+        let (sup, _) = setup(
+            "demo",
+            "[app]\nautostart = false\n[program.p]\ncommand = 'true'\nstartsecs = 0.0\n",
+        );
         let out = sup.cmd_apply(&ApplyScope::All, false).unwrap();
         assert!(out.contains("no changes"), "{out}");
         {
@@ -1223,9 +1318,16 @@ mod tests {
     /// apply-workflow: a changed running program stops, rebuilds, restarts.
     #[test]
     fn apply_updates_and_restarts_running_program() {
-        let (sup, app_file) = setup("demo", "[app]\nautostart = true\n[program.p]\ncommand = 'sleep 30'\nstartsecs = 0.0\n");
+        let (sup, app_file) = setup(
+            "demo",
+            "[app]\nautostart = true\n[program.p]\ncommand = 'sleep 30'\nstartsecs = 0.0\n",
+        );
         wait_state(&sup, "p", ProgramState::Running);
-        std::fs::write(&app_file, "[app]\nautostart = true\n[program.p]\ncommand = 'sleep 60'\nstartsecs = 0.0\n").unwrap();
+        std::fs::write(
+            &app_file,
+            "[app]\nautostart = true\n[program.p]\ncommand = 'sleep 60'\nstartsecs = 0.0\n",
+        )
+        .unwrap();
 
         let out = sup.cmd_apply(&ApplyScope::All, false).unwrap();
         assert!(out.contains("update-and-restart"), "{out}");
@@ -1247,14 +1349,21 @@ mod tests {
     /// stays stopped.
     #[test]
     fn apply_redefines_but_keeps_user_stopped() {
-        let (sup, app_file) = setup("demo", "[app]\nautostart = true\n[program.p]\ncommand = 'sleep 30'\nstartsecs = 0.0\n");
+        let (sup, app_file) = setup(
+            "demo",
+            "[app]\nautostart = true\n[program.p]\ncommand = 'sleep 30'\nstartsecs = 0.0\n",
+        );
         wait_state(&sup, "p", ProgramState::Running);
         {
             let mut st = sup.state.lock().unwrap();
             st.programs.get_mut("p").unwrap().stop();
         }
         wait_state(&sup, "p", ProgramState::Stopped);
-        std::fs::write(&app_file, "[app]\nautostart = true\n[program.p]\ncommand = 'sleep 60'\nstartsecs = 0.0\n").unwrap();
+        std::fs::write(
+            &app_file,
+            "[app]\nautostart = true\n[program.p]\ncommand = 'sleep 60'\nstartsecs = 0.0\n",
+        )
+        .unwrap();
 
         let out = sup.cmd_apply(&ApplyScope::All, false).unwrap();
         assert!(out.contains("update-only"), "{out}");
@@ -1297,9 +1406,16 @@ mod tests {
         {
             let st = sup.state.lock().unwrap();
             assert_ne!(st.programs["up"].pid(), pid_up_before, "up was restarted");
-            assert_eq!(st.programs["down"].state(), ProgramState::Stopped, "user-stopped stays down");
+            assert_eq!(
+                st.programs["down"].state(),
+                ProgramState::Stopped,
+                "user-stopped stays down"
+            );
         }
-        assert!(out.contains("keep-stopped"), "result distinguishes the skipped one: {out}");
+        assert!(
+            out.contains("keep-stopped"),
+            "result distinguishes the skipped one: {out}"
+        );
         let _ = sup.shutdown_all();
     }
 
@@ -1350,10 +1466,18 @@ mod tests {
         std::fs::write(&cfg_path, "").unwrap();
         let a_file = dir.join("a.toml");
         let b_file = dir.join("b.toml");
-        std::fs::write(&a_file, "[app]\nautostart = true\n[program.a]\ncommand = 'sleep 30'\nstartsecs = 0.0\n").unwrap();
-        std::fs::write(&b_file, "[app]\nautostart = true\n[program.b]\ncommand = 'sleep 30'\nstartsecs = 0.0\n").unwrap();
-        std::os::unix::fs::symlink(&a_file, dir.join("apps").join("a.toml")).unwrap();
-        std::os::unix::fs::symlink(&b_file, dir.join("apps").join("b.toml")).unwrap();
+        std::fs::write(
+            &a_file,
+            "[app]\nautostart = true\n[program.a]\ncommand = 'sleep 30'\nstartsecs = 0.0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &b_file,
+            "[app]\nautostart = true\n[program.b]\ncommand = 'sleep 30'\nstartsecs = 0.0\n",
+        )
+        .unwrap();
+        link_for_test(&a_file, &dir.join("apps").join("a.toml"));
+        link_for_test(&b_file, &dir.join("apps").join("b.toml"));
 
         let (config, _) = DaemonConfig::load_or_default(&cfg_path).unwrap();
         let sup = Supervisor::new(config, &dir).unwrap();
@@ -1364,8 +1488,16 @@ mod tests {
         let b_pid = sup.state.lock().unwrap().programs["b"].pid();
 
         // Change both on disk, apply only app a.
-        std::fs::write(&a_file, "[app]\nautostart = true\n[program.a]\ncommand = 'sleep 60'\nstartsecs = 0.0\n").unwrap();
-        std::fs::write(&b_file, "[app]\nautostart = true\n[program.b]\ncommand = 'sleep 90'\nstartsecs = 0.0\n").unwrap();
+        std::fs::write(
+            &a_file,
+            "[app]\nautostart = true\n[program.a]\ncommand = 'sleep 60'\nstartsecs = 0.0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &b_file,
+            "[app]\nautostart = true\n[program.b]\ncommand = 'sleep 90'\nstartsecs = 0.0\n",
+        )
+        .unwrap();
         let out = sup.cmd_apply(&ApplyScope::App("a".into()), false).unwrap();
         assert!(out.contains("update-and-restart"), "{out}");
         wait_state(&sup, "a", ProgramState::Running);
@@ -1379,7 +1511,12 @@ mod tests {
             assert_eq!(cmd("a"), "sleep 60");
             assert_eq!(cmd("b"), "sleep 30", "b untouched");
             assert_eq!(st.programs["b"].pid(), b_pid, "b never restarted");
-            assert_eq!(st.pending.programs.len(), 1, "b still pending: {:?}", st.pending.programs);
+            assert_eq!(
+                st.pending.programs.len(),
+                1,
+                "b still pending: {:?}",
+                st.pending.programs
+            );
         }
         let _ = sup.shutdown_all();
     }
@@ -1388,12 +1525,18 @@ mod tests {
     /// rest still detected.
     #[test]
     fn detect_isolates_broken_app_file() {
-        let (sup, app_file) = setup("demo", "[app]\nautostart = true\n[program.p]\ncommand = 'sleep 30'\nstartsecs = 0.0\n");
+        let (sup, app_file) = setup(
+            "demo",
+            "[app]\nautostart = true\n[program.p]\ncommand = 'sleep 30'\nstartsecs = 0.0\n",
+        );
         wait_state(&sup, "p", ProgramState::Running);
         std::fs::write(&app_file, "not [ valid toml").unwrap();
         let doc = sup.detect(true).unwrap();
         assert!(!doc.errors.is_empty(), "load failure reported: {doc:?}");
-        assert!(doc.programs.is_empty(), "broken app contributes no pending: {doc:?}");
+        assert!(
+            doc.programs.is_empty(),
+            "broken app contributes no pending: {doc:?}"
+        );
         {
             let st = sup.state.lock().unwrap();
             let cmdline = format!(
@@ -1409,7 +1552,10 @@ mod tests {
     /// apply-workflow: a newly registered autostart program starts on apply.
     #[test]
     fn apply_starts_newly_registered_app() {
-        let (sup, app_file) = setup("demo", "[app]\nautostart = true\n[program.p]\ncommand = 'sleep 30'\nstartsecs = 0.0\n");
+        let (sup, app_file) = setup(
+            "demo",
+            "[app]\nautostart = true\n[program.p]\ncommand = 'sleep 30'\nstartsecs = 0.0\n",
+        );
         let dir = app_file.parent().unwrap().to_path_buf();
         // Add a second program to the same app file (a "new" definition).
         std::fs::write(&app_file, "[app]\nautostart = true\n[program.p]\ncommand = 'sleep 30'\nstartsecs = 0.0\n[program.q]\ncommand = 'sleep 30'\nstartsecs = 0.0\n").unwrap();
@@ -1423,9 +1569,16 @@ mod tests {
     /// apply-workflow: removing a program from the file stops and drops it.
     #[test]
     fn apply_removes_dropped_program() {
-        let (sup, app_file) = setup("demo", "[app]\nautostart = true\n[program.p]\ncommand = 'sleep 30'\nstartsecs = 0.0\n[program.q]\ncommand = 'sleep 30'\nstartsecs = 0.0\n");
+        let (sup, app_file) = setup(
+            "demo",
+            "[app]\nautostart = true\n[program.p]\ncommand = 'sleep 30'\nstartsecs = 0.0\n[program.q]\ncommand = 'sleep 30'\nstartsecs = 0.0\n",
+        );
         wait_state(&sup, "q", ProgramState::Running);
-        std::fs::write(&app_file, "[app]\nautostart = true\n[program.p]\ncommand = 'sleep 30'\nstartsecs = 0.0\n").unwrap();
+        std::fs::write(
+            &app_file,
+            "[app]\nautostart = true\n[program.p]\ncommand = 'sleep 30'\nstartsecs = 0.0\n",
+        )
+        .unwrap();
         let out = sup.cmd_apply(&ApplyScope::All, false).unwrap();
         assert!(out.contains("removed"), "{out}");
         {
@@ -1447,8 +1600,8 @@ mod tests {
         let b_file = dir.join("b.toml");
         std::fs::write(&a_file, "[program.dup]\ncommand = 'true'\n").unwrap();
         std::fs::write(&b_file, "[program.dup]\ncommand = 'true'\n").unwrap();
-        std::os::unix::fs::symlink(&a_file, dir.join("apps").join("a.toml")).unwrap();
-        std::os::unix::fs::symlink(&b_file, dir.join("apps").join("b.toml")).unwrap();
+        link_for_test(&a_file, &dir.join("apps").join("a.toml"));
+        link_for_test(&b_file, &dir.join("apps").join("b.toml"));
 
         let (config, _) = DaemonConfig::load_or_default(&cfg_path).unwrap();
         let sup = Supervisor::new(config, &dir).unwrap();
@@ -1466,9 +1619,16 @@ mod tests {
     /// command; the mtime fast path skips re-parsing unchanged files.
     #[test]
     fn periodic_detect_publishes_pending() {
-        let (sup, app_file) = setup("demo", "[app]\nautostart = true\n[program.p]\ncommand = 'sleep 30'\nstartsecs = 0.0\n");
+        let (sup, app_file) = setup(
+            "demo",
+            "[app]\nautostart = true\n[program.p]\ncommand = 'sleep 30'\nstartsecs = 0.0\n",
+        );
         wait_state(&sup, "p", ProgramState::Running);
-        std::fs::write(&app_file, "[app]\nautostart = true\n[program.p]\ncommand = 'sleep 60'\nstartsecs = 0.0\n").unwrap();
+        std::fs::write(
+            &app_file,
+            "[app]\nautostart = true\n[program.p]\ncommand = 'sleep 60'\nstartsecs = 0.0\n",
+        )
+        .unwrap();
         sup.detect(false).unwrap();
         {
             let st = sup.state.lock().unwrap();
@@ -1479,7 +1639,11 @@ mod tests {
         sup.detect(false).unwrap();
         {
             let st = sup.state.lock().unwrap();
-            assert_eq!(st.pending.programs.len(), 1, "unchanged file re-detected from cache");
+            assert_eq!(
+                st.pending.programs.len(),
+                1,
+                "unchanged file re-detected from cache"
+            );
         }
         let _ = sup.shutdown_all();
     }
@@ -1489,9 +1653,27 @@ mod tests {
     fn render_apply_groups_by_action() {
         let r = ApplyResult {
             programs: vec![
-                ProgramAction { app: "a".into(), program: "x".into(), changed: true, action: "update-and-restart".into(), result: "ok".into() },
-                ProgramAction { app: "a".into(), program: "y".into(), changed: false, action: "restart".into(), result: "ok".into() },
-                ProgramAction { app: "b".into(), program: "z".into(), changed: false, action: "keep-stopped".into(), result: "ok".into() },
+                ProgramAction {
+                    app: "a".into(),
+                    program: "x".into(),
+                    changed: true,
+                    action: "update-and-restart".into(),
+                    result: "ok".into(),
+                },
+                ProgramAction {
+                    app: "a".into(),
+                    program: "y".into(),
+                    changed: false,
+                    action: "restart".into(),
+                    result: "ok".into(),
+                },
+                ProgramAction {
+                    app: "b".into(),
+                    program: "z".into(),
+                    changed: false,
+                    action: "keep-stopped".into(),
+                    result: "ok".into(),
+                },
             ],
             apps_added: vec!["c".into()],
             apps_removed: vec![],
@@ -1513,5 +1695,83 @@ mod tests {
         assert!(!ApplyScope::App("a".into()).matches("b", "x"));
         assert!(ApplyScope::Program("a".into(), "x".into()).matches("a", "x"));
         assert!(!ApplyScope::Program("a".into(), "x".into()).matches("a", "y"));
+    }
+
+    /// apply-workflow: the literal `all` resolves to the whole-registry
+    /// scope in every request shape; real app/program names still scope.
+    #[test]
+    fn apply_scope_all_keyword_and_validation() {
+        let (sup, _app_file) = setup(
+            "demo",
+            "[app]\nautostart = false\n[program.p]\ncommand = 'sleep 30'\nstartsecs = 0.0\n",
+        );
+        // `all` is the reserved keyword; a program part has no meaning.
+        assert!(
+            resolve_apply_scope(&sup, Some("all"), Some("p"))
+                .err()
+                .is_some_and(|e| e.contains("full-scope")),
+            "apply all <program> must be rejected"
+        );
+        assert!(matches!(
+            resolve_apply_scope(&sup, None, None).unwrap(),
+            ApplyScope::All
+        ));
+        // Real names scope down.
+        assert!(
+            matches!(
+                resolve_apply_scope(&sup, Some("demo"), None).unwrap(),
+                ApplyScope::App(a) if a == "demo"
+            ),
+            "app scope"
+        );
+        assert!(
+            matches!(
+                resolve_apply_scope(&sup, Some("demo"), Some("p")).unwrap(),
+                ApplyScope::Program(a, p) if a == "demo" && p == "p"
+            ),
+            "program scope"
+        );
+        // Validation still rejects unknown names.
+        assert!(resolve_apply_scope(&sup, Some("ghost"), None).is_err());
+        assert!(resolve_apply_scope(&sup, Some("demo"), Some("ghost")).is_err());
+        let _ = sup.shutdown_all();
+    }
+
+    /// A freshly registered app that is only pending (on disk, not applied
+    /// into the daemon state yet) is still a valid app-scope target — the
+    /// add → `apply <app>` flow (app-registry: --apply 在线一步生效).
+    #[test]
+    fn apply_scope_accepts_pending_new_app() {
+        let (sup, app_file) = setup(
+            "demo",
+            "[app]\nautostart = false\n[program.p]\ncommand = 'sleep 30'\nstartsecs = 0.0\n",
+        );
+        // Register a second app on disk without any reload/apply.
+        let dir = app_file.parent().unwrap();
+        let other = dir.join("other.toml");
+        std::fs::write(
+            &other,
+            "[app]\nautostart = false\n[program.q]\ncommand = 'sleep 30'\n",
+        )
+        .unwrap();
+        link_for_test(&other, &dir.join("apps").join("other.toml"));
+        {
+            let st = sup.state.lock().unwrap();
+            assert!(
+                !st.apps.iter().any(|a| a.name == "other"),
+                "other is not loaded into state yet"
+            );
+        }
+        assert!(
+            matches!(
+                resolve_apply_scope(&sup, Some("other"), None).unwrap(),
+                ApplyScope::App(a) if a == "other"
+            ),
+            "pending app is a valid apply target"
+        );
+        // Broken pending apps are not valid targets either.
+        std::fs::write(&other, "not [ valid toml").unwrap();
+        assert!(resolve_apply_scope(&sup, Some("other"), None).is_err());
+        let _ = sup.shutdown_all();
     }
 }

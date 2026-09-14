@@ -184,8 +184,8 @@ fn parse_log(args: &[String]) -> Result<ShellCmd> {
 /// Naive "did you mean" for the unknown-command hint.
 fn similar_hint(input: &str) -> String {
     const COMMANDS: [&str; 13] = [
-        "status", "start", "stop", "restart", "pid", "log", "reload", "pending", "apply", "shutdown", "open", "help",
-        "exit",
+        "status", "start", "stop", "restart", "pid", "log", "reload", "pending", "apply",
+        "shutdown", "open", "help", "exit",
     ];
     let input = input.to_lowercase();
     let similar: Vec<&str> = COMMANDS
@@ -230,8 +230,11 @@ Built-in commands:
   reload                              rescan config and show pending changes (no restarts)
   pending                             show pending (detected but not applied) changes
   apply [<app> [<program>]] [--restart]
-                                      apply pending changes; --restart restarts unchanged
-                                      programs too (user-stopped ones stay stopped)
+                                      apply pending changes; the literal `all`
+                                      (= no argument) applies everything and is
+                                      reserved — no app can be named `all`;
+                                      --restart restarts unchanged programs too
+                                      (user-stopped ones stay stopped)
   shutdown                            stop all programs and exit the daemon
   open                                open the web console in the system browser
   help (or ?)                         show this help

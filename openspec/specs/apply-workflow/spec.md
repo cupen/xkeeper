@@ -41,17 +41,17 @@
 
 ### Requirement: apply 范围与幂等
 
-`xkeeper apply` SHALL 应用 pending 变更，范围 SHALL 可指定：缺省为全部；
-`apply <app>` 仅作用于该 app 的程序与该 app 的注册变化，MUST NOT 影响其他
-app（其他 app 的 pending 保持不变）；`apply <app> <program>` 进一步收窄到
-单程序。范围内无 pending 时 SHALL 什么都不做，输出明确的「无变更」结论并
-以 0 退出（幂等）。新注册 app 的程序进入 apply 范围时 SHALL 直接启动
-（沿用 autostart 语义）。
+`xkeeper apply` SHALL 应用 pending 变更，范围 SHALL 可指定：缺省为全部；字面量 `all` SHALL 为全量关键字，`apply all` 与缺省全量严格等价（`all` 为保留字，MUST NOT 被解析为 app 名，帮助与文档 MUST 注明 `all` 不可用作 app 名）；`apply all` 后 MUST NOT 再接受 program 参数——`apply all <program>` 形状 SHALL 报错，MUST NOT 静默忽略 program 部分而按全量执行；`apply <app>` 仅作用于该 app 的程序与该 app 的注册变化，MUST NOT 影响其他 app（其他 app 的 pending 保持不变）；`apply <app> <program>` 进一步收窄到单程序。范围内无 pending 时 SHALL 什么都不做，输出明确的「无变更」结论并以 0 退出（幂等）。新注册 app 的程序进入 apply 范围时 SHALL 直接启动（沿用 autostart 语义）。
 
 #### Scenario: 无变更时 apply 幂等
 
 - **WHEN** 配置无任何 pending 时执行 `xkeeper apply`
 - **THEN** 无程序被停止/重启/启动，输出「无变更」类提示，退出码 0
+
+#### Scenario: apply all 等价全量
+
+- **WHEN** app A 与 app B 均有 pending 变更，执行 `xkeeper apply all`
+- **THEN** A 与 B 的全部 pending 被应用，结果与裸 `xkeeper apply` 一致
 
 #### Scenario: 单 app 范围不波及其他
 
