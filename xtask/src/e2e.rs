@@ -346,7 +346,10 @@ fn offline_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         code == 3,
         &format!("exit code is 3 (daemon unreachable), got {code}"),
     )?;
-    expect(combined.contains("offline"), "error names the offline cause")?;
+    expect(
+        combined.contains("offline"),
+        "error names the offline cause",
+    )?;
     expect(
         combined.contains("offline-demo.toml"),
         "error names the generated config file",
@@ -592,7 +595,10 @@ fn scaffold_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         out.contains("command:") && out.contains(sleep.to_string_lossy().as_ref()),
         "summary prints the absolute command",
     )?;
-    expect(out.contains("args:") && out.contains("100000"), "summary prints the args")?;
+    expect(
+        out.contains("args:") && out.contains("100000"),
+        "summary prints the args",
+    )?;
     expect(
         out.contains("env:") && out.contains("XK_E2E=1"),
         "summary prints the env",
@@ -601,7 +607,10 @@ fn scaffold_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     let abc_file = apps.join("abc.toml");
     expect(abc_file.is_file(), "apps/abc.toml is a real file")?;
     let abc_text = std::fs::read_to_string(&abc_file)?;
-    expect(abc_text.contains("XK_E2E"), "env written into the generated file")?;
+    expect(
+        abc_text.contains("XK_E2E"),
+        "env written into the generated file",
+    )?;
     // toml emits Windows paths as single-quoted literal strings; accept both
     // quote styles when extracting the value.
     let wd = abc_text
@@ -726,7 +735,8 @@ fn scaffold_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         .cloned()
         .unwrap_or_default();
     expect(
-        progs.iter()
+        progs
+            .iter()
             .any(|p| p.get("program").and_then(|x| x.as_str()) == Some("worker")),
         "alpha's pending survived delta's app-scoped --apply",
     )?;
@@ -775,8 +785,14 @@ fn scaffold_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     )?;
     // Apply the removals: the stopped programs disappear from the status.
     cli(bin, ws, &["apply"])?;
-    expect(pid_of(ws, "abc")?.is_none(), "abc's program stopped and gone")?;
-    expect(pid_of(ws, "fox")?.is_none(), "fox's program stopped and gone")?;
+    expect(
+        pid_of(ws, "abc")?.is_none(),
+        "abc's program stopped and gone",
+    )?;
+    expect(
+        pid_of(ws, "fox")?.is_none(),
+        "fox's program stopped and gone",
+    )?;
     Ok(())
 }
 

@@ -829,7 +829,11 @@ mod tests {
         let r = add(&config, &tmp, &exe, &opts("dflt")).unwrap();
         let (raw, _) = AppRaw::load(&r.file).unwrap();
         let wd = raw.program["dflt"].work_dir.as_ref().unwrap();
-        assert!(wd.is_absolute(), "default work_dir absolute: {}", wd.display());
+        assert!(
+            wd.is_absolute(),
+            "default work_dir absolute: {}",
+            wd.display()
+        );
         assert_eq!(
             wd,
             &std::env::current_dir().unwrap(),
@@ -844,7 +848,11 @@ mod tests {
         let r = add(&config, &tmp, &exe, &o).unwrap();
         let (raw, _) = AppRaw::load(&r.file).unwrap();
         let wd = raw.program["ovr"].work_dir.as_ref().unwrap();
-        assert!(wd.is_absolute(), "override work_dir absolute: {}", wd.display());
+        assert!(
+            wd.is_absolute(),
+            "override work_dir absolute: {}",
+            wd.display()
+        );
         assert_eq!(
             wd.canonicalize().unwrap(),
             wdir.canonicalize().unwrap(),
