@@ -476,7 +476,7 @@ fn display_absolute(p: PathBuf) -> PathBuf {
 fn warn_if_not_executable(exe: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let lacks = std::fs::metadata(exe)
-        .map(|md| md.mode() & 0o111 == 0)
+        .map(|md| md.permissions().mode() & 0o111 == 0)
         .unwrap_or(false);
     if lacks {
         warn!(
@@ -1112,8 +1112,10 @@ mod tests {
         let err = add(&config, &tmp, &exe_all, &AddOptions::default()).unwrap_err();
         assert!(err.to_string().contains("reserved"), "{err:#}");
 
-        // The directory flow is equally guarded.
-        let dir_all = tmp.join("all");
+        // The directory flow is equally guarded. Its name must still be
+        // "all" for the assertion, but keep it in a subdir to avoid the
+        // `all` file created by the stem-derived step above.
+        let dir_all = tmp.join("dirs").join("all");
         std::fs::create_dir_all(&dir_all).unwrap();
         std::fs::write(
             dir_all.join("xkeeper.toml"),
