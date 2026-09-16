@@ -174,7 +174,7 @@ impl AddResult {
 /// (apply-workflow spec).
 fn check_name(name: &str) -> Result<()> {
     if !is_valid_name(name) {
-        bail!("app name {name:?} is not filename-safe");
+        bail!("app name {name:?} is invalid: {}", crate::config::NAME_RULE);
     }
     if name == crate::supervisor::ALL_KEYWORD {
         bail!(

@@ -36,19 +36,36 @@ impl Client {
         path: &str,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value> {
-        let mut r = self
+        let r = self
             .agent
             .request(method, &format!("{}{}", self.base, path));
+        self.send(r, body)
+    }
+
+    /// Send a prepared request; `body` rides as JSON when non-empty.
+    fn send(&self, mut r: ureq::Request, body: &serde_json::Value) -> Result<serde_json::Value> {
         if !self.token.is_empty() {
             r = r.set("Authorization", &format!("Bearer {}", self.token));
         }
         let has_body = body.as_object().map(|o| !o.is_empty()).unwrap_or(false);
+        // ureq surfaces HTTP error statuses (4xx/5xx) as Error::Status — those
+        // are ANSWERS from the control plane (409 conflict, 404 unknown…),
+        // not transport failures; only Transport means "daemon unreachable".
         let resp = if has_body {
-            r.set("Content-Type", "application/json")
+            match r
+                .set("Content-Type", "application/json")
                 .send_string(&body.to_string())
-                .map_err(|e| unreachable(e))?
+            {
+                Ok(resp) => resp,
+                Err(ureq::Error::Status(_, resp)) => resp,
+                Err(e) => return Err(unreachable(e)),
+            }
         } else {
-            r.call().map_err(|e| unreachable(e))?
+            match r.call() {
+                Ok(resp) => resp,
+                Err(ureq::Error::Status(_, resp)) => resp,
+                Err(e) => return Err(unreachable(e)),
+            }
         };
         let status = resp.status();
         let text = resp.into_string().unwrap_or_default();
@@ -80,6 +97,33 @@ impl Client {
 
     pub fn action(&self, name: &str, action: &str) -> Result<serde_json::Value> {
         self.call("POST", &format!("/v1/programs/{name}/{action}"))
+    }
+
+    /// Run a program's declared custom action. Long actions must not hit the
+    /// agent's default total timeout, so the request gets its own bound.
+    pub fn custom_action(&self, program: &str, action: &str) -> Result<serde_json::Value> {
+        let r = self
+            .agent
+            .request(
+                "POST",
+                &format!("{}/v1/programs/{program}/actions/{action}", self.base),
+            )
+            .timeout(Duration::from_secs(15 * 60));
+        self.send(r, &serde_json::json!({}))
+    }
+
+    /// Deliver a whitelist signal to a program's child process.
+    pub fn signal(&self, program: &str, signal: &str) -> Result<serde_json::Value> {
+        self.call_with_body(
+            "POST",
+            &format!("/v1/programs/{program}/signal"),
+            &serde_json::json!({ "signal": signal }),
+        )
+    }
+
+    /// App-level fan-out (start|stop|restart), expanded server-side.
+    pub fn app_action(&self, app: &str, verb: &str) -> Result<serde_json::Value> {
+        self.call("POST", &format!("/v1/apps/{app}/{verb}"))
     }
 
     pub fn reload(&self) -> Result<serde_json::Value> {
@@ -138,7 +182,12 @@ impl Client {
         if !self.token.is_empty() {
             r = r.set("Authorization", &format!("Bearer {}", self.token));
         }
-        let resp = r.call().map_err(|e| unreachable(e))?;
+        let resp = match r.call() {
+            Ok(resp) => resp,
+            // 4xx/5xx are control-plane answers (e.g. unknown program 404).
+            Err(ureq::Error::Status(_, resp)) => resp,
+            Err(e) => return Err(unreachable(e)),
+        };
         if resp.status() != 200 {
             let code = resp.status();
             let msg = resp.into_string().unwrap_or_default();

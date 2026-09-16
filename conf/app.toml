@@ -64,3 +64,27 @@ command = "/opt/myapp/myserver --port 8080"
 # health_timeout = 2          # 单次探测超时（秒）
 # health_retries = 3          # 连续失败多少次判定不健康
 # health_start_period = 5     # 启动宽限期（秒），期内失败不计入 retries
+
+# ---------------------------------------------------------------------------
+# 自定义动作（可选）：[program.<名字>.action.<动作名>]，经平台 shell 执行
+# （unix /bin/sh -c、Windows cmd /C），字段仅 command（必填）与 timeout
+# （秒，缺省 30，必须 > 0）。详见 openspec/specs/actions 与 README「动作」。
+# 动作名与程序名同规则：仅 [A-Za-z0-9_-]；start/stop/restart/signal/reload/
+# shutdown 是内置动作保留字，不可用。
+#
+# [program.main.action.flush]
+# command = "curl -fsS http://127.0.0.1:8080/flush?pid=${program.main.pid}"
+# timeout = 10
+#
+# 多行命令整段交给 shell（管道/重定向/&& 可用）；${...} 已知域变量在执行前
+# 替换：program.<名>.pid|state|app|work_dir|log_dir、app.<名>.path、
+# daemon.pid|host|port|log_dir|app_dir；程序未运行时 pid 为空串；
+# ${HOME} 等 shell 变量原样保留。动作里可链式调用 xkeeper 子命令。
+#
+# [program.main.action.upgrade]
+# command = '''
+# set -e
+# ./build.sh && echo "restarting from pid=${program.main.pid}"
+# xkeeper restart main
+# '''
+# timeout = 120

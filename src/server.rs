@@ -344,9 +344,29 @@ fn handle_connection(sup: &Arc<Supervisor>, token: &str, stream: TcpStream) {
             sup.enqueue(cmd);
             match rx.recv_timeout(Duration::from_secs(60)) {
                 Ok(Ok(msg)) => json_bytes(200, serde_json::json!({ "result": msg })),
-                Ok(Err(e)) => err_bytes(409, &format!("{e:#}")),
+                Ok(Err(e)) => {
+                    // "already running" style refusals are 409; an unknown
+                    // program name is a missing target and must be 404.
+                    let msg = format!("{e:#}");
+                    let code = if msg.starts_with("unknown program") {
+                        404
+                    } else {
+                        409
+                    };
+                    err_bytes(code, &msg)
+                }
                 Err(_) => err_bytes(500, "supervisor did not answer in time"),
             }
+        }
+        // signal 内置动作：投递白名单信号到该程序的子进程。
+        ("POST", ["v1", "programs", name, "signal"]) => post_signal(sup, name, &body),
+        // 自定义动作：worker 线程同步执行，等待至完成或超时。
+        ("POST", ["v1", "programs", name, "actions", action]) => {
+            run_custom_action(sup, name, action)
+        }
+        // app 级扇出：服务端按排序规则展开为逐程序动作。
+        ("POST", ["v1", "apps", name, verb @ ("start" | "stop" | "restart")]) => {
+            post_app_fanout(sup, name, verb)
         }
         ("GET", ["v1", "programs", name, "logs"]) => {
             // Streaming response: owns the connection until the client leaves.
@@ -419,6 +439,121 @@ fn handle_connection(sup: &Arc<Supervisor>, token: &str, stream: TcpStream) {
         _ => err_bytes(404, &format!("no route {method} {path}")),
     };
     let _ = writer.write_all(&resp);
+}
+
+// -- action / signal / fan-out endpoints -------------------------------------
+
+/// `POST /v1/programs/{name}/signal` — deliver one whitelist signal to the
+/// program's child. Errors map: bad signal name → 400, unknown program →
+/// 404, no live child → 409 (incl. the windows "not supported" refusal).
+fn post_signal(sup: &Arc<Supervisor>, name: &str, body: &[u8]) -> Vec<u8> {
+    let req: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
+    let sig_name = req
+        .get("signal")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    if sig_name.is_empty() {
+        return err_bytes(400, "request body must be {\"signal\": \"NAME\"}");
+    }
+    let sig = match crate::platform::Signal::parse(sig_name) {
+        Ok(s) => s,
+        Err(msg) => return err_bytes(400, &msg),
+    };
+    match crate::supervisor::signal_program(sup, name, sig) {
+        Ok(msg) => json_bytes(200, serde_json::json!({ "result": msg })),
+        Err(e) => err_bytes(e.http_status(), &e.to_string()),
+    }
+}
+
+/// `POST /v1/programs/{name}/actions/{action}` — run a declared custom
+/// action on a worker thread and wait synchronously until it finishes or
+/// times out. Errors map: unknown program/action → 404, same action already
+/// running → 409. A timed-out action is reported in the result body
+/// (`timed_out: true`) — the tree was killed, the daemon stayed responsive.
+fn run_custom_action(sup: &Arc<Supervisor>, program: &str, action: &str) -> Vec<u8> {
+    let (spec, ctx) = {
+        let st = sup.state.lock().unwrap();
+        let Some(p) = st.programs.get(program) else {
+            return err_bytes(404, &format!("unknown program {program:?}"));
+        };
+        let Some(spec) = p.def.actions.get(action) else {
+            return err_bytes(
+                404,
+                &format!("program {program:?} declares no action {action:?}"),
+            );
+        };
+        (spec.clone(), crate::supervisor::run_context(&st))
+    };
+    let Ok(guard) = sup.actions.try_begin(program, action) else {
+        return err_bytes(
+            409,
+            &format!(
+                "action {program}.{action} is already running (mutual exclusion, no queueing)"
+            ),
+        );
+    };
+    let (tx, rx) = mpsc::channel();
+    let (prog, act) = (program.to_string(), action.to_string());
+    let work_dir = ctx
+        .programs
+        .get(program)
+        .map(|v| v.work_dir.clone())
+        .unwrap_or_default();
+    let timeout_secs = spec.timeout;
+    // Worker thread (design D1): substitute at spawn time, run the shell,
+    // reap — the supervisor loop and command queue are never involved.
+    let spawned = std::thread::Builder::new()
+        .name("action-worker".into())
+        .spawn(move || {
+            let command = ctx.substitute(&spec.command);
+            let result = crate::action::execute(&spec, &prog, &act, &command, &work_dir);
+            let _ = tx.send(result);
+            drop(guard); // free the (program, action) slot after reaping
+        })
+        .is_ok();
+    if !spawned {
+        return err_bytes(500, "failed to spawn action worker");
+    }
+    let wait = Duration::from_secs(timeout_secs.max(1))
+        .saturating_add(Duration::from_secs(15))
+        .min(Duration::from_secs(3600));
+    match rx.recv_timeout(wait) {
+        Ok(result) => json_bytes(200, result),
+        Err(_) => err_bytes(500, "action worker did not answer in time"),
+    }
+}
+
+/// `POST /v1/apps/{name}/start|stop|restart` — app-level fan-out expanded
+/// by the supervisor in the established order. Unknown app → 404.
+fn post_app_fanout(sup: &Arc<Supervisor>, app: &str, verb: &str) -> Vec<u8> {
+    let kind = match verb {
+        "start" => crate::supervisor::FanoutKind::Start,
+        "stop" => crate::supervisor::FanoutKind::Stop,
+        _ => crate::supervisor::FanoutKind::Restart,
+    };
+    let (tx, rx) = mpsc::channel();
+    sup.enqueue(Command::AppFanout {
+        kind,
+        app: app.to_string(),
+        reply: Some(tx),
+    });
+    match rx.recv_timeout(Duration::from_secs(120)) {
+        Ok(Ok(json)) => match serde_json::from_str::<crate::supervisor::FanoutResult>(&json) {
+            Ok(fr) => json_bytes(
+                200,
+                serde_json::json!({
+                    "result": crate::supervisor::render_fanout(&fr),
+                    "app": fr.app,
+                    "action": fr.action,
+                    "programs": fr.programs,
+                }),
+            ),
+            Err(_) => err_bytes(500, "unreadable fan-out result"),
+        },
+        Ok(Err(e)) => err_bytes(404, &format!("{e:#}")),
+        Err(_) => err_bytes(500, "supervisor did not answer in time"),
+    }
 }
 
 fn authorized(headers: &HashMap<String, String>, token: &str, path: &str) -> bool {

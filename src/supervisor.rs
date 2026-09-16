@@ -32,6 +32,13 @@ pub enum Command {
         name: String,
         reply: Option<Reply>,
     },
+    /// App-level fan-out: start/stop/restart every program of one app,
+    /// expanded server-side in the established ordering (actions spec).
+    AppFanout {
+        kind: FanoutKind,
+        app: String,
+        reply: Option<Reply>,
+    },
     Reload {
         reply: Option<Reply>,
     },
@@ -47,6 +54,140 @@ pub enum Command {
     HealthRestart {
         name: String,
     },
+}
+
+/// Which per-program action an app fan-out runs (actions spec: 动作层级矩阵).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FanoutKind {
+    Start,
+    Stop,
+    Restart,
+}
+
+impl FanoutKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FanoutKind::Start => "start",
+            FanoutKind::Stop => "stop",
+            FanoutKind::Restart => "restart",
+        }
+    }
+}
+
+/// One per-program line of a fan-out result.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FanoutStep {
+    pub program: String,
+    /// Human-readable per-program outcome ("started", "already running", …).
+    pub result: String,
+}
+
+/// Structured result of one app fan-out. The supervisor replies with this
+/// serialized; the CLI renders it via [`render_fanout`], the API returns it
+/// alongside the rendered text.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FanoutResult {
+    pub app: String,
+    pub action: String,
+    pub programs: Vec<FanoutStep>,
+}
+
+/// Render a fan-out result for the CLI/shell: one line per program, in the
+/// order the programs were processed (start order; stop is reversed).
+pub fn render_fanout(r: &FanoutResult) -> String {
+    let mut out = vec![format!(
+        "app[{}] {}: {} program(s)",
+        r.app,
+        r.action,
+        r.programs.len()
+    )];
+    for s in &r.programs {
+        out.push(format!("  {}: {}", s.program, s.result));
+    }
+    out.join("\n")
+}
+
+/// Why a `signal` request failed; carries the HTTP status for the API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignalError {
+    UnknownProgram,
+    NotRunning,
+    Delivery(String),
+}
+
+impl SignalError {
+    pub fn http_status(&self) -> u16 {
+        match self {
+            SignalError::UnknownProgram => 404,
+            SignalError::NotRunning => 409,
+            SignalError::Delivery(_) => 400,
+        }
+    }
+}
+
+impl std::fmt::Display for SignalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SignalError::UnknownProgram => write!(f, "unknown program"),
+            SignalError::NotRunning => {
+                write!(f, "program is not running (no child process to signal)")
+            }
+            SignalError::Delivery(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+/// Deliver a whitelist signal to a program's current child process. The
+/// state machine is untouched (actions spec: signal 成功投递 MUST NOT 改变
+/// 程序状态机); a program without a live child is an error.
+pub fn signal_program(
+    sup: &Supervisor,
+    name: &str,
+    sig: crate::platform::Signal,
+) -> std::result::Result<String, SignalError> {
+    let (pid, state) = {
+        let st = sup.state.lock().unwrap();
+        let p = st.programs.get(name).ok_or(SignalError::UnknownProgram)?;
+        (
+            p.pid().ok_or(SignalError::NotRunning)?,
+            p.state().to_string(),
+        )
+    };
+    crate::platform::send_signal(pid, sig).map_err(SignalError::Delivery)?;
+    Ok(format!(
+        "signal {} delivered to program {name} (pid {pid}, state {state})",
+        sig.name()
+    ))
+}
+
+/// Snapshot the runtime values `${...}` substitution can resolve to
+/// (one state lock, then the worker thread substitutes + spawns without
+/// touching supervisor state).
+pub fn run_context(st: &SupervisorState) -> crate::action::RunContext {
+    let mut ctx = crate::action::RunContext {
+        daemon_pid: std::process::id(),
+        daemon_host: st.config.daemon.host.clone(),
+        daemon_port: st.config.daemon.port,
+        daemon_log_dir: config::resolve_path(&st.config.daemon.log_dir, &st.config_dir),
+        daemon_app_dir: config::resolve_path(&st.config.daemon.app_dir, &st.config_dir),
+        ..Default::default()
+    };
+    for a in &st.apps {
+        ctx.apps.insert(a.name.clone(), a.path.clone());
+    }
+    for p in st.programs.values() {
+        ctx.programs.insert(
+            p.def.name.clone(),
+            crate::action::ProgramVars {
+                pid: p.pid(),
+                state: p.state().to_string(),
+                app: p.def.app.clone(),
+                work_dir: p.def.work_dir.clone(),
+                log_dir: p.log_dir.clone(),
+            },
+        );
+    }
+    ctx
 }
 
 /// Range an `apply` acts on: everything, one app, or one program.
@@ -231,6 +372,9 @@ pub struct Supervisor {
     /// Latest metrics from the sideband sampler thread; the only writer is
     /// [`crate::metrics::spawn_sampler`], the supervision loop never touches it.
     pub metrics: Arc<crate::metrics::MetricsTable>,
+    /// (program, action) mutual exclusion for custom actions. Only the
+    /// control-plane worker threads touch it — never the supervision loop.
+    pub actions: Arc<crate::action::ActionRuns>,
     config_path: Mutex<PathBuf>,
     started: std::time::Instant,
     interval: Duration,
@@ -256,6 +400,7 @@ impl Supervisor {
             cv: Condvar::new(),
             health_tasks: Arc::new(Mutex::new(HashMap::new())),
             metrics: Arc::new(crate::metrics::MetricsTable::new()),
+            actions: crate::action::ActionRuns::new(),
             config_path: Mutex::new(config_dir.join("xkeeper.toml")),
             started: std::time::Instant::now(),
             interval,
@@ -480,6 +625,9 @@ impl Supervisor {
                 let r = self.cmd_stop(&name).and_then(|_| self.cmd_start(&name));
                 answer(reply, r);
             }
+            Command::AppFanout { kind, app, reply } => {
+                answer(reply, self.cmd_app_fanout(kind, &app))
+            }
             Command::HealthRestart { name } => {
                 warn!("health checker requesting restart of program[{name}]");
                 let _ = self.cmd_stop(&name);
@@ -526,6 +674,136 @@ impl Supervisor {
         }
         p.stop();
         Ok(format!("program {name} is stopped"))
+    }
+
+    // -- app-level fan-out --------------------------------------------------
+
+    /// Programs of one app in fan-out order: dependency topological order
+    /// among the app's programs with a name tie-break — the same effective
+    /// ordering the daemon startup path uses (app priority is uniform within
+    /// one app, names sort). Cross-app dependencies do not constrain the
+    /// order. Stop is the reverse of this (actions spec: 排序复用
+    /// process-management 规则).
+    fn app_program_order(
+        st: &SupervisorState,
+        app: &str,
+    ) -> std::result::Result<Vec<String>, String> {
+        if !st.apps.iter().any(|a| a.name == app) {
+            return Err(format!("unknown app {app:?}"));
+        }
+        let mut names: Vec<String> = st
+            .programs
+            .values()
+            .filter(|p| p.def.app == app)
+            .map(|p| p.def.name.clone())
+            .collect();
+        if names.is_empty() {
+            return Err(format!("app {app:?} has no programs"));
+        }
+        names.sort();
+        let members: HashSet<&str> = names.iter().map(|s| s.as_str()).collect();
+        // Dependency edges restricted to the app (deduplicated so a repeated
+        // entry in depends_on cannot skew the in-degree).
+        let mut edges: HashSet<(&str, &str)> = HashSet::new();
+        for n in &names {
+            let deps = st
+                .programs
+                .get(n.as_str())
+                .map(|p| p.def.depends_on.as_slice())
+                .unwrap_or(&[]);
+            for d in deps {
+                if members.contains(d.as_str()) {
+                    edges.insert((d.as_str(), n.as_str()));
+                }
+            }
+        }
+        let mut indegree: HashMap<&str, usize> = names.iter().map(|n| (n.as_str(), 0)).collect();
+        let mut dependents: HashMap<&str, Vec<&str>> = HashMap::new();
+        for (dep, dependent) in &edges {
+            *indegree.entry(dependent).or_insert(0) += 1;
+            dependents.entry(dep).or_default().push(dependent);
+        }
+        // Kahn's algorithm; the sorted frontier is the name tie-break.
+        let mut ready: std::collections::BTreeSet<&str> = names
+            .iter()
+            .map(|n| n.as_str())
+            .filter(|n| indegree[n] == 0)
+            .collect();
+        let mut out = Vec::with_capacity(names.len());
+        while let Some(n) = ready.pop_first() {
+            for dep in dependents.remove(n).unwrap_or_default() {
+                let e = indegree.get_mut(dep).unwrap();
+                *e -= 1;
+                if *e == 0 {
+                    ready.insert(dep);
+                }
+            }
+            out.push(n.to_string());
+        }
+        if out.len() < names.len() {
+            // Unreachable: validate_all rejects dependency cycles at load.
+            // Keep the fan-out total anyway instead of silently dropping.
+            let done: HashSet<String> = out.iter().cloned().collect();
+            for n in &names {
+                if !done.contains(n) {
+                    out.push(n.clone());
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Expand one app fan-out: sequential per-program runs of the existing
+    /// start/stop/restart logic (spawn clears `user_stopped`; stop is the
+    /// reverse of the start order). Errors are recorded per program — the
+    /// fan-out never aborts halfway.
+    fn cmd_app_fanout(&self, kind: FanoutKind, app: &str) -> Result<String> {
+        let order = {
+            let st = self.state.lock().unwrap();
+            Self::app_program_order(&st, app).map_err(|e| anyhow::anyhow!("{e}"))?
+        };
+        let seq: Vec<String> = match kind {
+            FanoutKind::Start | FanoutKind::Restart => order,
+            FanoutKind::Stop => order.into_iter().rev().collect(),
+        };
+        let mut steps = Vec::with_capacity(seq.len());
+        for name in &seq {
+            let result = match kind {
+                FanoutKind::Start => {
+                    let busy = {
+                        let st = self.state.lock().unwrap();
+                        st.programs
+                            .get(name)
+                            .map(|p| {
+                                matches!(p.state(), ProgramState::Running | ProgramState::Starting)
+                            })
+                            .unwrap_or(true)
+                    };
+                    if busy {
+                        Ok(format!("program {name} is already running"))
+                    } else {
+                        self.cmd_start(name)
+                    }
+                }
+                FanoutKind::Stop => self.cmd_stop(name),
+                // Restart bounces each program in start order: dependencies
+                // come up first, every program is replaced in place.
+                FanoutKind::Restart => self.cmd_stop(name).and_then(|_| self.cmd_start(name)),
+            };
+            steps.push(FanoutStep {
+                program: name.clone(),
+                result: match result {
+                    Ok(text) => text,
+                    Err(e) => format!("error: {e:#}"),
+                },
+            });
+        }
+        let fr = FanoutResult {
+            app: app.to_string(),
+            action: kind.as_str().to_string(),
+            programs: steps,
+        };
+        serde_json::to_string(&fr).context("failed to serialize fan-out result")
     }
 
     // -- reload / apply -----------------------------------------------------
@@ -1772,6 +2050,187 @@ mod tests {
         // Broken pending apps are not valid targets either.
         std::fs::write(&other, "not [ valid toml").unwrap();
         assert!(resolve_apply_scope(&sup, Some("other"), None).is_err());
+        let _ = sup.shutdown_all();
+    }
+
+    // -- app fan-out --------------------------------------------------------
+
+    fn fanout(sup: &Supervisor, kind: FanoutKind, app: &str) -> FanoutResult {
+        let raw = sup
+            .cmd_app_fanout(kind, app)
+            .unwrap_or_else(|e| panic!("fanout {kind:?} {app} failed: {e:#}"));
+        serde_json::from_str(&raw).expect("fan-out result is JSON")
+    }
+
+    fn names_of(fr: &FanoutResult) -> Vec<&str> {
+        fr.programs.iter().map(|s| s.program.as_str()).collect()
+    }
+
+    /// actions: the fan-out start expands in dependency order, starts every
+    /// program with the existing per-program logic (clearing user_stopped),
+    /// and reports one line per program.
+    #[test]
+    fn app_fanout_start_orders_and_covers_user_stopped() {
+        let (sup, _) = setup(
+            "demo",
+            "[app]\nautostart = false\n\
+             [program.a]\ncommand = 'sleep 30'\nstartsecs = 0.0\n\
+             [program.b]\ncommand = 'sleep 30'\nstartsecs = 0.0\ndepends_on = ['a']\n\
+             [program.c]\ncommand = 'sleep 30'\nstartsecs = 0.0\ndepends_on = ['b']\n",
+        );
+        let fr = fanout(&sup, FanoutKind::Start, "demo");
+        assert_eq!(names_of(&fr), ["a", "b", "c"], "dependency order");
+        for n in ["a", "b", "c"] {
+            wait_state(&sup, n, ProgramState::Running);
+        }
+        assert!(fr.programs.iter().all(|s| !s.result.contains("error")));
+
+        // The user stopped b; a fan-out start pulls it up again and clears
+        // the marker (spawn clears user_stopped).
+        {
+            let mut st = sup.state.lock().unwrap();
+            st.programs.get_mut("b").unwrap().stop();
+        }
+        wait_state(&sup, "b", ProgramState::Stopped);
+        assert!(sup.state.lock().unwrap().programs["b"].user_stopped());
+
+        let fr = fanout(&sup, FanoutKind::Start, "demo");
+        assert_eq!(names_of(&fr), ["a", "b", "c"]);
+        wait_state(&sup, "b", ProgramState::Running);
+        {
+            let st = sup.state.lock().unwrap();
+            assert!(
+                !st.programs["b"].user_stopped(),
+                "fan-out start clears user_stopped"
+            );
+        }
+        // a/c were already running: recorded, not an error.
+        let b_res = &fr.programs[0].result;
+        assert!(b_res.contains("already running"), "a: {b_res}");
+        assert!(
+            !fr.programs[1].result.contains("error"),
+            "b: {}",
+            fr.programs[1].result
+        );
+        let _ = sup.shutdown_all();
+    }
+
+    /// actions: fan-out stop runs in the reverse of the start order;
+    /// restart bounces every program (stop+start) in start order.
+    #[test]
+    fn app_fanout_stop_is_reverse_and_restart_bounces() {
+        let (sup, _) = setup(
+            "demo",
+            "[app]\nautostart = false\n\
+             [program.a]\ncommand = 'sleep 30'\nstartsecs = 0.0\n\
+             [program.b]\ncommand = 'sleep 30'\nstartsecs = 0.0\ndepends_on = ['a']\n\
+             [program.c]\ncommand = 'sleep 30'\nstartsecs = 0.0\ndepends_on = ['b']\n",
+        );
+        fanout(&sup, FanoutKind::Start, "demo");
+        for n in ["a", "b", "c"] {
+            wait_state(&sup, n, ProgramState::Running);
+        }
+        let pids: Vec<Option<u32>> = {
+            let st = sup.state.lock().unwrap();
+            ["a", "b", "c"]
+                .iter()
+                .map(|n| st.programs[*n].pid())
+                .collect()
+        };
+
+        let fr = fanout(&sup, FanoutKind::Stop, "demo");
+        assert_eq!(names_of(&fr), ["c", "b", "a"], "stop is the reverse order");
+        for n in ["a", "b", "c"] {
+            wait_state(&sup, n, ProgramState::Stopped);
+        }
+
+        let fr = fanout(&sup, FanoutKind::Restart, "demo");
+        assert_eq!(
+            names_of(&fr),
+            ["a", "b", "c"],
+            "restart walks the start order"
+        );
+        for (i, n) in ["a", "b", "c"].iter().enumerate() {
+            wait_state(&sup, n, ProgramState::Running);
+            let st = sup.state.lock().unwrap();
+            assert_ne!(
+                st.programs[*n].pid(),
+                pids[i],
+                "{n} was replaced by the restart"
+            );
+        }
+        let _ = sup.shutdown_all();
+    }
+
+    /// actions: unknown apps and (defensively) apps without programs are
+    /// error paths, never silent no-ops.
+    #[test]
+    fn app_fanout_unknown_and_empty_apps() {
+        let (sup, _) = setup(
+            "demo",
+            "[app]\nautostart = false\n[program.p]\ncommand = 'sleep 30'\nstartsecs = 0.0\n",
+        );
+        {
+            let mut st = sup.state.lock().unwrap();
+            st.apps.push(AppRecord {
+                name: "hollow".into(),
+                path: PathBuf::new(),
+                autostart: false,
+                priority: 0,
+            });
+        }
+        let e = sup
+            .cmd_app_fanout(FanoutKind::Start, "ghost")
+            .err()
+            .expect("unknown app must fail")
+            .to_string();
+        assert!(e.contains("unknown app"), "{e}");
+        let e = sup
+            .cmd_app_fanout(FanoutKind::Stop, "hollow")
+            .err()
+            .expect("app without programs must fail")
+            .to_string();
+        assert!(e.contains("no programs"), "{e}");
+        let _ = sup.shutdown_all();
+    }
+
+    /// actions: signal reaches the child without touching the state machine;
+    /// a stopped program has nothing to signal (SignalError branches).
+    #[test]
+    #[cfg(unix)]
+    fn signal_delivery_and_error_branches() {
+        let (sup, _) = setup(
+            "demo",
+            "[app]\nautostart = false\n[program.p]\ncommand = 'sleep 30'\nstartsecs = 0.0\nautorestart = 'never'\n",
+        );
+        sup.cmd_start("p").unwrap();
+        wait_state(&sup, "p", ProgramState::Running);
+        let pid = sup.state.lock().unwrap().programs["p"].pid();
+
+        let out = signal_program(&sup, "p", crate::platform::Signal::Usr1).unwrap();
+        assert!(out.contains("delivered"), "{out}");
+        // Immediately after delivery the state machine is untouched — the
+        // program dies on its own and the next tick observes the exit.
+        assert_eq!(
+            sup.state.lock().unwrap().programs["p"].state(),
+            ProgramState::Running,
+            "signal must not change the state machine"
+        );
+        wait_state(&sup, "p", ProgramState::Exited);
+
+        // Not running: nothing to deliver.
+        let e = signal_program(&sup, "p", crate::platform::Signal::Term)
+            .err()
+            .unwrap();
+        assert_eq!(e, SignalError::NotRunning);
+        assert_eq!(e.http_status(), 409);
+        // Unknown program.
+        let e = signal_program(&sup, "ghost", crate::platform::Signal::Term)
+            .err()
+            .unwrap();
+        assert_eq!(e, SignalError::UnknownProgram);
+        assert_eq!(e.http_status(), 404);
+        let _ = pid;
         let _ = sup.shutdown_all();
     }
 }

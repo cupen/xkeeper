@@ -5,6 +5,7 @@
 //! subcommands talk to the loopback HTTP API, and add/remove/list manage the
 //! app registry (app_dir links).
 
+mod action;
 mod api;
 mod assets;
 mod client;
@@ -74,12 +75,40 @@ enum Cmd {
     Edit,
     /// Overview of daemon and all programs
     Status,
-    /// Start a program
-    Start { name: String },
-    /// Stop a program (graceful, then force after stop timeout)
-    Stop { name: String },
-    /// Restart a program
-    Restart { name: String },
+    /// Start a program, or fan out over one app with --app
+    Start {
+        /// Program name (the bare form keeps per-program semantics)
+        #[arg(required_unless_present = "app", conflicts_with = "app")]
+        name: Option<String>,
+        /// Start every program of this app, in the established order
+        #[arg(long)]
+        app: Option<String>,
+    },
+    /// Stop a program (graceful, then force after stop timeout), or every
+    /// program of one app with --app
+    Stop {
+        /// Program name (the bare form keeps per-program semantics)
+        #[arg(required_unless_present = "app", conflicts_with = "app")]
+        name: Option<String>,
+        /// Stop every program of this app, in reverse start order
+        #[arg(long)]
+        app: Option<String>,
+    },
+    /// Restart a program, or every program of one app with --app
+    Restart {
+        /// Program name (the bare form keeps per-program semantics)
+        #[arg(required_unless_present = "app", conflicts_with = "app")]
+        name: Option<String>,
+        /// Restart every program of this app
+        #[arg(long)]
+        app: Option<String>,
+    },
+    /// Execute a program's declared custom action; the CLI exit code is the
+    /// action's own exit code (call failures: 1, daemon unreachable: 3)
+    Action { program: String, name: String },
+    /// Send a whitelist signal (TERM INT HUP QUIT USR1 USR2) to a program's
+    /// child process; unix only
+    Signal { program: String, signal: String },
     /// Print a program's pid
     Pid { name: String },
     /// Show a program's logs
@@ -283,9 +312,32 @@ fn dispatch(cli: &Cli) -> Result<()> {
             }
             Ok(())
         }),
-        Some(Cmd::Start { name }) => action_cmd(&config_path, name, "start"),
-        Some(Cmd::Stop { name }) => action_cmd(&config_path, name, "stop"),
-        Some(Cmd::Restart { name }) => action_cmd(&config_path, name, "restart"),
+        Some(Cmd::Start { name, app }) => match (name, app) {
+            (Some(n), _) => action_cmd(&config_path, &n, "start"),
+            (None, Some(a)) => fanout_cmd(&config_path, &a, "start"),
+            (None, None) => unreachable!("clap enforces name xor app"),
+        },
+        Some(Cmd::Stop { name, app }) => match (name, app) {
+            (Some(n), _) => action_cmd(&config_path, &n, "stop"),
+            (None, Some(a)) => fanout_cmd(&config_path, &a, "stop"),
+            (None, None) => unreachable!("clap enforces name xor app"),
+        },
+        Some(Cmd::Restart { name, app }) => match (name, app) {
+            (Some(n), _) => action_cmd(&config_path, &n, "restart"),
+            (None, Some(a)) => fanout_cmd(&config_path, &a, "restart"),
+            (None, None) => unreachable!("clap enforces name xor app"),
+        },
+        Some(Cmd::Action { program, name }) => custom_action_cmd(&config_path, program, name),
+        Some(Cmd::Signal { program, signal }) => client_cmd(&config_path, |c| {
+            let v = c.signal(program, signal)?;
+            println!(
+                "{}",
+                v.get("result")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("delivered")
+            );
+            Ok(())
+        }),
         Some(Cmd::Reload) => client_cmd(&config_path, |c| {
             let v = c.reload()?;
             println!(
@@ -600,6 +652,55 @@ fn client_cmd(config_path: &Path, f: impl FnOnce(&client::Client) -> Result<()>)
 fn action_cmd(config_path: &Path, name: &str, action: &str) -> Result<()> {
     client_cmd(config_path, |c| {
         let v = c.action(name, action)?;
+        println!(
+            "{}",
+            v.get("result").and_then(|r| r.as_str()).unwrap_or("done")
+        );
+        Ok(())
+    })
+}
+
+/// `xkeeper action <program> <action>`: print the output tail and pass the
+/// action's own exit code through (control-plane spec: 调用失败 1、守护不可达 3、
+/// 超时 1 — anything else is the action's exit status).
+fn custom_action_cmd(config_path: &Path, program: &str, action: &str) -> Result<()> {
+    let config = client::load_config(config_path)?;
+    let c = client::Client::from_config(&config);
+    let v = match c.custom_action(program, action) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("xkeeper: error: {e:#}");
+            std::process::exit(client::exit_code_of(&e));
+        }
+    };
+    if let Some(out) = v
+        .get("output")
+        .and_then(|o| o.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        println!("{out}");
+    }
+    if v.get("timed_out")
+        .and_then(|t| t.as_bool())
+        .unwrap_or(false)
+    {
+        eprintln!("xkeeper: error: action {program}.{action} timed out (process tree killed)");
+        std::process::exit(EXIT_ERROR);
+    }
+    match v.get("exit_code").and_then(|e| e.as_i64()) {
+        Some(0) | None => Ok(()),
+        Some(code) => {
+            eprintln!("action {program}.{action} exited with code {code}");
+            std::process::exit(code.clamp(i32::MIN as i64, 255) as i32);
+        }
+    }
+}
+
+/// `xkeeper start|stop|restart --app <name>`: app-level fan-out; the server
+/// expands it in the established order and reports per-program results.
+fn fanout_cmd(config_path: &Path, app: &str, verb: &str) -> Result<()> {
+    client_cmd(config_path, |c| {
+        let v = c.app_action(app, verb)?;
         println!(
             "{}",
             v.get("result").and_then(|r| r.as_str()).unwrap_or("done")

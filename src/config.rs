@@ -20,15 +20,161 @@ pub fn resolve_path(p: &Path, base: &Path) -> PathBuf {
     }
 }
 
-/// Names become link file names and log file names, so they must be safe.
+/// The identifier charset shared by app names, program names and custom
+/// action names (glossary 标识符不变量). App names become link file names,
+/// program names become log file names, and all three address objects from
+/// every panel — so one strict rule covers them all.
+pub const NAME_RULE: &str =
+    "names may only contain ASCII letters, digits, '_' and '-' ([A-Za-z0-9_-])";
+
+/// The single gate for app names, program names and action names. Dots,
+/// spaces, non-ASCII and control characters are rejected; an empty name is
+/// rejected. `app.program`-style composite names are therefore never valid
+/// identifiers (glossary: they must not be parsed as addressing syntax).
 pub fn is_valid_name(name: &str) -> bool {
     !name.is_empty()
-        && name != "."
-        && name != ".."
-        && !name.chars().any(|c| {
-            matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || c.is_control()
-        })
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
+
+/// Built-in action names reserved for custom actions (glossary 动作词表边界:
+/// observe-only commands and `apply` are NOT reserved).
+pub const RESERVED_ACTIONS: [&str; 6] =
+    ["start", "stop", "restart", "signal", "reload", "shutdown"];
+
+/// Action `timeout` when the field is omitted (actions/configuration spec).
+pub const DEFAULT_ACTION_TIMEOUT: u64 = 30;
+
+/// A known-domain `${...}` reference in an action command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VarRef {
+    pub domain: VarDomain,
+    /// Program/app name; empty for the daemon domain.
+    pub name: String,
+    pub field: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VarDomain {
+    Program,
+    App,
+    Daemon,
+}
+
+/// Fields allowed per domain (`${program.<n>.field}` etc., configuration
+/// spec: 动作定义表). Names are NOT checked here — program names are globally
+/// unique and cross-program references are allowed.
+pub const PROGRAM_VAR_FIELDS: [&str; 5] = ["pid", "state", "app", "work_dir", "log_dir"];
+pub const APP_VAR_FIELDS: [&str; 1] = ["path"];
+pub const DAEMON_VAR_FIELDS: [&str; 5] = ["pid", "host", "port", "log_dir", "app_dir"];
+
+/// Parse the inside of one `${...}`. `None` = the content does not start with
+/// a known domain prefix, so it stays verbatim for the shell (e.g. `${HOME}`).
+/// `Some(Ok(_))` = a well-formed known-domain variable; `Some(Err(_))` = it
+/// looked like a known-domain variable but is malformed (unknown field or
+/// missing parts) — rejected at resolve time so typos fail fast.
+pub fn parse_var_ref(content: &str) -> Option<Result<VarRef, String>> {
+    let parts: Vec<&str> = content.split('.').collect();
+    let known = |field: &str, fields: &[&str]| fields.contains(&field);
+    match parts.as_slice() {
+        ["program", name, field] if known(field, &PROGRAM_VAR_FIELDS) => Some(Ok(VarRef {
+            domain: VarDomain::Program,
+            name: (*name).to_string(),
+            field: (*field).to_string(),
+        })),
+        ["app", name, field] if known(field, &APP_VAR_FIELDS) => Some(Ok(VarRef {
+            domain: VarDomain::App,
+            name: (*name).to_string(),
+            field: (*field).to_string(),
+        })),
+        ["daemon", field] if known(field, &DAEMON_VAR_FIELDS) => Some(Ok(VarRef {
+            domain: VarDomain::Daemon,
+            name: String::new(),
+            field: (*field).to_string(),
+        })),
+        ["program", _, _] | ["app", _, _] => Some(Err(format!(
+            "unknown variable field (allowed: program.<name>.{{{}}}, app.<name>.{{{}}}, daemon.{{{}}})",
+            PROGRAM_VAR_FIELDS.join(", "),
+            APP_VAR_FIELDS.join(", "),
+            DAEMON_VAR_FIELDS.join(", ")
+        ))),
+        ["daemon", _] => Some(Err(format!(
+            "unknown variable field (allowed: daemon.{{{}}})",
+            DAEMON_VAR_FIELDS.join(", ")
+        ))),
+        ["program"] | ["app"] | ["daemon"] | ["program", _] | ["app", _] => Some(Err(
+            "incomplete variable reference (e.g. ${program.<name>.pid} or ${daemon.pid})".into(),
+        )),
+        _ => None,
+    }
+}
+
+/// Extract the inside text of every `${...}` occurrence (no nesting: the
+/// first `}` closes the reference).
+fn extract_var_texts(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = s;
+    while let Some(start) = rest.find("${") {
+        let after = &rest[start + 2..];
+        match after.find('}') {
+            Some(end) => {
+                out.push(&after[..end]);
+                rest = &after[end + 1..];
+            }
+            None => break, // unterminated: shell's problem, left verbatim
+        }
+    }
+    out
+}
+
+/// Known-domain variables in `cmd` whose text is malformed, for the
+/// resolve-time check (configuration spec: 未知动作变量被拒绝).
+pub fn unknown_action_vars(cmd: &str) -> Vec<String> {
+    extract_var_texts(cmd)
+        .into_iter()
+        .filter_map(|raw| {
+            parse_var_ref(raw).and_then(|r| r.err().map(|e| format!("${{{raw}}}: {e}")))
+        })
+        .collect()
+}
+
+/// Replace known-domain `${...}` variables via `resolve`; unknown-domain
+/// `${...}` stays verbatim for the shell (user's `${HOME}` is untouched).
+/// A known-domain reference resolving to `None` (e.g. the pid of a stopped
+/// program) becomes the empty string.
+pub fn substitute_vars(cmd: &str, resolve: impl Fn(&VarRef) -> Option<String>) -> String {
+    let mut out = String::with_capacity(cmd.len());
+    let mut rest = cmd;
+    while let Some(start) = rest.find("${") {
+        let after = &rest[start + 2..];
+        out.push_str(&rest[..start]);
+        match after.find('}') {
+            Some(end) => {
+                let raw = &after[..end];
+                match parse_var_ref(raw) {
+                    Some(Ok(r)) => out.push_str(&resolve(&r).unwrap_or_default()),
+                    _ => {
+                        // Unknown domain or malformed: hand the text to the shell.
+                        out.push_str("${");
+                        out.push_str(raw);
+                        out.push('}');
+                    }
+                }
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push_str("${");
+                out.push_str(after);
+                return out;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Split a command line into argv using shell word rules (whitespace split,
 
 /// Split a command line into argv using shell word rules (whitespace split,
 /// quote awareness). We never invoke a shell — no pipes/variables/redirects.
@@ -245,6 +391,17 @@ pub struct LevelOptions {
 /// Defaults shared by every app, from the daemon config `[app-default]` table.
 pub type AppDefaults = LevelOptions;
 
+/// One `[program.<name>.action.<action-name>]` table as written on disk.
+/// Only `command` is required; `timeout` is optional (seconds, default
+/// [`DEFAULT_ACTION_TIMEOUT`], must be > 0).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActionRaw {
+    pub command: String,
+    #[serde(default)]
+    pub timeout: Option<u64>,
+}
+
 /// The `[app]` table of an app config: metadata plus app-level defaults.
 /// This is where `xkeeper add` micro-tuning flags are written.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -313,6 +470,9 @@ pub struct AppRaw {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProgramRaw {
+    /// Custom actions declared as `[program.<name>.action.<action-name>]`
+    /// tables; the map key is the action name (configuration spec: 动作定义表).
+    pub action: BTreeMap<String, ActionRaw>,
     pub command: Option<String>,
     pub args: Option<Vec<String>>,
     pub work_dir: Option<PathBuf>,
@@ -355,6 +515,14 @@ impl AppRaw {
 // resolved model
 // ---------------------------------------------------------------------------
 
+/// One resolved custom action: the command template (substituted at spawn
+/// time) and the effective timeout in seconds.
+#[derive(Debug, Clone, Serialize)]
+pub struct ResolvedAction {
+    pub command: String,
+    pub timeout: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct HealthCheck {
     pub kind: HealthKind,
@@ -377,6 +545,9 @@ pub struct ResolvedProgram {
     pub name: String,
     pub command: String,
     pub args: Vec<String>,
+    /// Custom actions of this program, validated at resolve time
+    /// (actions spec: 自定义动作执行契约).
+    pub actions: BTreeMap<String, ResolvedAction>,
     pub work_dir: PathBuf,
     pub env: BTreeMap<String, String>,
     pub depends_on: Vec<String>,
@@ -463,7 +634,7 @@ pub fn resolve_program(
     base_dir: &Path,
 ) -> Result<ResolvedProgram> {
     if !is_valid_name(prog_name) {
-        bail!("program name {prog_name:?} is not filename-safe");
+        bail!("program name {prog_name:?} is invalid: {NAME_RULE}");
     }
     let command_raw = raw
         .command
@@ -578,11 +749,51 @@ pub fn resolve_program(
     let env = raw.env.clone().unwrap_or_default();
     let depends_on = raw.depends_on.clone().unwrap_or_default();
 
+    // Custom actions: validate the name (charset + reserved words), the
+    // command (non-empty, variable names known) and the timeout (> 0) at
+    // resolve time so `validate`/`reload` fail fast (configuration spec).
+    let mut actions = BTreeMap::new();
+    for (aname, araw) in &raw.action {
+        if !is_valid_name(aname) {
+            bail!("program[{prog_name}] action name {aname:?} is invalid: {NAME_RULE}");
+        }
+        if RESERVED_ACTIONS.contains(&aname.as_str()) {
+            bail!(
+                "program[{prog_name}] action name {aname:?} is reserved (built-in action names \
+                 {} cannot be redefined)",
+                RESERVED_ACTIONS.join(", ")
+            );
+        }
+        if araw.command.trim().is_empty() {
+            bail!("program[{prog_name}] action[{aname}]: command must not be empty");
+        }
+        let timeout = match araw.timeout {
+            Some(0) => bail!("program[{prog_name}] action[{aname}]: timeout must be > 0"),
+            Some(t) => t,
+            None => DEFAULT_ACTION_TIMEOUT,
+        };
+        let unknown = unknown_action_vars(&araw.command);
+        if !unknown.is_empty() {
+            bail!(
+                "program[{prog_name}] action[{aname}]: unknown action variable(s): {}",
+                unknown.join(", ")
+            );
+        }
+        actions.insert(
+            aname.clone(),
+            ResolvedAction {
+                command: araw.command.clone(),
+                timeout,
+            },
+        );
+    }
+
     let p = ResolvedProgram {
         app: app_name.to_string(),
         name: prog_name.to_string(),
         command,
         args,
+        actions,
         work_dir,
         env,
         depends_on,
@@ -615,7 +826,7 @@ pub fn resolve_app(
     defaults: Option<&AppDefaults>,
 ) -> Result<ResolvedApp> {
     if !is_valid_name(name) {
-        bail!("app name {name:?} is not filename-safe");
+        bail!("app name {name:?} is invalid: {NAME_RULE}");
     }
     let meta = raw.app.as_ref();
     let autostart = meta
@@ -825,6 +1036,7 @@ pub fn import_legacy(legacy_path: &Path) -> Result<LegacyImport> {
         programs.insert(
             p.name.clone(),
             ProgramRaw {
+                action: BTreeMap::new(),
                 command: Some(p.command),
                 args: p.args,
                 work_dir: p.working_dir.map(PathBuf::from),
@@ -901,6 +1113,210 @@ mod tests {
         );
         assert_eq!(split_command("echo \"a b\" c"), vec!["echo", "a b", "c"]);
         assert_eq!(split_command("  spaced   out  "), vec!["spaced", "out"]);
+    }
+
+    /// configuration: identifiers are [A-Za-z0-9_-]+ — dots, spaces and
+    /// non-ASCII are rejected (breaking tighten, glossary 标识符不变量).
+    #[test]
+    fn name_charset_is_strict() {
+        for ok in ["api", "web-1", "worker_2", "A-b_c9"] {
+            assert!(is_valid_name(ok), "{ok:?} must pass");
+        }
+        for bad in [
+            "",           // empty
+            "my.web",     // dot (composite names are not identifiers)
+            "my web",     // space
+            "プログラム", // non-ASCII
+            "a/b",        // path separator
+            "..",         // dot-dot (dots are illegal anyway)
+            "a\nb",       // control char
+        ] {
+            assert!(!is_valid_name(bad), "{bad:?} must be rejected");
+        }
+        // The gate rejects at resolve time with a repair hint.
+        let r = app_of("[program.\"my.web\"]\ncommand = 'x'\n");
+        let msg = r.err().unwrap().to_string();
+        assert!(
+            msg.contains("my.web") && msg.contains("[A-Za-z0-9_-]"),
+            "{msg}"
+        );
+        let app_err = resolve_app(
+            "bad name",
+            Path::new("x.toml"),
+            &toml::from_str("[program.a]\ncommand='x'\n").unwrap(),
+            None,
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(
+            app_err.contains("bad name") && app_err.contains("invalid"),
+            "{app_err}"
+        );
+    }
+
+    /// configuration: the minimal action table resolves; timeout defaults to
+    /// 30 and explicit positive values pass through.
+    #[test]
+    fn action_table_minimal_and_timeout() {
+        let a = app_of(
+            "[program.api]\ncommand = 'x'\n\n[program.api.action.flush]\ncommand = 'curl -fsS http://h/flush'\n",
+        )
+        .unwrap();
+        let act = a.programs[0].actions.get("flush").expect("flush resolved");
+        assert_eq!(act.command, "curl -fsS http://h/flush");
+        assert_eq!(act.timeout, 30, "omitted timeout defaults to 30");
+        let b = app_of(
+            "[program.api]\ncommand = 'x'\n\n[program.api.action.flush]\ncommand = 'x'\ntimeout = 5\n",
+        )
+        .unwrap();
+        assert_eq!(b.programs[0].actions["flush"].timeout, 5);
+    }
+
+    /// configuration: action definitions are validated — timeout range,
+    /// empty command, unknown fields, reserved words, bad names.
+    #[test]
+    fn action_table_validation() {
+        // timeout = 0 is rejected and names the field.
+        let r = app_of(
+            "[program.api]\ncommand='x'\n\n[program.api.action.t0]\ncommand='x'\ntimeout = 0\n",
+        );
+        let msg = r.err().unwrap().to_string();
+        assert!(msg.contains("timeout") && msg.contains("> 0"), "{msg}");
+        // A negative timeout fails at TOML parse time and names the field.
+        let r = app_of(
+            "[program.api]\ncommand='x'\n\n[program.api.action.tn]\ncommand='x'\ntimeout = -1\n",
+        );
+        let msg = r.err().unwrap().to_string();
+        assert!(
+            msg.contains("timeout"),
+            "parse error must name the field: {msg}"
+        );
+        // Unknown fields inside an action table are rejected.
+        assert!(
+            app_of(
+                "[program.api]\ncommand='x'\n\n[program.api.action.u]\ncommand='x'\nretries = 3\n"
+            )
+            .is_err()
+        );
+        // Empty / whitespace-only command.
+        let msg = app_of("[program.api]\ncommand='x'\n\n[program.api.action.e]\ncommand = ' '\n")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(msg.contains("command must not be empty"), "{msg}");
+        // Built-in action names are reserved.
+        for reserved in RESERVED_ACTIONS {
+            let msg = app_of(&format!(
+                "[program.api]\ncommand='x'\n\n[program.api.action.{reserved}]\ncommand='x'\n"
+            ))
+            .err()
+            .unwrap()
+            .to_string();
+            assert!(
+                msg.contains("reserved") && msg.contains(reserved),
+                "{reserved} must be rejected: {msg}"
+            );
+        }
+        // Observe-only commands and `apply` are NOT reserved (glossary).
+        assert!(
+            app_of("[program.api]\ncommand='x'\n\n[program.api.action.status]\ncommand='x'\n")
+                .is_ok()
+        );
+        assert!(
+            app_of("[program.api]\ncommand='x'\n\n[program.api.action.apply]\ncommand='x'\n")
+                .is_ok()
+        );
+        // Action names follow the same identifier charset.
+        let msg = app_of(
+            "[program.api]\ncommand='x'\n\n[program.api.action.\"bad.name\"]\ncommand='x'\n",
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(msg.contains("bad.name") && msg.contains("invalid"), "{msg}");
+    }
+
+    /// configuration: variable names in action commands are checked at
+    /// resolve time; unknown-domain `${...}` stays untouched for the shell;
+    /// multi-line commands pass validation.
+    #[test]
+    fn action_variables_validated_and_multiline_ok() {
+        // Unknown program field rejected, error names the variable.
+        let msg = app_of(
+            "[program.api]\ncommand='x'\n\n[program.api.action.f]\ncommand = 'curl http://h/?pid=${program.api.hello}'\n",
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(
+            msg.contains("unknown action variable") && msg.contains("program.api.hello"),
+            "{msg}"
+        );
+        // Unknown daemon field rejected.
+        assert!(app_of("[program.api]\ncommand='x'\n\n[program.api.action.d]\ncommand = 'x ${daemon.wat}'\n").is_err());
+        // Incomplete known-domain references rejected.
+        assert!(
+            app_of(
+                "[program.api]\ncommand='x'\n\n[program.api.action.i]\ncommand = 'x ${program}'\n"
+            )
+            .is_err()
+        );
+        assert!(app_of("[program.api]\ncommand='x'\n\n[program.api.action.i2]\ncommand = 'x ${program.api}'\n").is_err());
+        // All documented variables validate.
+        let ok = app_of(
+            "[program.api]\ncommand='x'\n\n[program.api.action.v]\ncommand = '''x ${program.api.pid} ${program.api.state} ${program.api.app} ${program.api.work_dir} ${program.api.log_dir} ${app.api.path} ${daemon.pid} ${daemon.host} ${daemon.port} ${daemon.log_dir} ${daemon.app_dir}'''",
+        );
+        assert!(ok.is_ok(), "documented variables must validate: {ok:?}");
+        // Shell-domain variables are not xkeeper's business.
+        assert!(app_of("[program.api]\ncommand='x'\n\n[program.api.action.h]\ncommand = 'echo ${HOME} ${foo.bar}'\n").is_ok());
+        // Multi-line command (TOML literal string) validates.
+        let multi = app_of(
+            "[program.api]\ncommand='x'\n\n[program.api.action.m]\ncommand = '''\necho one\necho two\n'''",
+        );
+        assert!(multi.is_ok(), "multi-line command must validate: {multi:?}");
+        // Unterminated ${ stays verbatim (shell's business).
+        assert!(substitute_vars("echo ${oops", |_| Some("X".into())) == "echo ${oops");
+    }
+
+    /// configuration: spawn-time substitution replaces known-domain variables
+    /// with runtime values; a pid that is absent becomes the empty string;
+    /// unknown-domain text survives for the shell.
+    #[test]
+    fn variable_substitution_and_empty_pid() {
+        let resolve = |r: &VarRef| -> Option<String> {
+            match (r.domain, r.name.as_str(), r.field.as_str()) {
+                (VarDomain::Program, "api", "pid") => Some("4242".into()),
+                (VarDomain::Program, "api", "state") => Some("running".into()),
+                (VarDomain::Program, "api", "work_dir") => Some("/opt/api".into()),
+                (VarDomain::Program, "down", "pid") => None, // not running
+                (VarDomain::App, "api", "path") => Some("/opt/api/xkeeper.toml".into()),
+                (VarDomain::Daemon, _, "port") => Some("7310".into()),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            substitute_vars(
+                "curl http://127.0.0.1:${daemon.port}/?pid=${program.api.pid}",
+                resolve
+            ),
+            "curl http://127.0.0.1:7310/?pid=4242"
+        );
+        // pid of a stopped program: empty string, observable in the command.
+        assert_eq!(
+            substitute_vars("echo stopped=[${program.down.pid}]", resolve),
+            "echo stopped=[]"
+        );
+        // Shell variables pass through untouched.
+        assert_eq!(
+            substitute_vars("echo ${HOME} and ${program.api.state} and $USER", resolve),
+            "echo ${HOME} and running and $USER"
+        );
+        // Several references in one command.
+        assert_eq!(
+            substitute_vars("${program.api.work_dir}:${app.api.path}", resolve),
+            "/opt/api:/opt/api/xkeeper.toml"
+        );
     }
 
     #[test]
@@ -1040,6 +1456,24 @@ mod tests {
         assert!(validate_all(&[b]).is_err());
         let c = app_of("[program.a]\ncommand=\"x\"\n").unwrap();
         assert!(validate_all(&[c]).is_ok());
+    }
+
+    /// configuration: a program name duplicated across two registered apps is
+    /// refused and the error names the program AND both conflicting apps
+    /// (glossary 标识符不变量: program names are globally unique).
+    #[test]
+    fn validate_all_duplicate_program_names_both_apps() {
+        let raw: AppRaw = toml::from_str("[program.dup]\ncommand='x'\n").unwrap();
+        let alpha = resolve_app("alpha", Path::new("/opt/alpha/xkeeper.toml"), &raw, None).unwrap();
+        let beta = resolve_app("beta", Path::new("/opt/beta/xkeeper.toml"), &raw, None).unwrap();
+        let err = validate_all(&[alpha, beta])
+            .err()
+            .expect("duplicate refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("dup") && msg.contains("alpha") && msg.contains("beta"),
+            "error must name the program and both apps: {msg}"
+        );
     }
 
     #[test]

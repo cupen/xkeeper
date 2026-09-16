@@ -12,13 +12,29 @@ use crate::client::{self, Client};
 /// Default webui listen address, matching `xkeeper webui --listen`.
 const DEFAULT_WEBUI_URL: &str = "http://127.0.0.1:9877";
 
+/// What a start/stop/restart targets: one program (bare name, unchanged
+/// semantics) or a whole app (`--app`, fan-out expanded server-side).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Target {
+    Program(String),
+    App(String),
+}
+
 /// One parsed shell line.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ShellCmd {
     Status,
-    Start(String),
-    Stop(String),
-    Restart(String),
+    Start(Target),
+    Stop(Target),
+    Restart(Target),
+    Action {
+        program: String,
+        name: String,
+    },
+    Signal {
+        program: String,
+        signal: String,
+    },
     Pid(String),
     Log {
         name: String,
@@ -47,9 +63,13 @@ pub(crate) fn parse_line(line: &str) -> Result<Option<ShellCmd>> {
     };
     let cmd = match head.as_str() {
         "status" | "st" => ShellCmd::Status,
-        "start" => ShellCmd::Start(one_arg(head, args)?),
-        "stop" => ShellCmd::Stop(one_arg(head, args)?),
-        "restart" => ShellCmd::Restart(one_arg(head, args)?),
+        "start" => parse_target("start", args).map(ShellCmd::Start)?,
+        "stop" => parse_target("stop", args).map(ShellCmd::Stop)?,
+        "restart" => parse_target("restart", args).map(ShellCmd::Restart)?,
+        "action" => parse_two_args("action", args, "action <program> <action>")
+            .map(|(program, name)| ShellCmd::Action { program, name })?,
+        "signal" => parse_two_args("signal", args, "signal <program> <SIGNAL>")
+            .map(|(program, signal)| ShellCmd::Signal { program, signal })?,
         "pid" => ShellCmd::Pid(one_arg(head, args)?),
         "log" => parse_log(args)?,
         "reload" => ShellCmd::Reload,
@@ -62,6 +82,49 @@ pub(crate) fn parse_line(line: &str) -> Result<Option<ShellCmd>> {
         other => bail!("unknown command {other:?}{}", similar_hint(other)),
     };
     Ok(Some(cmd))
+}
+
+/// Parse `<name>` (program) or `--app <app>` for start/stop/restart.
+fn parse_target(cmd: &str, args: &[String]) -> Result<Target> {
+    let mut name: Option<String> = None;
+    let mut app: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--app" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--app needs an app name"))?;
+                if app.is_some() {
+                    bail!("{cmd} takes --app only once");
+                }
+                app = Some(v.clone());
+            }
+            other if other.starts_with('-') => bail!("unknown {cmd} flag {other:?}"),
+            other => {
+                if name.is_some() {
+                    bail!("{cmd} takes exactly one program name");
+                }
+                name = Some(other.to_string());
+            }
+        }
+        i += 1;
+    }
+    match (name, app) {
+        (Some(n), None) => Ok(Target::Program(n)),
+        (None, Some(a)) => Ok(Target::App(a)),
+        (Some(_), Some(_)) => bail!("{cmd} takes a program name OR --app <app>, not both"),
+        (None, None) => bail!("{cmd} needs a program name (or --app <app>)"),
+    }
+}
+
+/// Parse exactly two positional arguments (`action`/`signal` verbs).
+fn parse_two_args(cmd: &str, args: &[String], usage: &str) -> Result<(String, String)> {
+    match args {
+        [a, b] => Ok((a.clone(), b.clone())),
+        _ => bail!("{cmd} takes exactly two arguments: {usage}"),
+    }
 }
 
 /// Parse `apply [<app> [<program>]] [--restart]`.
@@ -183,9 +246,9 @@ fn parse_log(args: &[String]) -> Result<ShellCmd> {
 
 /// Naive "did you mean" for the unknown-command hint.
 fn similar_hint(input: &str) -> String {
-    const COMMANDS: [&str; 13] = [
-        "status", "start", "stop", "restart", "pid", "log", "reload", "pending", "apply",
-        "shutdown", "open", "help", "exit",
+    const COMMANDS: [&str; 15] = [
+        "status", "start", "stop", "restart", "action", "signal", "pid", "log", "reload",
+        "pending", "apply", "shutdown", "open", "help", "exit",
     ];
     let input = input.to_lowercase();
     let similar: Vec<&str> = COMMANDS
@@ -224,6 +287,11 @@ pub(crate) const HELP_TEXT: &str = "\
 Built-in commands:
   status                              list all programs (app, state, pid, restarts)
   start|stop|restart <name>           control a program
+  start|stop|restart --app <app>      fan out over every program of an app
+  action <program> <action>           run a custom action (prints its output tail;
+                                      -e mode exits with the action's exit code)
+  signal <program> <SIGNAL>           send a whitelist signal to the program's
+                                      child (TERM INT HUP QUIT USR1 USR2; unix only)
   pid <name>                          print a program's pid
   log <name> [-f] [--tail N] [--stream out|err]
                                       view program logs
@@ -239,6 +307,20 @@ Built-in commands:
   open                                open the web console in the system browser
   help (or ?)                         show this help
   exit (or quit)                      leave the shell";
+
+/// Exit-code carrier for `-e` single-command mode: an action's own exit code
+/// passes through the shell exactly like `xkeeper action` would. Implements
+/// StdError so it can ride in an `anyhow::Error` and be downcast later.
+#[derive(Debug)]
+struct ActionExit(i32);
+
+impl std::fmt::Display for ActionExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "action exit code {}", self.0)
+    }
+}
+
+impl std::error::Error for ActionExit {}
 
 /// Outcome of one executed command: keep looping or leave the shell.
 enum Outcome {
@@ -261,7 +343,14 @@ pub(crate) fn run(config_path: &std::path::Path, single: Option<&str>) -> Result
                     Ok(Outcome::Continue) => Ok(()),
                     Ok(Outcome::Exit) => Ok(()),
                     Err(e) => {
-                        std::process::exit(client::exit_code_of(&e));
+                        // The message is the only trace of what the control
+                        // plane answered — never exit silently.
+                        eprintln!("xkeeper: error: {e:#}");
+                        let code = e
+                            .downcast_ref::<ActionExit>()
+                            .map(|a| a.0)
+                            .unwrap_or_else(|| client::exit_code_of(&e));
+                        std::process::exit(code);
                     }
                 }
             }
@@ -318,9 +407,20 @@ fn repl(c: &Client, webui_url: &str) -> Result<()> {
 fn execute(c: &Client, cmd: &ShellCmd, webui_url: &str) -> Result<Outcome> {
     match cmd {
         ShellCmd::Status => print_status(c),
-        ShellCmd::Start(name) => print_action(c, name, "start"),
-        ShellCmd::Stop(name) => print_action(c, name, "stop"),
-        ShellCmd::Restart(name) => print_action(c, name, "restart"),
+        ShellCmd::Start(t) => run_target(c, t, "start"),
+        ShellCmd::Stop(t) => run_target(c, t, "stop"),
+        ShellCmd::Restart(t) => run_target(c, t, "restart"),
+        ShellCmd::Action { program, name } => run_custom_action(c, program, name),
+        ShellCmd::Signal { program, signal } => {
+            let v = c.signal(program, signal)?;
+            println!(
+                "{}",
+                v.get("result")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("delivered")
+            );
+            Ok(Outcome::Continue)
+        }
         ShellCmd::Pid(name) => {
             let v = c.program(name)?;
             match v.get("pid") {
@@ -425,6 +525,49 @@ fn print_action(c: &Client, name: &str, action: &str) -> Result<Outcome> {
         v.get("result").and_then(|r| r.as_str()).unwrap_or("done")
     );
     Ok(Outcome::Continue)
+}
+
+/// start/stop/restart against a program (bare name) or a whole app (--app);
+/// both shapes print the per-target result the CLI prints.
+fn run_target(c: &Client, t: &Target, verb: &str) -> Result<Outcome> {
+    match t {
+        Target::Program(name) => print_action(c, name, verb),
+        Target::App(app) => {
+            let v = c.app_action(app, verb)?;
+            println!(
+                "{}",
+                v.get("result").and_then(|r| r.as_str()).unwrap_or("done")
+            );
+            Ok(Outcome::Continue)
+        }
+    }
+}
+
+/// `action <program> <action>`: print the output tail, keep the same
+/// success/failure semantics as `xkeeper action` (non-zero exit → error;
+/// in `-e` mode the action's own exit code leaves the shell via ActionExit).
+fn run_custom_action(c: &Client, program: &str, name: &str) -> Result<Outcome> {
+    let v = c.custom_action(program, name)?;
+    if let Some(out) = v
+        .get("output")
+        .and_then(|o| o.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        println!("{out}");
+    }
+    if v.get("timed_out")
+        .and_then(|t| t.as_bool())
+        .unwrap_or(false)
+    {
+        return Err(anyhow::Error::new(ActionExit(1)).context(format!(
+            "action {program}.{name} timed out (process tree killed)"
+        )));
+    }
+    match v.get("exit_code").and_then(|e| e.as_i64()) {
+        Some(0) | None => Ok(Outcome::Continue),
+        Some(code) => Err(anyhow::Error::new(ActionExit(code.clamp(1, 255) as i32))
+            .context(format!("action {program}.{name} exited with code {code}"))),
+    }
 }
 
 /// Aligned status table: name / app / state / pid / restarts / unhealthy.
@@ -725,6 +868,68 @@ mod tests {
         assert!(parse_line("log").is_err());
         assert!(parse_line("log web --tail").is_err());
         assert!(parse_line("log web --stream both").is_err());
+    }
+
+    /// actions: start/stop/restart take a bare program name or --app <app>.
+    #[test]
+    fn target_parsing_program_and_app() {
+        assert_eq!(
+            parse("start web"),
+            Some(ShellCmd::Start(Target::Program("web".into())))
+        );
+        assert_eq!(
+            parse("stop web"),
+            Some(ShellCmd::Stop(Target::Program("web".into())))
+        );
+        assert_eq!(
+            parse("restart --app gateway"),
+            Some(ShellCmd::Restart(Target::App("gateway".into())))
+        );
+        assert_eq!(
+            parse("start --app demo"),
+            Some(ShellCmd::Start(Target::App("demo".into())))
+        );
+        // Both shapes at once, a missing --app value, or an unknown flag: all errors.
+        assert!(parse_line("start web --app demo").is_err());
+        assert!(parse_line("start --app").is_err());
+        assert!(parse_line("start --bogus x").is_err());
+        assert!(parse_line("stop a b").is_err());
+    }
+
+    /// actions: `action`/`signal` verbs parse two positional arguments.
+    #[test]
+    fn action_and_signal_parsing() {
+        assert_eq!(
+            parse("action api upgrade"),
+            Some(ShellCmd::Action {
+                program: "api".into(),
+                name: "upgrade".into()
+            })
+        );
+        assert_eq!(
+            parse("signal web SIGUSR1"),
+            Some(ShellCmd::Signal {
+                program: "web".into(),
+                signal: "SIGUSR1".into()
+            })
+        );
+        assert!(parse_line("action api").is_err(), "needs two args");
+        assert!(parse_line("action api upgrade extra").is_err());
+        assert!(parse_line("signal web").is_err());
+        // The new words are reachable via the typo hint.
+        assert!(similar_hint("actoin").contains("action"));
+        assert!(similar_hint("signl").contains("signal"));
+    }
+
+    /// actions: `-e` single-command mode passes an action's exit code through
+    /// via the ActionExit carrier (checked here without a daemon).
+    #[test]
+    fn action_exit_code_carrier_downcasts() {
+        let e: anyhow::Error =
+            anyhow::Error::new(ActionExit(3)).context("action p.a exited with code 3");
+        assert_eq!(e.downcast_ref::<ActionExit>().map(|a| a.0), Some(3));
+        let e: anyhow::Error = anyhow::anyhow!("daemon unreachable");
+        assert_eq!(e.downcast_ref::<ActionExit>().map(|a| a.0), None);
     }
 
     #[test]
