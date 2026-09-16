@@ -1,11 +1,11 @@
-//! Acceptance e2e for the apply-workflow + app-registry changes
+//! Acceptance e2e for the apply-workflow + app-registry + actions changes
 //! (`cargo run -p xtask -- e2e`).
 //!
 //! Drives the REAL daemon binary end-to-end, in two passes:
 //!
 //! - CLI pass — the acceptance checklist as executable scenarios (spec:
 //!   apply-workflow, configuration, control-plane, shell-client,
-//!   app-registry):
+//!   app-registry, actions, glossary):
 //!   A. detect does not touch processes (periodic + reload preview),
 //!   B. scoped apply leaves other apps untouched,
 //!   C. --restart restarts unchanged programs but never a user-stopped one,
@@ -16,6 +16,13 @@
 //!      apply → no-change re-add → changed re-add + `apply all` → `--apply`
 //!      one-step (app-scoped) → reserved `all` rejected → remove deletes the
 //!      generated file and stops the program.
+//!   H. actions (actions/glossary change): offline declaration + rejection
+//!      cases (charset / unknown variable / reserved word / timeout range),
+//!      then online: `--app` fan-out order + user_stopped coverage, custom
+//!      action success with variable substitution, work_dir resolution,
+//!      timeout tree kill, same-action mutual exclusion, chained
+//!      `xkeeper restart` inside an action, stopped-program pid→empty,
+//!      signal whitelist in/out + not-running (unix).
 //! - webui pass — a real browser (playwright, chromium) against the embedded
 //!   console: the pending badge appears after a disk edit, "Apply 此应用"
 //!   (app-scope) confirms and applies, the result text renders, and a second
@@ -219,6 +226,39 @@ fn cli_try(bin: &Path, ws: &Workspace, args: &[&str]) -> Result<(bool, i32, Stri
     Ok((out.status.success(), code, combined))
 }
 
+/// Run the CLI against an explicit daemon config (for bad-config scenarios
+/// where the workspace's own daemon.toml must stay valid), expecting FAILURE.
+fn cli_try_cfg(bin: &Path, cfg: &Path, args: &[&str]) -> Result<(bool, i32, String)> {
+    let out = Command::new(bin)
+        .arg("--config")
+        .arg(cfg)
+        .args(args)
+        .output()
+        .with_context(|| format!("run xkeeper {:?} (cfg {})", args, cfg.display()))?;
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let code = out.status.code().unwrap_or(-1);
+    Ok((out.status.success(), code, combined))
+}
+
+/// HTTP status code + body of a control-plane request (curl, like `api`,
+/// but the status code is kept so error mappings can be asserted).
+fn api_checked(ws: &Workspace, method: &str, path: &str, body: &str) -> Result<(u16, String)> {
+    let mut cmd = Command::new("curl");
+    cmd.args(["-s", "-o", "-", "-w", "\n%{http_code}", "-X", method]);
+    if !body.is_empty() {
+        cmd.args(["-d", body]);
+    }
+    cmd.arg(format!("http://127.0.0.1:{}{path}", ws.control_port));
+    let out = cmd.output().context("curl control plane")?;
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let (body, code) = text.rsplit_once('\n').unwrap_or((&text, "0"));
+    Ok((code.trim().parse().unwrap_or(0), body.to_string()))
+}
+
 /// A `sleep` executable for the scaffold scenarios: standard locations on
 /// unix, PATH search elsewhere (Git for Windows ships one).
 fn find_sleep() -> Result<PathBuf> {
@@ -406,6 +446,63 @@ fn offline_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         "empty --env key registers nothing",
     )?;
 
+    step("G0c. `xkeeper status` with no daemon is unreachable (exit 3)");
+    let (ok, code, combined) = cli_try(bin, ws, &["status"])?;
+    expect(
+        !ok && code == 3,
+        &format!("status without a daemon exits 3, got {code}"),
+    )?;
+    expect(
+        combined.contains("unreachable"),
+        "the error says the daemon is unreachable",
+    )?;
+
+    step("G0d. a relative daemon.log_dir fails validate AND refuses daemon startup");
+    let bad_cfg = ws.root.join("daemon-bad.toml");
+    std::fs::write(&bad_cfg, "[daemon]\nlog_dir = \"logs\"\n")?;
+    let (ok, _code, combined) = cli_try_cfg(bin, &bad_cfg, &["validate"])?;
+    expect(!ok, "validate with a relative log_dir fails")?;
+    expect(
+        combined.contains("daemon.log_dir") && combined.contains("absolute"),
+        "the error names daemon.log_dir and demands an absolute path",
+    )?;
+    // The daemon itself must refuse to boot on that config (fast, non-zero).
+    let out = std::fs::File::create(ws.root.join("bad-daemon.out.log"))?;
+    let err = out.try_clone()?;
+    let mut child = Command::new(bin)
+        .arg("--config")
+        .arg(&bad_cfg)
+        .arg("webui")
+        .arg("--listen")
+        .arg(format!("127.0.0.1:{}", free_port()?))
+        .stdout(Stdio::from(out))
+        .stderr(Stdio::from(err))
+        .spawn()
+        .context("spawn daemon with relative log_dir")?;
+    let mut refused = false;
+    for _ in 0..50 {
+        match child.try_wait()? {
+            Some(st) => {
+                refused = !st.success();
+                break;
+            }
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+    if !refused {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    expect(
+        refused,
+        "the daemon exits non-zero instead of starting (relative log_dir)",
+    )?;
+    let refusal = std::fs::read_to_string(ws.root.join("bad-daemon.out.log"))?;
+    expect(
+        refusal.contains("daemon.log_dir") && refusal.contains("absolute"),
+        "the startup refusal names daemon.log_dir and the fix",
+    )?;
+
     // Clean the offline registration so the daemon pass starts clean.
     let out = cli(bin, ws, &["remove", "offline-demo"])?;
     expect(
@@ -488,6 +585,19 @@ fn cli_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         progs.len() == 1 && progs[0].get("program").and_then(|p| p.as_str()) == Some("job"),
         "beta's pending survived the alpha apply",
     )?;
+
+    step("B2. shell pending + scoped apply mirror the CLI with real pending");
+    let out = cli(bin, ws, &["shell", "-e", "pending"])?;
+    expect(
+        out.contains("pending changes") && out.contains("job"),
+        "shell pending lists the changed program",
+    )?;
+    let out = cli(bin, ws, &["shell", "-e", "apply beta"])?;
+    expect(
+        out.contains("update-and-restart") && out.contains("job"),
+        "shell scoped apply reports the per-program result",
+    )?;
+    wait_running(ws, "job")?;
 
     step("C. --restart restarts unchanged programs but keeps user-stopped ones");
     cli(bin, ws, &["stop", "web"])?;
@@ -796,6 +906,676 @@ fn scaffold_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     Ok(())
 }
 
+// -- actions scenario group (actions + glossary change) ----------------------
+
+/// Write the scenario app used by the actions pass: one long-running service
+/// with a custom-action toolbox, a USR1/USR2-trapping program and a plain
+/// sleeper, chained by dependencies so the fan-out order is observable.
+/// The `xkeeper` binary path and daemon config path are baked into the
+/// chained-restart action (the CLI reads connection info from the config).
+fn setup_actions_app(ws: &Workspace, bin: &Path) -> Result<()> {
+    let dir = ws.root.join("acts");
+    std::fs::create_dir_all(&dir)?;
+    let bin_s = bin.display().to_string().replace('\\', "/");
+    let cfg_s = ws.config_arg().replace('\\', "/");
+    let text = format!(
+        r#"[app]
+autostart = false
+
+[program.svc]
+command = "sleep 100000"
+startsecs = 0.2
+
+[program.svc.action.ping]
+command = "echo svc_pid=${{program.svc.pid}} svc_state=${{program.svc.state}}"
+timeout = 10
+
+[program.svc.action.workdir_probe]
+command = "pwd"
+timeout = 5
+
+[program.svc.action.slow]
+command = "sleep 31"
+timeout = 2
+
+[program.svc.action.ring]
+command = "sleep 4"
+timeout = 30
+
+[program.svc.action.chained]
+command = "echo old_svc_pid=${{program.svc.pid}}; {bin} --config {cfg} restart svc; {bin} --config {cfg} pid svc"
+timeout = 60
+
+[program.svc.action.stopped_pid]
+command = "echo stopped_svc_pid=[${{program.svc.pid}}]"
+timeout = 10
+
+[program.svc.action.multiline]
+command = '''
+echo ml-one
+echo ml-two
+'''
+timeout = 10
+
+[program.svc.action.fail3]
+command = "exit 3"
+timeout = 10
+
+[program.signalee]
+command = "sleep 100000"
+startsecs = 0.2
+autorestart = "never"
+depends_on = ["svc"]
+
+[program.trapper]
+command = "sh"
+args = ["-c", "trap '' USR1 USR2; sleep 100000"]
+startsecs = 0.2
+autorestart = "never"
+depends_on = ["signalee"]
+
+[program.logger]
+command = "sh"
+args = ["-c", "while true; do echo tick; sleep 0.2; done"]
+startsecs = 0.2
+autorestart = "never"
+"#,
+        bin = bin_s,
+        cfg = cfg_s,
+    );
+    std::fs::write(dir.join("xkeeper.toml"), text)?;
+    link_registration(&dir.join("xkeeper.toml"), &ws.root.join("apps/acts.toml"))?;
+    Ok(())
+}
+
+/// Offline (daemon not running): declarations validate, bad ones are refused
+/// with actionable errors — charset (breaking tighten), unknown action
+/// variable, built-in reserved word, timeout range.
+fn actions_offline_pass(bin: &Path, ws: &Workspace) -> Result<()> {
+    step("H0. action declarations pass validate");
+    let acts_file = ws.root.join("acts/xkeeper.toml");
+    let out = cli(bin, ws, &["validate", &acts_file.to_string_lossy()])?;
+    expect(
+        out.contains("OK") && out.contains("program(s)"),
+        "the acts config with 7 declared actions validates",
+    )?;
+
+    step("H1. illegal identifier names are refused (dots, spaces, non-ASCII)");
+    let bad_dir = ws.root.join("badcase");
+    std::fs::create_dir_all(&bad_dir)?;
+    let bad_file = bad_dir.join("xkeeper.toml");
+    std::fs::write(&bad_file, "[program.\"my.web\"]\ncommand = 'sleep 1'\n")?;
+    let (ok, code, combined) = cli_try(bin, ws, &["validate", &bad_file.to_string_lossy()])?;
+    expect(!ok, "a dotted program name fails validate")?;
+    expect(code == 1, &format!("validate failure exits 1, got {code}"))?;
+    expect(
+        combined.contains("[A-Za-z0-9_-]"),
+        "the error states the identifier charset",
+    )?;
+    std::fs::write(&bad_file, "[program.\"my web\"]\ncommand = 'sleep 1'\n")?;
+    let (ok, _code, combined) = cli_try(bin, ws, &["validate", &bad_file.to_string_lossy()])?;
+    expect(
+        !ok && combined.contains("[A-Za-z0-9_-]"),
+        "a spaced program name is refused",
+    )?;
+    let (ok, _code, combined) = cli_try(
+        bin,
+        ws,
+        &["add", &acts_file.to_string_lossy(), "--name", "my.app"],
+    )?;
+    expect(
+        !ok && combined.contains("[A-Za-z0-9_-]"),
+        "`add --name my.app` is refused (dots are not identifiers)",
+    )?;
+    let (ok, _code, combined) = cli_try(
+        bin,
+        ws,
+        &["add", &acts_file.to_string_lossy(), "--name", "bad name"],
+    )?;
+    expect(
+        !ok && combined.contains("[A-Za-z0-9_-]"),
+        "`add --name \"bad name\"` is refused (spaces are not identifiers)",
+    )?;
+
+    step("H2. unknown action variables are refused at validate time");
+    std::fs::write(
+        &bad_file,
+        "[program.ok]\ncommand = 'sleep 1'\n\n[program.ok.action.bad]\ncommand = 'curl http://h/?x=${program.ok.hello}'\n",
+    )?;
+    let (ok, _code, combined) = cli_try(bin, ws, &["validate", &bad_file.to_string_lossy()])?;
+    expect(!ok, "an unknown variable field fails validate")?;
+    expect(
+        combined.contains("unknown action variable") && combined.contains("program.ok.hello"),
+        "the error names the offending variable",
+    )?;
+
+    step("H3. built-in action names are reserved");
+    std::fs::write(
+        &bad_file,
+        "[program.ok]\ncommand = 'sleep 1'\n\n[program.ok.action.stop]\ncommand = 'echo nope'\n",
+    )?;
+    let (ok, _code, combined) = cli_try(bin, ws, &["validate", &bad_file.to_string_lossy()])?;
+    expect(
+        !ok && combined.contains("reserved"),
+        "action `stop` is refused as reserved",
+    )?;
+    // Observe-only command names are NOT reserved (glossary 动作词表边界).
+    std::fs::write(
+        &bad_file,
+        "[program.ok]\ncommand = 'sleep 1'\n\n[program.ok.action.status]\ncommand = 'echo hi'\n",
+    )?;
+    let out = cli(bin, ws, &["validate", &bad_file.to_string_lossy()])?;
+    expect(
+        out.contains("OK"),
+        "a custom action named `status` is allowed",
+    )?;
+
+    step("H4. action timeout must be > 0");
+    std::fs::write(
+        &bad_file,
+        "[program.ok]\ncommand = 'sleep 1'\n\n[program.ok.action.t0]\ncommand = 'x'\ntimeout = 0\n",
+    )?;
+    let (ok, _code, combined) = cli_try(bin, ws, &["validate", &bad_file.to_string_lossy()])?;
+    expect(
+        !ok && combined.contains("timeout"),
+        "timeout = 0 is refused",
+    )?;
+    std::fs::write(
+        &bad_file,
+        "[program.ok]\ncommand = 'sleep 1'\n\n[program.ok.action.tn]\ncommand = 'x'\ntimeout = -1\n",
+    )?;
+    let (ok, _code, combined) = cli_try(bin, ws, &["validate", &bad_file.to_string_lossy()])?;
+    expect(
+        !ok && combined.contains("timeout"),
+        "a negative timeout is refused",
+    )?;
+    Ok(())
+}
+
+/// Process-tree helper: pids whose argv contains exactly `arg` (unix only;
+/// windows runs no tree assertions).
+#[cfg(unix)]
+fn pids_with_arg(arg: &str) -> Vec<u32> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return out;
+    };
+    for e in entries.flatten() {
+        let Ok(name) = e.file_name().into_string() else {
+            continue;
+        };
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(cmdline) = std::fs::read(e.path().join("cmdline")) else {
+            continue;
+        };
+        if cmdline.split(|&b| b == 0).any(|a| a == arg.as_bytes()) {
+            out.push(name.parse().unwrap());
+        }
+    }
+    out
+}
+
+fn state_of(ws: &Workspace, program: &str) -> Result<String> {
+    let out = Command::new("curl")
+        .args([
+            "-s",
+            &format!("http://127.0.0.1:{}/v1/programs/{program}", ws.control_port),
+        ])
+        .output()
+        .context("curl program state")?;
+    let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout))?;
+    Ok(v.get("state")
+        .and_then(|s| s.as_str())
+        .unwrap_or("unknown")
+        .to_string())
+}
+
+fn wait_state(ws: &Workspace, program: &str, want: &str) -> Result<()> {
+    wait_state_in(ws, program, &[want])
+}
+
+fn wait_state_in(ws: &Workspace, program: &str, want: &[&str]) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let have = state_of(ws, program)?;
+        if want.contains(&have.as_str()) {
+            return Ok(());
+        }
+        if Instant::now() > deadline {
+            bail!("{program} never reached {want:?} (state {have})");
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+}
+
+/// Online actions pass: fan-out, custom-action contract, signal.
+fn actions_online_pass(bin: &Path, ws: &Workspace) -> Result<()> {
+    // Everything below addresses the acts app; make sure the daemon loaded it.
+    let svc_running = pid_of(ws, "svc")?;
+    expect(svc_running.is_none(), "acts programs are not autostarted")?;
+    let acts_dir = ws.root.join("acts");
+
+    step("H5. `start --app acts` fans out in dependency order");
+    let out = cli(bin, ws, &["start", "--app", "acts"])?;
+    let (psvc, psig, ptrap) = (
+        out.find("  svc:"),
+        out.find("  signalee:"),
+        out.find("  trapper:"),
+    );
+    expect(
+        matches!((psvc, psig, ptrap), (Some(a), Some(b), Some(c)) if a < b && b < c),
+        &format!("fan-out start lists svc < signalee < trapper: {out:?}"),
+    )?;
+    for name in ["svc", "signalee", "trapper"] {
+        wait_running(ws, name)?;
+    }
+
+    if cfg!(unix) {
+        step("H5b. `xkeeper log -f` streams new lines and stays alive (unix)");
+        // logger (started by the fan-out above) echoes `tick` every 0.2s.
+        let follow_path = ws.root.join("follow.out");
+        let follow = std::fs::File::create(&follow_path)?;
+        let mut child = Command::new(bin)
+            .arg("--config")
+            .arg(ws.config_arg())
+            .args(["log", "logger", "--tail", "1", "-f"])
+            .stdout(Stdio::from(follow))
+            .stderr(Stdio::null())
+            .spawn()
+            .context("spawn `log -f`")?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut len1 = 0usize;
+        loop {
+            let text = std::fs::read_to_string(&follow_path).unwrap_or_default();
+            if text.contains("tick") {
+                len1 = text.len();
+                break;
+            }
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("log follow never showed a tick line");
+            }
+            std::thread::sleep(Duration::from_millis(150));
+        }
+        // The stream must keep growing after the initial tail (following,
+        // not a one-shot tail), and the client must still be running.
+        std::thread::sleep(Duration::from_millis(1500));
+        let len2 = std::fs::read_to_string(&follow_path)?.len();
+        expect(
+            len2 > len1,
+            &format!("new lines kept arriving after the tail ({len1} -> {len2} bytes)"),
+        )?;
+        expect(
+            matches!(child.try_wait(), Ok(None)),
+            "`log -f` is still following (no self-exit)",
+        )?;
+        let _ = child.kill();
+        let _ = child.wait()?;
+    }
+
+    step("H5c. control-plane API: status JSON, 409 transition, 404 unknown targets");
+    let (code, body) = api_checked(ws, "GET", "/v1/status", "")?;
+    expect(
+        code == 200,
+        &format!("GET /v1/status answers 200, got {code}"),
+    )?;
+    expect(
+        body.contains("\"daemon\"")
+            && body.contains("\"programs\"")
+            && body.contains("\"unhealthy\"")
+            && body.contains("\"pid\""),
+        "status JSON carries daemon info and per-program pid/unhealthy",
+    )?;
+    let (code, body) = api_checked(ws, "POST", "/v1/programs/svc/start", "{}")?;
+    expect(
+        code == 409,
+        &format!("starting a running program is 409, got {code}"),
+    )?;
+    expect(
+        body.contains("already"),
+        "the 409 explains the invalid transition",
+    )?;
+    let (code, _) = api_checked(ws, "GET", "/v1/programs/ghost", "")?;
+    expect(code == 404, &format!("unknown program is 404, got {code}"))?;
+    let (code, body) = api_checked(ws, "POST", "/v1/programs/ghost/start", "{}")?;
+    expect(
+        code == 404,
+        &format!("starting an unknown program is 404, got {code}"),
+    )?;
+    expect(
+        body.contains("unknown program"),
+        "the 404 names the unknown program",
+    )?;
+    let (code, _) = api_checked(ws, "POST", "/v1/programs/svc/actions/nosuch", "{}")?;
+    expect(code == 404, &format!("unknown action is 404, got {code}"))?;
+    let (code, _) = api_checked(ws, "POST", "/v1/apps/ghost/start", "{}")?;
+    expect(
+        code == 404,
+        &format!("unknown app fan-out is 404, got {code}"),
+    )?;
+    // The CLI surfaces the same answers with exit code 1.
+    let (ok, code, combined) = cli_try(bin, ws, &["action", "svc", "nosuch"])?;
+    expect(
+        !ok && code == 1,
+        &format!("unknown action exits 1, got {code}"),
+    )?;
+    expect(combined.contains("404"), "the CLI error reports the 404")?;
+    let (ok, code, combined) = cli_try(bin, ws, &["start", "--app", "ghost"])?;
+    expect(
+        !ok && code == 1,
+        &format!("unknown app fan-out exits 1, got {code}"),
+    )?;
+    expect(
+        combined.contains("unknown app") || combined.contains("404"),
+        "the CLI error names the unknown app",
+    )?;
+
+    step("H6. custom action runs with variable substitution");
+    wait_state(ws, "svc", "running")?;
+    let svc_pid = pid_of(ws, "svc")?.expect("svc has a pid");
+    let out = cli(bin, ws, &["action", "svc", "ping"])?;
+    expect(
+        out.contains(&format!("svc_pid={svc_pid}")),
+        &format!("${{program.svc.pid}} substituted with the real pid: {out:?}"),
+    )?;
+    expect(
+        out.contains("svc_state=running"),
+        "state variable resolves to running",
+    )?;
+
+    step("H6b. a multi-line command runs as one shell script");
+    let out = cli(bin, ws, &["action", "svc", "multiline"])?;
+    expect(
+        out.contains("ml-one") && out.contains("ml-two"),
+        &format!("both lines of the multi-line command executed: {out:?}"),
+    )?;
+
+    step("H6c. `xkeeper action` passes the action's own exit code through");
+    let (ok, code, combined) = cli_try(bin, ws, &["action", "svc", "fail3"])?;
+    expect(
+        !ok && code == 3,
+        &format!("an exit-3 action exits 3, got {code}"),
+    )?;
+    expect(
+        combined.contains("exited with code 3"),
+        "the failure explains the action's exit code",
+    )?;
+
+    step("H7. the action cwd is the program's work_dir");
+    let out = cli(bin, ws, &["action", "svc", "workdir_probe"])?;
+    expect(
+        out.trim() == acts_dir.to_str().unwrap(),
+        &format!("pwd == work_dir ({}): {out:?}", acts_dir.display()),
+    )?;
+
+    step("H8. timeout kills the action process tree");
+    let t0 = Instant::now();
+    let (ok, code, combined) = cli_try(bin, ws, &["action", "svc", "slow"])?;
+    let elapsed = t0.elapsed();
+    expect(!ok, "a timed-out action fails the call")?;
+    expect(code == 1, &format!("timeout exits 1, got {code}"))?;
+    expect(
+        combined.contains("timed out"),
+        "the error says the action timed out",
+    )?;
+    expect(
+        elapsed < Duration::from_secs(20),
+        &format!("returned near the 2s timeout, took {elapsed:?} (sleep 31 was killed)"),
+    )?;
+    expect(
+        pid_of(ws, "svc")? == Some(svc_pid),
+        "the supervised program is unaffected by the action timeout",
+    )?;
+    #[cfg(unix)]
+    {
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while Instant::now() < deadline && !pids_with_arg("31").is_empty() {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        expect(
+            pids_with_arg("31").is_empty(),
+            "no `sleep 31` survives the tree kill (/proc scan)",
+        )?;
+    }
+
+    step("H9. same (program, action) is mutually exclusive, no queueing");
+    // Fire the first ring call in the background (sleep 4, timeout 30),
+    // then race a second one in: it must hit the 409, not queue.
+    let handle = std::thread::spawn({
+        let bin = bin.to_path_buf();
+        let cfg = ws.config_arg();
+        move || {
+            let out = Command::new(&bin)
+                .arg("--config")
+                .arg(&cfg)
+                .args(["action", "svc", "ring"])
+                .output()
+                .expect("run first ring");
+            (
+                out.status.success(),
+                out.status.code().unwrap_or(-1),
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                ),
+            )
+        }
+    });
+    std::thread::sleep(Duration::from_millis(700));
+    let (ok2, code2, combined2) = cli_try(bin, ws, &["action", "svc", "ring"])?;
+    expect(!ok2, "the concurrent second call is refused")?;
+    expect(
+        code2 == 1,
+        &format!("conflict exits 1, got {code2}: {combined2:?}"),
+    )?;
+    expect(
+        combined2.contains("409") || combined2.contains("already running"),
+        "the error says the action is already running",
+    )?;
+    let (ok1, code1, _) = handle.join().unwrap();
+    expect(
+        ok1 && code1 == 0,
+        "the first ring call completed normally (exit 0)",
+    )?;
+    expect(
+        pid_of(ws, "svc")? == Some(svc_pid),
+        "mutual exclusion left the program untouched",
+    )?;
+
+    step("H10. an action can chain `xkeeper restart` via the control plane");
+    let out = cli(bin, ws, &["action", "svc", "chained"])?;
+    expect(
+        out.contains(&format!("old_svc_pid={svc_pid}")),
+        "the substitution saw the pre-restart pid",
+    )?;
+    let new_pid = wait_running(ws, "svc")?;
+    expect(
+        new_pid != svc_pid,
+        "the chained restart replaced the process",
+    )?;
+    expect(
+        out.contains(&new_pid.to_string()),
+        &format!("the action observed the new pid ({new_pid}): {out:?}"),
+    )?;
+
+    step("H11. actions run for stopped programs; pid substitutes to empty");
+    cli(bin, ws, &["stop", "svc"])?;
+    wait_state(ws, "svc", "stopped")?;
+    let out = cli(bin, ws, &["action", "svc", "stopped_pid"])?;
+    expect(
+        out.contains("stopped_svc_pid=[]"),
+        &format!("the pid of a stopped program is an empty string: {out:?}"),
+    )?;
+
+    if cfg!(unix) {
+        step("H12. signal: whitelist in/out, case-insensitive, not-running (unix)");
+        // USR2 lowercase: accepted, normalized; the trapper ignores USR1/USR2,
+        // so its state machine must stay running with the same pid.
+        let trap_pid = wait_running(ws, "trapper")?;
+        let out = cli(bin, ws, &["signal", "trapper", "usr2"])?;
+        expect(out.contains("delivered"), "lowercase usr2 is accepted")?;
+        expect(
+            pid_of(ws, "trapper")? == Some(trap_pid),
+            "the trapped process survived USR2",
+        )?;
+        expect(
+            state_of(ws, "trapper")? == "running",
+            "signal did not change the state machine",
+        )?;
+        let out = cli(bin, ws, &["signal", "trapper", "USR1"])?;
+        expect(out.contains("delivered"), "USR1 delivered to the trapper")?;
+        expect(
+            state_of(ws, "trapper")? == "running",
+            "trapper still running after USR1",
+        )?;
+        // KILL is off-whitelist; the error points at stop.
+        let (ok, code, combined) = cli_try(bin, ws, &["signal", "trapper", "KILL"])?;
+        expect(!ok && code == 1, "KILL exits 1")?;
+        expect(
+            combined.contains("whitelist") && combined.contains("stop"),
+            "the error explains the whitelist and the stop alternative",
+        )?;
+        expect(
+            pid_of(ws, "trapper")? == Some(trap_pid),
+            "the rejected signal did not touch the program",
+        )?;
+        // TERM really terminates (signalee has autorestart = never).
+        let out = cli(bin, ws, &["signal", "signalee", "TERM"])?;
+        expect(out.contains("delivered"), "TERM delivered")?;
+        wait_state(ws, "signalee", "exited")?;
+        // No live child anymore: signaling must fail.
+        let (ok, code, combined) = cli_try(bin, ws, &["signal", "signalee", "USR1"])?;
+        expect(!ok && code == 1, "signaling an exited program exits 1")?;
+        expect(
+            combined.contains("not running"),
+            "the error says there is no child to signal",
+        )?;
+    } else {
+        println!("    (windows: signal scenarios require unix; skipping)");
+    }
+
+    step("H13. `stop --app acts` runs in reverse order");
+    let out = cli(bin, ws, &["stop", "--app", "acts"])?;
+    let (ptrap, psig, psvc) = (
+        out.find("  trapper:"),
+        out.find("  signalee:"),
+        out.find("  svc:"),
+    );
+    expect(
+        matches!((ptrap, psig, psvc), (Some(a), Some(b), Some(c)) if a < b && b < c),
+        &format!("fan-out stop lists trapper < signalee < svc (reverse): {out:?}"),
+    )?;
+    // signalee was TERM-signaled to exit in H12 (autorestart never): a
+    // terminal state (exited) is as stopped as stopped itself — fan-out stop
+    // must simply not leave anything running.
+    for name in ["svc", "signalee", "trapper"] {
+        wait_state_in(ws, name, &["stopped", "exited"])?;
+    }
+
+    step("H14. fan-out start covers user_stopped programs (issued from the shell)");
+    // Every acts program is user-stopped at this point (explicit stop above
+    // and in H11); the fan-out start must pull all of them up and clear the
+    // marker. Issued via the shell to prove the shell verb fans out too.
+    let out = cli(bin, ws, &["shell", "-e", "start --app acts"])?;
+    expect(
+        matches!((out.find("  svc:"), out.find("  signalee:"), out.find("  trapper:")),
+            (Some(a), Some(b), Some(c)) if a < b && b < c),
+        "fan-out start again lists all three in dependency order",
+    )?;
+    for name in ["svc", "signalee", "trapper"] {
+        wait_running(ws, name)?;
+        expect(
+            matches!(state_of(ws, name)?.as_str(), "running" | "starting"),
+            &format!("user-stopped {name} was started by the fan-out (marker cleared)"),
+        )?;
+    }
+
+    step("H15. shell: status table, unknown-command tolerance, restart, action exit code");
+    // status table: program name is the primary column, app is attribution.
+    let out = cli(bin, ws, &["shell", "-e", "status"])?;
+    expect(
+        ["NAME", "APP", "STATE", "PID", "RESTARTS", "UNHEALTHY"]
+            .iter()
+            .all(|h| out.contains(h)),
+        &format!("shell status prints the aligned table header: {out:?}"),
+    )?;
+    expect(
+        out.contains("svc") && out.contains("acts"),
+        "rows name the program with its app as a separate column",
+    )?;
+
+    // REPL: an unknown command is reported (with a did-you-mean hint) and the
+    // shell keeps reading — piped stdin drives the non-TTY fallback path.
+    let svc_pid2 = wait_running(ws, "svc")?;
+    let mut repl = Command::new(bin)
+        .arg("--config")
+        .arg(ws.config_arg())
+        .arg("shell")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawn shell repl")?;
+    {
+        use std::io::Write;
+        repl.stdin
+            .as_mut()
+            .expect("stdin piped")
+            .write_all(b"sttaus\npid svc\nexit\n")?;
+    }
+    let repl_out = repl.wait_with_output()?;
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&repl_out.stdout),
+        String::from_utf8_lossy(&repl_out.stderr)
+    );
+    expect(
+        repl_out.status.success(),
+        "the shell leaves via `exit` with code 0",
+    )?;
+    expect(
+        combined.contains("unknown command"),
+        "the typo is reported as an unknown command",
+    )?;
+    expect(
+        combined.contains("status"),
+        "the did-you-mean hint suggests `status`",
+    )?;
+    expect(
+        combined.contains(&svc_pid2.to_string()),
+        "the shell kept reading after the typo (`pid svc` answered)",
+    )?;
+
+    // restart through the shell hits the same control plane (same migration).
+    let old_pid = wait_running(ws, "svc")?;
+    let out = cli(bin, ws, &["shell", "-e", "restart svc"])?;
+    expect(
+        out.contains("svc"),
+        &format!("shell restart reports the program: {out:?}"),
+    )?;
+    let new_pid = wait_running(ws, "svc")?;
+    expect(
+        new_pid != old_pid,
+        "shell restart replaced the process like the CLI does",
+    )?;
+
+    // shell -e passes the action's own exit code through (like `xkeeper action`).
+    let (ok, code, combined) = cli_try(bin, ws, &["shell", "-e", "action svc fail3"])?;
+    expect(
+        !ok && code == 3,
+        &format!("shell action exit-3 → exit 3, got {code}"),
+    )?;
+    expect(
+        combined.contains("exited with code 3"),
+        "the shell explains the action's failure",
+    )?;
+    Ok(())
+}
+
 // -- browser pass -----------------------------------------------------------------
 
 /// Drive the embedded console with playwright (node script via npx-resolved
@@ -980,6 +1760,9 @@ pub(crate) fn run(args: Args) -> Result<()> {
     let started = Instant::now();
     let bin = crate::build_daemon()?;
     let ws = setup_workspace("main")?;
+    // The actions scenario app must exist before the daemon boots (bootstrap
+    // loads it, autostart = false keeps everything under our control).
+    setup_actions_app(&ws, &bin)?;
 
     println!(
         "workspace: {}\ndaemon: webui 127.0.0.1:{}, control 127.0.0.1:{}",
@@ -989,9 +1772,11 @@ pub(crate) fn run(args: Args) -> Result<()> {
     );
     // Offline scenarios first: the daemon must NOT be running yet.
     offline_pass(&bin, &ws)?;
+    actions_offline_pass(&bin, &ws)?;
     let mut daemon = spawn_daemon(&bin, &ws)?;
     let result = (|| {
         cli_pass(&bin, &ws)?;
+        actions_online_pass(&bin, &ws)?;
         if args.no_browser {
             println!("\n(--no-browser: skipping browser pass)");
         } else {
