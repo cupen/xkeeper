@@ -43,6 +43,23 @@ Linux 与 Windows 上行为一致：崩溃自动拉起、启动顺序与依赖�
 字段优先级（高 → 低）：`[program.*]` 显式字段 > app 配置 `[app]` 表 >
 daemon `[app-default]` > 内置默认。`autostart`/`priority` 是应用级字段。
 
+## 术语表
+
+权威定义以 `openspec/specs/glossary/spec.md` 为准，速查：
+
+| 术语 | 定义 |
+| --- | --- |
+| daemon（守护进程） | 全局唯一的 xkeeper 监督进程本体，持有 daemon 配置与 `app_dir`，唯一执行监督循环的实体 |
+| app（应用） | 注册的部署单元；配置本体为部署目录中的 `xkeeper.toml`，注册记录为 `app_dir` 中的链接。app 不是进程，是程序的容器 |
+| program（程序） | app 配置 `[program.<name>]` 定义的被守护子进程，有独立状态机与日志流；名称跨全部已注册应用**全局唯一**，任一面板用程序名即可无歧义寻址 |
+| action（动作） | 面向 daemon/app/program 发出的执行指令；分**内置动作**（start/stop/restart/signal/reload/shutdown，实现于 xkeeper 自身）与**自定义动作**（配置声明、映射为 shell 命令执行） |
+
+标识符规则：app 名、程序名、动作名统一只允许英文字母、数字、下划线与连字符
+（`[A-Za-z0-9_-]+`）。点号、空格、非 ASCII 一律校验拒绝——`gateway.api`
+这类复合名只会被当作非法标识符，不会被解释为 `app.program` 寻址语法。
+观察类命令（status/pid/log/list/pending）与 `apply` 不属于动作词表，
+自定义动作可以叫 `status` 而不冲突。
+
 ## 快速上手
 
 ```bash
@@ -64,6 +81,9 @@ xkeeper run
 xkeeper status
 xkeeper stop myapp-程序名
 xkeeper log <程序名> --tail 50 -f
+xkeeper signal <程序名> USR1     # 向子进程投递白名单信号（unix）
+xkeeper restart --app myapp     # 对整个 app 扇出（按启动排序，停止逆序）
+xkeeper action api flush        # 执行自定义动作（退出码透传）
 xkeeper reload                 # 重扫配置并检出待应用变更（pending），不触碰任何进程
 xkeeper apply                  # 应用待应用变更（apply all 等价；apply demo / apply demo web 限定范围）
 xkeeper apply --restart        # 无变更的程序也重启（手动停止的保持停止）
@@ -108,7 +128,7 @@ env = { FOO = "bar" }
 startsecs = 1.0             # 存活超过此时长才算启动成功（预算 startretries 次失败）
 stop_timeout = 10
 exit_codes = [0]            # on-failure 的"期望退出码"
-depends_on = ["db.main"]    # 可跨应用引用；成环在注册期拒绝
+depends_on = ["db"]         # 可跨应用引用（写程序名，全局唯一）；成环在注册期拒绝
 log_max_size = "10MB"       # 可选；缺省 50MB，"0" 显式禁用轮转
 log_rotate_keep = 2          # 可选；缺省保留 2 份轮转文件
 health_check = "http://127.0.0.1:8000/health"   # http(s):// | tcp://host:port | exec 命令行
@@ -167,16 +187,89 @@ restart_on_unhealthy = true # unhealthy 触发与崩溃一致的重启
 - 依赖编排：priority 小者先启动；依赖未 running 则等待；依赖 fatal/exited
   则依赖方进入 fatal（原因注明）；关闭按逆序停止
 
+## 动作（action）
+
+动作是改变运行状态的执行指令，按目标分层（权威定义见
+`openspec/specs/actions/spec.md`）：
+
+| 层级 | 动作 | 入口 |
+| --- | --- | --- |
+| daemon | shutdown、reload | 既有命令，语义不变 |
+| program | start、stop、restart | 既有命令；signal 见下 |
+| program | 自定义动作 | `xkeeper action <program> <动作名>`，配置声明见下 |
+| app | start、stop、restart 扇出 | `xkeeper start|stop|restart --app <名>` |
+
+**app 扇出**：作用于该 app 全部程序，排序复用启动规则——启动按依赖拓扑序
+（同名次按字典序），停止按逆序；逐程序复用既有 start/stop/restart 逻辑，
+所以扇出 start 会拉起手动停止的程序（并清除 user_stopped 标记），输出逐程序
+结果。裸 `xkeeper start <程序名>` 语义不变。
+
+**signal（内置动作，unix）**：`xkeeper signal <程序名> <SIGNAL>` 向该程序的
+子进程 pid 投递信号（不投进程组——清理进程组是 stop 的语义）。白名单：
+`TERM INT HUP QUIT USR1 USR2`（大小写不敏感，可带 `SIG` 前缀）；白名单外
+（含 KILL/STOP/CONT）报错——需要停止请用 `xkeeper stop`。投递成功不改变
+程序状态机；Windows 上明确报平台不支持。
+
+### 自定义动作
+
+在 app 配置的程序表下声明（字段仅 `command` 必填 + `timeout` 可选，缺省
+30 秒且必须 > 0）：
+
+```toml
+[program.api]
+command = "python -m http.server 8000"
+
+[program.api.action.flush]
+command = "curl -fsS http://127.0.0.1:8000/flush?pid=${program.api.pid}"
+timeout = 10
+
+[program.api.action.upgrade]
+# TOML 多行字符串整段交给平台 shell：管道/重定向/&& 都可用
+command = """
+set -e
+cd /opt/myapp
+git pull && ./build.sh
+xkeeper restart api          # 动作中链式控制命令：CLI 自动读取 daemon 配置连接控制面
+"""
+```
+
+执行契约（actions 规范）：
+
+- **经平台 shell 执行**：unix `/bin/sh -c`、Windows `cmd /C`。这是与程序
+  `command` 字段（词法拆分直 spawn、不经 shell）的有意分叉：动作是运维者
+  编写的维护逻辑，shell 语义是核心价值。多行命令整段作为脚本文本；也可
+  `bash scripts/upgrade.sh` 调用外部脚本（相对路径按程序 `work_dir` 解析）。
+- **变量替换**：`${...}` 中以已知域开头的引用在 spawn 期替换——
+  `program.<名>.pid|state|app|work_dir|log_dir`、`app.<名>.path`、
+  `daemon.pid|host|port|log_dir|app_dir`（程序名全局唯一，可跨程序引用）。
+  程序未运行时其 `pid` 替换为**空串**。`validate`/`reload` 会拒绝未知字段
+  （拼错即报）；**非已知域的 `${...}` 原样保留给 shell**——`${HOME}` 等
+  shell 变量不受影响。
+- **互斥**：同一程序的同名动作执行中再次调用返回冲突（API 409 / CLI 退出
+  码 1），不排队；同一程序的不同动作允许并行。
+- **超时**：超过 `timeout` 终止整个动作进程树（unix 杀进程组 / Windows
+  Job Object），响应标记 `timed_out`。
+- **输出去向**：完整输出按行写入 daemon 日志（前缀
+  `[program.<程序>.action.<动作>]`）；调用响应只带截断的输出尾部。动作不进
+  状态投影，webui 不展示。
+- 动作执行不阻塞监督循环（独立工作线程）；动作命令等于配置作者在本机的
+  任意代码执行能力，与 health exec 同级信任模型，调用面受 Bearer 鉴权覆盖。
+
 ## 控制平面
 
 守护进程在 `host:port`（默认回环 7310）提供 JSON API：
 `GET /v1/health|status|programs|programs/{name}|programs/{name}/logs`，
-`POST /v1/programs/{name}/start|stop|restart`、`/v1/reload`（检出 pending 并返回预览）、
+`POST /v1/programs/{name}/start|stop|restart`、`/v1/programs/{name}/signal`（白名单信号）、
+`/v1/programs/{name}/actions/{动作}`（同步执行自定义动作，返回退出码/耗时/超时标记/输出尾部）、
+`/v1/apps/{name}/start|stop|restart`（app 扇出，返回逐程序结果）、
+`/v1/reload`（检出 pending 并返回预览）、
 `GET /v1/pending`、`POST /v1/apply`、`/v1/shutdown`。
 配置 `auth_token` 后除 `/v1/health` 外都要求 `Authorization: Bearer <token>`。
 `GET /v1/programs/{name}/logs?stream=out|err&tail=N&follow=1` 支持流式跟随。
 
 CLI 退出码：`0` 成功、`1` 一般错误、`2` 配置错误、`3` 守护进程不可达。
+例外：`xkeeper action` 成功时**透传动作自身的退出码**（超时/调用失败为 1，
+守护不可达为 3）。
 
 Web 控制台（`xkeeper webui`）在同一守护进程内另开一个回环端口，伺服内嵌 UI、
 `/api/*` 查询与 `/ws` WebSocket 推送——状态投影与本控制面完全一致（见下文 Web UI）。
@@ -191,7 +284,9 @@ xkeeper shell -e "status"            # 单命令模式：执行一条后退出�
 ```
 
 内置命令：`status`（对齐表格：NAME/APP/STATE/PID/RESTARTS/UNHEALTHY）、
-`start|stop|restart <name>`、`pid <name>`、`log <name> [-f] [--tail N] [--stream out|err]`、
+`start|stop|restart <name>`（或 `--app <app>` 扇出，语义同 CLI）、
+`action <program> <action>`（输出尾部；`-e` 模式退出码透传动作退出码）、
+`signal <program> <SIGNAL>`、`pid <name>`、`log <name> [-f] [--tail N] [--stream out|err]`、
 `pending`、`apply [<app> [<program>]] [--restart]`、`shutdown`、`open`（用系统浏览器打开 webui 控制台）、`help`/`?`、`exit`/`quit`。
 
 ### 一键打开控制台（`xkeeper system webui`）
@@ -313,6 +408,17 @@ v0.1 单文件配置（`[daemon]` + `[[program]]`）在 `xkeeper add <旧文件>
 自动识别并转换：程序转写为 `[program.*]` 注册为一个应用，`[daemon]` 段提示
 并入 daemon 配置，原文件不修改。
 
+## 升级注意（标识符字符集收紧）
+
+应用名、程序名与自定义动作名现在只允许 `[A-Za-z0-9_-]`（英文字母、数字、
+下划线、连字符）。含点号、空格或非 ASCII 字符的既有名字升级后会被
+validate/reload 拒绝。迁移步骤：升级二进制 → `xkeeper validate`（暴露全部
+违规名）→ 改名（`xkeeper.toml` 中的表键与 `depends_on` 引用）→
+`xkeeper reload && xkeeper apply`。
+
+回滚提示：`[program.<名>.action.*]` 动作表是新增配置结构，旧版本二进制
+会因未知字段拒绝整个 app 配置——回滚前先移除这些表再降级。
+
 ## 作为系统服务运行（守护 xkeeper 本身）
 
 Linux (systemd) 一条命令安装/卸载（需要 root）：
@@ -351,7 +457,9 @@ xkeeper 被强杀时，Windows 上子进程树由 Job Object（kill-on-close）�
 - Linux 上 `/etc/xkeeper/daemon.toml` 需 root 写权限：非 root 用户执行 add/remove
   请用 sudo，或 `-c/--config` 指向用户级 daemon 配置。
 - 单行 `command` 只做词法拆分（空白 + 引号），不经过 shell；需要 shell 语义
-  显式写 `bash -c "..."`。
+  显式写 `bash -c "..."`。自定义动作的 `command` 相反，整体交给平台 shell
+  （unix `/bin/sh -c`、Windows `cmd /C`），见「动作」一节。
+- `signal` 动作仅 unix：Windows 上返回明确的平台不支持错误。
 
 ## 测试
 
@@ -360,5 +468,14 @@ cargo test
 ```
 
 覆盖：分层配置解析与四层优先级、单行 command 拆分、健康检查协议分发、
-跨应用重名/依赖成环校验、legacy 导入、日志轮转与环形缓冲、7 态状态机
+跨应用重名/依赖成环校验、标识符字符集校验、动作定义表校验（保留字/变量名/
+timeout）与变量替换、动作执行（捕获/超时杀树/互斥）、signal 白名单、
+app 扇出排序、legacy 导入、日志轮转与环形缓冲、7 态状态机
 （真实子进程：重启/启动预算/策略/停止/落盘）、tcp/http/exec 探测。
+
+跨进程验收（真实 daemon + CLI + HTTP，含动作全链路/signal/--app 扇出/
+字符集拒绝场景）：
+
+```bash
+cargo run -p xtask -- e2e --no-browser
+```
