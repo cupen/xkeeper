@@ -2192,6 +2192,145 @@ fn webui_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     Ok(())
 }
 
+
+// -- bench smoke (add-xkeeper-bench) ----------------------------------------------
+
+/// Build the bench binary quietly; returns its path (same profile as the
+/// daemon binary we just built).
+fn build_bench() -> Result<PathBuf> {
+    let root = repo_root();
+    let status = Command::new("cargo")
+        .args(["build", "--quiet", "-p", "xkeeper-bench"])
+        .current_dir(&root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("failed to run cargo build -p xkeeper-bench")?;
+    if !status.success() {
+        bail!("cargo build -p xkeeper-bench failed");
+    }
+    Ok(root.join("target/debug/xkeeper-bench"))
+}
+
+/// Temp dirs that follow the bench spawn-workspace naming
+/// (`xk-bench-<pid>-<nanos>`); anything present after a bench run is residue.
+#[cfg(unix)]
+fn bench_workspaces() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            let rest = match name.strip_prefix("xk-bench-") {
+                Some(r) => r,
+                None => continue,
+            };
+            let mut parts = rest.split('-');
+            let numeric =
+                |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+            if let (Some(a), Some(b)) = (parts.next(), parts.next()) {
+                if numeric(a) && numeric(b) && parts.next().is_none() {
+                    out.push(e.path());
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(not(unix))]
+fn bench_workspaces() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+/// Bench smoke: a short firehose run of the real `xkeeper-bench` binary
+/// (spawning its own isolated daemon on a random port) — verifies the bench
+/// wiring, the JSON report contract and the cleanup guarantee.
+fn bench_pass(bin: &Path, ws: &Workspace) -> Result<()> {
+    step("L. bench smoke: xkeeper-bench firehose cycles its own isolated daemon");
+    let bench = build_bench()?;
+    let json = ws.root.join("bench-report.json");
+    let out = Command::new(&bench)
+        .args([
+            "--case",
+            "firehose",
+            "--log-rows",
+            "20000",
+            "--duration",
+            "30",
+            "--daemon",
+            bin.to_str().unwrap(),
+            "--json",
+            json.to_str().unwrap(),
+        ])
+        .output()
+        .context("run xkeeper-bench")?;
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    expect(
+        out.status.success(),
+        &format!("xkeeper-bench exits 0 ({stderr})"),
+    )?;
+    expect(
+        stdout.contains("rows/s") && stdout.contains("integrity"),
+        "the human-readable table lands on stdout",
+    )?;
+    expect(json.is_file(), "the JSON report was written")?;
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&json)?)?;
+    expect(v["case"] == "firehose", "the report names the case")?;
+    expect(
+        v["aggregate"]["rows"] == 20000,
+        "the row bound is honored exactly (20000 rows)",
+    )?;
+    expect(
+        v["aggregate"]["rows_per_sec"].as_f64().unwrap_or(0.0) > 0.0,
+        "rows/s is a positive number",
+    )?;
+    expect(v["integrity"]["pass"] == true, "integrity passed")?;
+    expect(
+        v["bin_versions"]["xkeeper"].is_string(),
+        "the xkeeper version is recorded in the report",
+    )?;
+    expect(
+        v["wall_time_secs"].as_f64().unwrap_or(0.0) > 0.0,
+        "wall_time_secs is a positive number",
+    )?;
+    expect(
+        v["aggregate"]["bytes"].as_u64().unwrap_or(0) > 0
+            && v["aggregate"]["bytes_per_sec"].as_f64().unwrap_or(0.0) > 0.0,
+        "bytes and bytes/s are reported",
+    )?;
+    expect(v["rotation_count"] == 0, "firehose rotates nothing")?;
+    expect(
+        v["programs"][0]["name"] == "xkeeper-bench-firehose",
+        "the load program carries the bench prefix",
+    )?;
+    if cfg!(unix) {
+        expect(
+            v["daemon_rss"]["peak_kib"].as_u64().unwrap_or(0) > 0,
+            "spawn mode samples the daemon RSS",
+        )?;
+    }
+    expect(
+        stderr.contains("[bench]"),
+        "progress/diagnostics land on stderr",
+    )?;
+    expect(
+        !stdout.contains("[bench]"),
+        "stdout stays free of progress noise",
+    )?;
+    if cfg!(unix) {
+        expect(
+            pids_with_arg("__generate").is_empty(),
+            "no leftover generator processes",
+        )?;
+    }
+    expect(
+        bench_workspaces().is_empty(),
+        "no leftover bench temp workspaces",
+    )?;
+    Ok(())
+}
+
 // -- browser pass -----------------------------------------------------------------
 
 /// Drive the embedded console with playwright (node script via npx-resolved
@@ -2400,6 +2539,7 @@ pub(crate) fn run(args: Args) -> Result<()> {
         } else {
             browser_pass(&ws)?;
         }
+        bench_pass(&bin, &ws)?;
         Ok(())
     })();
 

@@ -1760,6 +1760,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "xkeeper-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ctrlc",
+ "serde",
+ "serde_json",
+ "toml",
+ "ureq",
+]
+
+[[package]]
 name = "xtask"
 version = "0.1.0"
 dependencies = [

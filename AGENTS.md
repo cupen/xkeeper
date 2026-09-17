@@ -19,6 +19,9 @@ stdout/stderr 落盘、Ctrl+C / SIGTERM 优雅停机、Windows Job Object 清理
   `src/health.rs` — 健康探测；`src/client.rs` — CLI HTTP 客户端。
 - `src/server.rs` — 控制平面：std 手写 HTTP（`/v1/*`，可选 Bearer 鉴权），
   状态投影（`StatusDoc`/`ProgramInfo`）由此导出。
+- `xkeeper-bench/` — 独立基准测量二进制（workspace 成员）：日志生成器 =
+  bench 二进制自我重入（隐藏 `__generate`），指标全部从 `/v1` 投影与磁盘日志
+  外部采集（daemon 侧零改动）；轮转对账/清理契约见 README「性能基准」。
 - `src/web.rs` + `src/api.rs` — Web 控制台（配置驱动：`[webui]` 段开启，
   supervisor 管理线程按意图 spawn/停 `web::serve`，reload 热生效）：axum 伺服内嵌
   SPA + `/api/*`（复用控制面投影）+ `/ws` 推送（快照/增量/日志/心跳，
@@ -41,11 +44,17 @@ pnpm dev                               # HMR dev server（:5273），代理 /api
 
 cargo run -p xtask -- e2e             # 验收 e2e：CLI 检出/apply/范围/--restart/add 场景
                                        #   + playwright 驱动真实浏览器的 webui 交互（--no-browser 跳过浏览器段）
+                                       #   + xkeeper-bench firehose 冒烟（JSON 报告 + 清理断言）
 cargo run -- validate                  # 校验 daemon 配置 + 全部注册应用
 cargo run -- run                       # 守护（daemon 配置含 [webui] 段时伺服内嵌控制台；
                                        #   config --set webui.listen=... + reload 可热开启）
 cargo run -- status                    # 控制面 CLI（默认端口 7310）
-```
+
+cargo run -p xkeeper-bench -- --case firehose --duration 10
+                                       # 性能基准：firehose/rotation/fanout/drip 四 case；
+                                       #   缺省自带隔离环境（临时 workspace + 随机端口），
+                                       #   --connect <addr> 连同机已运行 daemon（--token Bearer），
+                                       #   --json <path> 导出机器可读报告；无阈值门禁
 
 ## OpenSpec 规范驱动开发（`.agents`）
 

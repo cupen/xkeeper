@@ -516,6 +516,54 @@ xkeeper 被强杀时，Windows 上子进程树由 Job Object（kill-on-close）�
   （unix `/bin/sh -c`、Windows `cmd /C`），见「动作」一节。
 - `signal` 动作仅 unix：Windows 上返回明确的平台不支持错误。
 
+## 性能基准（`xkeeper-bench`）
+
+独立二进制 `xkeeper-bench`（workspace 成员 crate，随 workspace 一同构建）对真实
+xkeeper daemon 做负载基准测量：按 case 拉起负载、从既有 `/v1` 控制面与磁盘日志
+**纯外部**采集指标，输出人类可读报告（stdout）与 `--json` 机器可读结果（rows/s、
+bytes/s、峰值/均值 RSS、轮转次数、wall time、逐行完整性校验）。退出码只反映运行
+成败，不做阈值门禁——版本间回归请自行对比两次 JSON。
+
+```bash
+# 自带隔离环境（缺省）：临时 workspace 拉起自己的 daemon 与负载程序，结束自动清理
+xkeeper-bench --case firehose --duration 10
+
+# 连接已运行的 daemon（同机；daemon 开启 Bearer 鉴权时加 --token）
+xkeeper-bench --case firehose --connect 127.0.0.1:7310 --token <tok>
+
+# 导出机器可读报告
+xkeeper-bench --case rotation --log-rows 200000 --json report.json
+```
+
+四个 case（`--case`，必选）：
+
+| case | 语义 | 看什么 |
+|---|---|---|
+| `firehose` | 单程序全速（或 `--rate` 定速）产出 | 泵/落盘链路吞吐上限（rows/s、bytes/s） |
+| `rotation` | bench 自动设定小轮转阈值 + 足够 keep | 高频轮转下的逐行完整性与轮转次数 |
+| `fanout` | `--programs` 个程序并行，stdout/stderr 双流 | 聚合吞吐与每程序吞吐分解 |
+| `drip` | 低速率稳态长跑（缺省 100 行/秒） | daemon RSS 峰值/均值（内存有界性） |
+
+负载量界参数（任一先到即终止）：`--log-rows`（每程序总行数，0/缺省不限）、
+`--log-row-size`（单行载荷字节数，缺省 128）、`--log-total-size`（全部程序合计
+字节上限）、`--rate`（行/秒，0 = 全速；drip 缺省用内置 100）、`--duration`
+（墙钟上限，缺省 30 秒）、`--programs`（fanout 程序数，缺省 4，仅 fanout 消费）。
+负数/非数字等非法组合以非零码拒绝。
+
+- **负载程序** = bench 二进制自我重入（隐藏 `__generate` 模式），作为 daemon 普通
+  子进程精确控速产出真实日志；行内嵌 `[流] 序号 时间戳` 前缀，测量结束后按轮转序
+  逐行对账——丢行/缺口/乱序/重复 → 报告 integrity 失败 → 非零退出。
+- **清理契约**：无论成功、失败或 Ctrl-C，自动卸载临时 app 并删除其日志文件
+  （spawn 模式连临时 workspace 一并删除）；`--keep` 保留现场供检查（保留
+  workspace/日志，临时 app 仍会卸载）。
+- **`--connect` 注意**：负载经由目标 daemon 写真实磁盘日志，量界参数请量力设置；
+  bench 与 daemon 必须同机（需读取其 app_dir 与 log_dir）；目标上已存在
+  `xkeeper-bench-` 前缀 app 时拒绝开跑，绝不触碰非 bench 创建的 app 或文件。
+- **与 `cargo run -p xtask -- stress` 的关系**：stress 是零反压/WS 背压的
+  **验证**工具（CI 断言口径），bench 是面向用户的**测量**工具（对比 JSON 口径），
+  两者实现独立、互不依赖。
+- **Windows**：RSS 外部采样不可用，报告该项为 null，其余指标不受影响。
+
 ## 测试
 
 ```bash
@@ -529,8 +577,15 @@ app 扇出排序、legacy 导入、日志轮转与环形缓冲、7 态状态机
 （真实子进程：重启/启动预算/策略/停止/落盘）、tcp/http/exec 探测。
 
 跨进程验收（真实 daemon + CLI + HTTP，含动作全链路/signal/--app 扇出/
-字符集拒绝场景）：
+字符集拒绝场景，以及 xkeeper-bench 的 firehose 冒烟 + JSON 报告 + 清理断言；
+`--no-browser` 跳过浏览器段）：
 
 ```bash
 cargo run -p xtask -- e2e --no-browser
+```
+
+xkeeper-bench 自身的完整周期集成测试（真实 daemon，每条数秒）默认忽略：
+
+```bash
+cargo test -p xkeeper-bench --test integration -- --ignored --test-threads=1
 ```

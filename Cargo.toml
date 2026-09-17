@@ -1,5 +1,5 @@
 [workspace]
-members = ["xtask"]
+members = ["xtask", "xkeeper-bench"]
 resolver = "2"
 
 [package]
