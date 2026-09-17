@@ -430,7 +430,8 @@ sudo xkeeper service uninstall          # stop + disable + 删除 unit + daemon-
 ```
 
 可选参数：`-c/--config <daemon 配置>`（全局参数；写入 unit 的 ExecStart，缺省 `/etc/xkeeper/daemon.toml`）、
-`--name <unit>`（unit 名，默认 `xkeeper`）、`--user <name>`（服务运行用户）、
+`--unit-file <path>`（unit 文件完整路径，必须以 `.service` 结尾，默认
+`/etc/systemd/system/xkeeper.service`）、`--user <name>`（服务运行用户）、
 `--force`（目标 unit 已存在且内容不同时覆盖）。重复安装内容一致时幂等跳过。
 `TimeoutStopSec` 按已注册程序的最大 `stop_timeout` 自动估算（2×最大值 + 10s，
 配置不可加载时 90s）；需要定制可直接修改生成后的 unit 文件再

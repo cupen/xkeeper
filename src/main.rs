@@ -223,18 +223,18 @@ enum ServiceCmd {
         /// Overwrite an existing unit whose content differs
         #[arg(long)]
         force: bool,
-        /// systemd unit name without the .service suffix
-        #[arg(long)]
-        name: Option<String>,
+        /// Full path to the unit file to write (must end in .service)
+        #[arg(long, value_name = "PATH", default_value = service::DEFAULT_UNIT_FILE)]
+        unit_file: PathBuf,
         /// Run the service as this user (User= in the unit)
         #[arg(long)]
         user: Option<String>,
     },
     /// Stop, disable and remove the systemd unit
     Uninstall {
-        /// systemd unit name without the .service suffix
-        #[arg(long)]
-        name: Option<String>,
+        /// Full path to the unit file to remove (must end in .service)
+        #[arg(long, value_name = "PATH", default_value = service::DEFAULT_UNIT_FILE)]
+        unit_file: PathBuf,
     },
 }
 
@@ -539,19 +539,17 @@ fn dispatch(cli: &Cli) -> Result<()> {
             SystemCmd::Webui { url } => shell::system_webui(url.as_deref()),
         },
         Some(Cmd::Service { cmd }) => {
-            let (action, name, user, force, now) = match cmd {
+            let (action, unit_file, user, force, now) = match cmd {
                 ServiceCmd::Install {
                     now,
                     force,
-                    name,
+                    unit_file,
                     user,
-                } => ("install", name, user, *force, *now),
-                ServiceCmd::Uninstall { name } => ("uninstall", name, &None, false, false),
+                } => ("install", unit_file, user, *force, *now),
+                ServiceCmd::Uninstall { unit_file } => ("uninstall", unit_file, &None, false, false),
             };
             let opts = service::ServiceOptions {
-                unit_name: name
-                    .clone()
-                    .unwrap_or_else(|| service::DEFAULT_UNIT_NAME.to_string()),
+                unit_file: unit_file.clone(),
                 user: user.clone(),
                 force,
                 now,

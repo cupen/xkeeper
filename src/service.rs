@@ -1,16 +1,18 @@
 //! systemd service registration: `xkeeper service install|uninstall`.
 //!
-//! Linux only — generates a unit file under `/etc/systemd/system/`, then
-//! drives `systemctl` to reload/enable/start it. Windows builds keep the
-//! subcommands discoverable but fail at runtime with a clear error. All
-//! template rendering, name validation and write decisions are
-//! platform-independent pure functions so they are testable everywhere.
+//! Linux only — writes a unit file (default `/etc/systemd/system/xkeeper.service`,
+//! override with `--unit-file`), then drives `systemctl` to reload/enable/start
+//! it. Windows builds keep the subcommands discoverable but fail at runtime with
+//! a clear error. All template rendering, path validation and write decisions
+//! are platform-independent pure functions so they are testable everywhere.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 
-pub const DEFAULT_UNIT_NAME: &str = "xkeeper";
+/// Default `--unit-file` value.
+#[cfg_attr(windows, allow(dead_code))]
+pub const DEFAULT_UNIT_FILE: &str = "/etc/systemd/system/xkeeper.service";
 /// Fallback stop budget when the config cannot be loaded.
 #[cfg_attr(windows, allow(dead_code))]
 const FALLBACK_TIMEOUT_STOP_SEC: u64 = 90;
@@ -20,8 +22,8 @@ const FALLBACK_TIMEOUT_STOP_SEC: u64 = 90;
 #[derive(Debug, Clone)]
 #[cfg_attr(windows, allow(dead_code))]
 pub struct ServiceOptions {
-    /// systemd unit name (without the `.service` suffix).
-    pub unit_name: String,
+    /// Full path of the unit file to write/remove (must end in `.service`).
+    pub unit_file: PathBuf,
     /// Optional `User=` the service runs as.
     pub user: Option<String>,
     /// Overwrite an existing unit with different content.
@@ -32,15 +34,39 @@ pub struct ServiceOptions {
 
 // -- platform-independent pure logic ----------------------------------------
 
+/// systemd unit file paths we accept: file name is a legal unit name
+/// (ASCII alphanumerics plus `.` `_` `-`, non-empty, not ending in `.`)
+/// with a mandatory `.service` extension.
+#[cfg_attr(windows, allow(dead_code))]
+pub fn is_valid_unit_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let Some(stem) = name.strip_suffix(".service") else {
+        return false;
+    };
+    is_valid_unit_name(stem)
+}
+
 /// systemd unit names we accept: ASCII alphanumerics plus `.` `_` `-`,
 /// non-empty, not ending in `.`.
 #[cfg_attr(windows, allow(dead_code))]
-pub fn is_valid_unit_name(name: &str) -> bool {
+fn is_valid_unit_name(name: &str) -> bool {
     !name.is_empty()
         && !name.ends_with('.')
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// Unit name (without `.service`) derived from a validated unit file path.
+#[cfg_attr(windows, allow(dead_code))]
+fn unit_name_of(path: &Path) -> String {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_suffix(".service"))
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// Quote an ExecStart argument when it contains whitespace, systemd-style.
@@ -84,6 +110,63 @@ pub fn render_unit(
     s.push_str("[Install]\n");
     s.push_str("WantedBy=multi-user.target\n");
     s
+}
+
+/// Pretty-render a written unit file inside a rounded box for the terminal.
+/// `color` enables ANSI styling (section headers cyan, keys bold, borders
+/// dim); padding is computed on visible characters so colored output stays
+/// aligned. Pure so it is testable on every platform.
+#[cfg_attr(windows, allow(dead_code))]
+pub fn render_unit_display(path: &str, unit: &str, color: bool) -> String {
+    // colorize one unit-file line; the caller pads the raw line first so
+    // escape sequences never skew the box width
+    fn paint(line: &str, color: bool) -> String {
+        if !color {
+            return line.to_string();
+        }
+        let t = line.trim_start();
+        if t.starts_with('[') && t.ends_with(']') {
+            format!("\x1b[1;36m{line}\x1b[0m")
+        } else if t.starts_with('#') || t.starts_with(';') {
+            format!("\x1b[90m{line}\x1b[0m")
+        } else if let Some(eq) = line.find('=') {
+            format!("\x1b[1m{}\x1b[0m{}", &line[..=eq], &line[eq + 1..])
+        } else {
+            line.to_string()
+        }
+    }
+
+    let lines: Vec<&str> = unit.lines().collect();
+    let title_w = path.chars().count();
+    let content_w = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+    // title + 2 keeps at least one filler dash on each side of the title
+    let w = content_w.max(title_w + 2);
+    let dash = "─".repeat(w - title_w - 1);
+    let rule = "─".repeat(w + 2);
+
+    let mut out = String::new();
+    if color {
+        out.push_str(&format!(
+            "\x1b[2m╭─\x1b[0m \x1b[1m{path}\x1b[0m \x1b[2m{dash}╮\x1b[0m\n"
+        ));
+    } else {
+        out.push_str(&format!("╭─ {path} {dash}╮\n"));
+    }
+    for line in &lines {
+        let pad = " ".repeat(w - line.chars().count());
+        let body = paint(line, color);
+        if color {
+            out.push_str(&format!("\x1b[2m│\x1b[0m {body}{pad} \x1b[2m│\x1b[0m\n"));
+        } else {
+            out.push_str(&format!("│ {body}{pad} │\n"));
+        }
+    }
+    if color {
+        out.push_str(&format!("\x1b[2m╰{rule}╯\x1b[0m"));
+    } else {
+        out.push_str(&format!("╰{rule}╯"));
+    }
+    out
 }
 
 /// What to do with an existing unit file before writing.
@@ -173,13 +256,7 @@ pub fn uninstall(_config_path: &Path, opts: &ServiceOptions) -> Result<()> {
 // -- unix (systemd) implementation -------------------------------------------
 
 #[cfg(unix)]
-use std::path::PathBuf;
-
-#[cfg(unix)]
 use anyhow::Context as _;
-
-#[cfg(unix)]
-const SYSTEMD_UNIT_DIR: &str = "/etc/systemd/system";
 
 #[cfg(unix)]
 fn require_root() -> Result<()> {
@@ -189,20 +266,24 @@ fn require_root() -> Result<()> {
     Ok(())
 }
 
+/// Color the unit box only when stdout is a real terminal and the user has
+/// not opted out via `NO_COLOR`.
 #[cfg(unix)]
-fn unit_path(unit_name: &str) -> PathBuf {
-    Path::new(SYSTEMD_UNIT_DIR).join(format!("{unit_name}.service"))
+fn use_color() -> bool {
+    std::env::var_os("NO_COLOR").is_none() && unsafe { libc::isatty(libc::STDOUT_FILENO) } == 1
 }
 
 #[cfg(unix)]
 fn unix_install(config_path: &Path, opts: &ServiceOptions) -> Result<()> {
-    require_root()?;
-    if !is_valid_unit_name(&opts.unit_name) {
+    if !is_valid_unit_file(&opts.unit_file) {
         bail!(
-            "invalid unit name {:?} (allowed: letters, digits, '.', '_', '-'; must not end with '.')",
-            opts.unit_name
+            "invalid unit file {} (file name must be a legal unit name ending in '.service': \
+             letters, digits, '.', '_', '-'; must not end with '.')",
+            opts.unit_file.display()
         );
     }
+    require_root()?;
+    let unit_name = unit_name_of(&opts.unit_file);
 
     let exe = std::env::current_exe()
         .context("cannot locate the current executable")?
@@ -221,8 +302,8 @@ fn unix_install(config_path: &Path, opts: &ServiceOptions) -> Result<()> {
         compute_timeout_stop_sec(config_path),
     );
 
-    let path = unit_path(&opts.unit_name);
-    let existing = std::fs::read_to_string(&path).ok();
+    let path = &opts.unit_file;
+    let existing = std::fs::read_to_string(path).ok();
     match decide_write(existing.as_deref(), &rendered, opts.force) {
         WriteDecision::RefuseNeedsForce => bail!(
             "unit {} already exists with different content; use --force to overwrite",
@@ -232,45 +313,52 @@ fn unix_install(config_path: &Path, opts: &ServiceOptions) -> Result<()> {
             println!("unit {} already up to date", path.display());
         }
         WriteDecision::Write => {
-            std::fs::write(&path, &rendered)
+            std::fs::write(path, &rendered)
                 .with_context(|| format!("cannot write {}", path.display()))?;
             println!("unit written: {}", path.display());
         }
     }
 
     systemctl(&["daemon-reload"])?;
-    systemctl(&["enable", &format!("{}.service", opts.unit_name)])?;
+    systemctl(&["enable", &format!("{unit_name}.service")])?;
     if opts.now {
-        systemctl(&["start", &format!("{}.service", opts.unit_name)])?;
-        println!("service {} started", opts.unit_name);
+        systemctl(&["start", &format!("{unit_name}.service")])?;
+        println!("service {unit_name} started");
     }
+    // only reached on a fully successful install — show what landed on disk
+    println!(
+        "{}",
+        render_unit_display(&path.display().to_string(), &rendered, use_color())
+    );
     Ok(())
 }
 
 #[cfg(unix)]
 fn unix_uninstall(opts: &ServiceOptions) -> Result<()> {
-    require_root()?;
-    if !is_valid_unit_name(&opts.unit_name) {
+    if !is_valid_unit_file(&opts.unit_file) {
         bail!(
-            "invalid unit name {:?} (allowed: letters, digits, '.', '_', '-'; must not end with '.')",
-            opts.unit_name
+            "invalid unit file {} (file name must be a legal unit name ending in '.service': \
+             letters, digits, '.', '_', '-'; must not end with '.')",
+            opts.unit_file.display()
         );
     }
+    require_root()?;
+    let unit_name = unit_name_of(&opts.unit_file);
 
-    let path = unit_path(&opts.unit_name);
+    let path = &opts.unit_file;
     if !path.exists() {
-        println!("service {} is not installed", opts.unit_name);
+        println!("service {unit_name} is not installed");
         return Ok(());
     }
 
     // stop and disable failures are non-fatal: the goal is a clean removal.
-    if let Err(e) = systemctl(&["stop", &format!("{}.service", opts.unit_name)]) {
+    if let Err(e) = systemctl(&["stop", &format!("{unit_name}.service")]) {
         eprintln!("xkeeper: warning: {e:#}");
     }
-    if let Err(e) = systemctl(&["disable", &format!("{}.service", opts.unit_name)]) {
+    if let Err(e) = systemctl(&["disable", &format!("{unit_name}.service")]) {
         eprintln!("xkeeper: warning: {e:#}");
     }
-    std::fs::remove_file(&path).with_context(|| format!("cannot remove {}", path.display()))?;
+    std::fs::remove_file(path).with_context(|| format!("cannot remove {}", path.display()))?;
     println!("unit removed: {}", path.display());
     systemctl(&["daemon-reload"])?;
     Ok(())
@@ -305,13 +393,30 @@ mod tests {
     }
 
     #[test]
-    fn unit_name_accepts_legal_and_rejects_illegal() {
-        assert!(is_valid_unit_name("xkeeper"));
-        assert!(is_valid_unit_name("xk-prod_1.service.test"));
-        assert!(is_valid_unit_name("a"));
-        for bad in ["", "a/b", "a b", "a\\b", "ends.", "ä"] {
-            assert!(!is_valid_unit_name(bad), "expected {bad:?} to be rejected");
+    fn unit_file_accepts_legal_and_rejects_illegal() {
+        assert!(is_valid_unit_file(Path::new("/etc/systemd/system/xkeeper.service")));
+        assert!(is_valid_unit_file(Path::new("xk-prod_1.service")));
+        assert!(is_valid_unit_file(Path::new("a.service")));
+        assert!(is_valid_unit_file(Path::new("my-app_v2.service")));
+        for bad in [
+            "xkeeper",             // missing .service
+            ".service",            // empty stem
+            "ends..service",       // stem ends with '.'
+            "my app.service",      // space in stem
+            "x.service.bak",       // wrong extension
+            "/etc/systemd/system/", // directory, no file name
+        ] {
+            assert!(
+                !is_valid_unit_file(Path::new(bad)),
+                "expected {bad:?} to be rejected"
+            );
         }
+    }
+
+    #[test]
+    fn unit_name_derived_from_file_stem() {
+        assert_eq!(unit_name_of(Path::new("/etc/systemd/system/xk.service")), "xk");
+        assert_eq!(unit_name_of(Path::new("my-app.service")), "my-app");
     }
 
     #[test]
@@ -353,6 +458,53 @@ mod tests {
         ));
         assert!(unit.contains("User=svc-xk\n"));
         assert!(unit.contains("TimeoutStopSec=60\n"));
+    }
+
+    #[test]
+    fn unit_display_plain_box_frames_and_aligns() {
+        let out = render_unit_display("/x.service", "[Unit]\nDescription=demo\n", false);
+        assert_eq!(
+            out,
+            "╭─ /x.service ─────╮\n\
+             │ [Unit]           │\n\
+             │ Description=demo │\n\
+             ╰──────────────────╯"
+        );
+    }
+
+    #[test]
+    fn unit_display_color_highlights_and_stays_aligned() {
+        fn strip_ansi(s: &str) -> String {
+            let mut out = String::new();
+            let mut it = s.chars();
+            while let Some(c) = it.next() {
+                if c == '\x1b' {
+                    for e in it.by_ref() {
+                        if e == 'm' {
+                            break;
+                        }
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        }
+        let unit = render_unit(
+            Path::new("/usr/local/bin/xkeeper"),
+            Path::new("/etc/xkeeper/daemon.toml"),
+            None,
+            90,
+        );
+        let out = render_unit_display("/etc/systemd/system/xkeeper.service", &unit, true);
+        assert!(out.contains("\x1b[1;36m[Unit]\x1b[0m"));
+        assert!(out.contains("\x1b[1mExecStart=\x1b[0m"));
+        assert!(out.starts_with("\x1b[2m╭─"));
+        assert!(out.contains("\x1b[2m╰"));
+        // escapes must not skew the box: every line has the same visible width
+        let widths: std::collections::HashSet<usize> =
+            out.lines().map(|l| strip_ansi(l).chars().count()).collect();
+        assert_eq!(widths.len(), 1, "uneven box lines: {widths:?}");
     }
 
     #[test]
