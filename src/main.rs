@@ -58,14 +58,11 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// Run the daemon in the foreground (default when no subcommand given)
+    /// Run the daemon in the foreground (default when no subcommand given).
+    /// The web console is config-driven: add a `[webui]` section to the
+    /// daemon config (or `xkeeper config --set webui.listen=...` + reload)
+    /// to enable it
     Run,
-    /// Run the daemon and serve the web console (API + embedded UI)
-    Webui {
-        /// Address for the console to listen on
-        #[arg(long, default_value = "127.0.0.1:9877")]
-        listen: String,
-    },
     /// Validate the daemon config + all registered apps, or one app file
     Validate {
         /// Optional path to a single app config file
@@ -76,18 +73,23 @@ enum Cmd {
     /// action per call. Purely local file operations; a running daemon is
     /// only probed for a "reload needed" hint after a successful write.
     Config {
-        /// Set a [daemon] key (repeatable): --set port=8080. Strong-typed
-        /// whitelist; unknown keys / type violations are rejected untouched
-        /// and the result is validated before it is written atomically
+        /// Set a daemon config key (repeatable): --set port=8080 or
+        /// --set webui.listen=127.0.0.1:9877. Strong-typed whitelist; unknown
+        /// keys / type violations are rejected untouched and the result is
+        /// validated before it is written atomically
         #[arg(long, value_name = "KEY=VALUE", conflicts_with_all = ["get", "delete", "edit", "init"])]
         set: Vec<String>,
-        /// Print the effective value of a [daemon] key (repeatable; a bare
-        /// value per key; unset keys answer with the built-in default)
+        /// Print the effective value of a daemon config key (repeatable; a
+        /// bare value per key; unset keys answer with the built-in default,
+        /// e.g. `webui.listen` falls back to 127.0.0.1:9877)
         #[arg(long, value_name = "KEY", conflicts_with_all = ["delete", "edit", "init"])]
         get: Vec<String>,
-        /// Remove a [daemon] key (repeatable): bare keys are shorthand for
-        /// [daemon] leaves, dotted paths like daemon.port name them directly.
-        /// Idempotent — absent targets change nothing
+        /// Remove a daemon config key or whole section (repeatable): bare
+        /// keys are shorthand for [daemon] leaves, dotted paths like
+        /// daemon.port or webui.listen name them directly, and a bare
+        /// section name (`webui`) removes the whole table — deleting
+        /// `[webui]` turns the console off. Idempotent — absent targets
+        /// change nothing
         #[arg(long, value_name = "KEY", conflicts_with_all = ["edit", "init"])]
         delete: Vec<String>,
         /// Open the daemon config in $VISUAL/$EDITOR (vi/notepad), creating
@@ -218,24 +220,10 @@ enum Cmd {
         #[arg(short = 'e', long = "exec")]
         cmd: Option<String>,
     },
-    /// Local helper commands not needing a running daemon
-    System {
-        #[command(subcommand)]
-        cmd: SystemCmd,
-    },
     /// Install/uninstall xkeeper as a system service (Linux systemd; root required)
     Service {
         #[command(subcommand)]
         cmd: ServiceCmd,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum SystemCmd {
-    /// Open the web console in the system browser, starting the daemon if needed
-    Webui {
-        /// Console URL (default: the webui listen address, 127.0.0.1:9877)
-        url: Option<String>,
     },
 }
 
@@ -306,17 +294,16 @@ fn config_path_of(cli: &Cli) -> PathBuf {
 fn dispatch(cli: &Cli) -> Result<()> {
     // Client subcommands don't reach the daemon's logger init; without
     // this, warnings from the registry/config layers would be dropped
-    // silently. `run`/`webui` (and bare `xkeeper`) init their own logger
-    // from the config's log_level.
-    if !matches!(&cli.cmd, None | Some(Cmd::Run) | Some(Cmd::Webui { .. })) {
+    // silently. `run` (and bare `xkeeper`) init their own logger from the
+    // config's log_level.
+    if !matches!(&cli.cmd, None | Some(Cmd::Run)) {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
             .try_init()
             .ok();
     }
     let config_path = config_path_of(cli);
     match &cli.cmd {
-        Some(Cmd::Run) | None => run_daemon(&config_path, None),
-        Some(Cmd::Webui { listen }) => run_daemon(&config_path, Some(listen.clone())),
+        Some(Cmd::Run) | None => run_daemon(&config_path),
         Some(Cmd::Validate { path }) => validate(&config_path, path.as_deref()),
         Some(Cmd::Config {
             set,
@@ -578,9 +565,6 @@ fn dispatch(cli: &Cli) -> Result<()> {
             Ok(())
         }
         Some(Cmd::Shell { cmd }) => shell::run(&config_path, cmd.as_deref()),
-        Some(Cmd::System { cmd }) => match cmd {
-            SystemCmd::Webui { url } => shell::system_webui(url.as_deref()),
-        },
         Some(Cmd::Service { cmd }) => {
             let (action, unit_file, user, force, now) = match cmd {
                 ServiceCmd::Install {
@@ -1087,7 +1071,10 @@ fn edit_config_with(editor: &str, config_path: &Path) -> Result<i32> {
 }
 
 // -- daemon -----------------------------------------------------------------
-fn run_daemon(config_path: &Path, webui_listen: Option<String>) -> Result<()> {
+/// `run` is the only daemon entry. The web console is config-driven: its
+/// initial state comes from the `[webui]` section of the daemon config
+/// (absent = off), and `xkeeper reload` converges it later at runtime.
+fn run_daemon(config_path: &Path) -> Result<()> {
     let (config, existed) = DaemonConfig::load_or_default(config_path)
         .with_context(|| format!("failed to load daemon config {}", config_path.display()))?;
     if !existed {
@@ -1109,13 +1096,28 @@ fn run_daemon(config_path: &Path, webui_listen: Option<String>) -> Result<()> {
         if existed { "" } else { " (absent)" }
     );
 
+    // Capture the console intent before `config` is moved into the supervisor.
+    let webui_intent = supervisor::WebuiIntent::from_config(&config);
+
     let config_dir = config_dir_of(config_path);
     let sup = Supervisor::new(config, &config_dir)?;
     sup.set_config_path(config_path);
 
+    // Web console manager: converges the running console to the latest
+    // intent (published here for startup and by `reload` later). Bind
+    // failures degrade non-fatally; the manager exits with the daemon.
+    sup.webui.set_desired(webui_intent);
+    {
+        let sup2 = sup.clone();
+        std::thread::Builder::new()
+            .name("webui-manager".into())
+            .spawn(move || supervisor::webui_manager_loop(sup2))
+            .context("failed to spawn webui manager thread")?;
+    }
+
     // Metrics sampler: 1 Hz read-only sideband (CPU/RSS + log rates). Runs
-    // for both `run` and `webui`; exits with the daemon. Its failure only
-    // degrades metric fields to null.
+    // for the daemon; exits with it. Its failure only degrades metric
+    // fields to null.
     metrics::spawn_sampler(sup.clone());
 
     // Health checker thread: probes due tasks, reports back into the state
@@ -1151,21 +1153,6 @@ fn run_daemon(config_path: &Path, webui_listen: Option<String>) -> Result<()> {
             .name("api-accept".into())
             .spawn(move || server::serve(sup2, listener))
             .context("failed to spawn api accept loop")?;
-    }
-
-    // Web console: SPA + WebSocket push on its own loopback port, sharing
-    // the supervisor with the control plane. Exits with the daemon.
-    if let Some(listen) = &webui_listen {
-        let sup2 = sup.clone();
-        let listen = listen.clone();
-        std::thread::Builder::new()
-            .name("webui".into())
-            .spawn(move || {
-                if let Err(e) = web::serve(sup2, &listen) {
-                    log::error!("webui server error: {e:#}");
-                }
-            })
-            .context("failed to spawn webui thread")?;
     }
 
     // Bootstrap the registry and enter the supervision loop.
@@ -1577,9 +1564,6 @@ mod config_cmd_tests {
         let code = config_cmd(&path, &[], &[], &["port".to_string()], false, false).unwrap();
         assert_eq!(code, EXIT_OK, "absent-key delete is idempotent success");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
-        // Unknown delete is rejected.
-        let code = config_cmd(&path, &[], &[], &["webui".to_string()], false, false).unwrap();
-        assert_eq!(code, EXIT_CONFIG);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

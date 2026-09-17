@@ -1,4 +1,4 @@
-//! The `xkeeper webui` HTTP server: embedded console SPA + WebSocket push.
+//! The embedded web console HTTP server: console SPA + WebSocket push.
 //!
 //! Design consistency with the control plane (`webui-api` capability):
 //! this server re-uses the *same* status projection as `crate::server`
@@ -8,15 +8,21 @@
 //! adds for the browser console: the embedded SPA and a `/ws` push channel
 //! (snapshot → status deltas → log chunks → heartbeat, MessagePack binary
 //! frames, see [`crate::api`]).
+//!
+//! Lifecycle (config-driven-webui): whether this server runs at all is
+//! decided by the daemon config's `[webui]` section; the supervisor's
+//! manager thread spawns/stops it on reload. Besides the daemon shutdown
+//! flag, `serve` honors an external stop flag (reload off / rebind), and WS
+//! sessions close gracefully (queued frames flush, then a Close frame).
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -52,6 +58,48 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(100);
 /// loss is counted and surfaced as Gap markers; a truly dead client still
 /// frees the session when the budget lapses (and on sink errors).
 const LOG_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+/// After the stop/shutdown flag is set, the server drain waits up to this
+/// long for live WS sessions to flush their queues and send the Close frame
+/// before the runtime tears the sockets down (webui-api: graceful close).
+const WS_LIVE_DRAIN: Duration = Duration::from_secs(3);
+
+/// Shared lifecycle state for one console instance: the external stop flag
+/// (reload off / rebind, set by the webui manager) plus the count of live WS
+/// sessions so `serve` can hold the drain while they close gracefully.
+pub struct WebuiLifecycle {
+    stop: AtomicBool,
+    live: AtomicUsize,
+}
+
+impl WebuiLifecycle {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            stop: AtomicBool::new(false),
+            live: AtomicUsize::new(0),
+        })
+    }
+
+    /// Request a graceful stop (manager: reload off / rebind).
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+
+    pub fn stopped(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
+    }
+
+    fn enter_session(&self) {
+        self.live.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn exit_session(&self) {
+        self.live.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    fn live(&self) -> usize {
+        self.live.load(Ordering::SeqCst)
+    }
+}
 
 #[derive(Deserialize)]
 struct LogQuery {
@@ -192,8 +240,9 @@ async fn program_action(
     }
 }
 
-/// Build the console router (exposed for integration tests).
-pub fn build_router(sup: Arc<Supervisor>) -> Router {
+/// Build the console router (exposed for integration tests). `stop` is the
+/// external lifecycle state shared with the WS sessions (see [`serve`]).
+pub fn build_router(sup: Arc<Supervisor>, stop: Arc<WebuiLifecycle>) -> Router {
     Router::new()
         .route("/api/health", get(health))
         .route("/api/overview", get(overview))
@@ -205,31 +254,65 @@ pub fn build_router(sup: Arc<Supervisor>) -> Router {
         .route("/api/apply", post(apply))
         .route("/assets/{*path}", get(assets::asset))
         .route("/ws", get(ws_upgrade))
+        .layer(Extension(stop))
         .layer(CompressionLayer::new())
         .with_state(sup)
         .fallback(assets::spa_fallback)
 }
 
 /// Serve the console on `listen`. Blocks the calling thread; run it on a
-/// dedicated worker thread. Exits when the daemon shuts down.
-pub fn serve(sup: Arc<Supervisor>, listen: &str) -> Result<()> {
+/// dedicated worker thread. Exits when the daemon shuts down (flag is set by
+/// Ctrl+C / `POST /v1/shutdown`) OR when `stop` is set — the webui manager
+/// uses that for the reload-driven stop/rebind (config-driven-webui). The
+/// bind outcome is reported on `bound` (when given) as soon as the socket is
+/// bound, so the manager can converge without guessing.
+pub fn serve(
+    sup: Arc<Supervisor>,
+    listen: &str,
+    stop: Arc<WebuiLifecycle>,
+    bound: Option<std::sync::mpsc::Sender<Result<String>>>,
+) -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()?;
     rt.block_on(async move {
-        let app = build_router(sup.clone());
-        let listener = tokio::net::TcpListener::bind(listen).await?;
+        let app = build_router(sup.clone(), Arc::clone(&stop));
+        let listener = match tokio::net::TcpListener::bind(listen).await {
+            Ok(l) => l,
+            Err(e) => {
+                // Report the failure before returning so the manager can
+                // degrade non-fatally instead of waiting for a disconnect.
+                let msg = format!("webui server error: {e}");
+                if let Some(tx) = bound {
+                    let _ = tx.send(Err(anyhow::anyhow!(msg.clone())));
+                }
+                return Err(anyhow::anyhow!(msg));
+            }
+        };
         log::info!("webui listening on http://{listen}");
+        if let Some(tx) = &bound {
+            let _ = tx.send(Ok(listen.to_string()));
+        }
         axum::serve(listener, app)
             .with_graceful_shutdown(async move {
                 // Exit when the daemon shuts down (flag is set by Ctrl+C /
-                // POST /v1/shutdown), so the process can terminate.
+                // POST /v1/shutdown, so the process can terminate) or the
+                // manager requested a stop/rebind (reload 热生效). Then hold
+                // the drain briefly: live WS sessions flush their queues and
+                // send the WebSocket Close frame before the sockets die
+                // (webui-api: 随停机 graceful 关闭).
                 loop {
-                    if sup.state.lock().unwrap().shutdown.load(Ordering::SeqCst) {
+                    if stop.stopped()
+                        || sup.state.lock().unwrap().shutdown.load(Ordering::SeqCst)
+                    {
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                let deadline = tokio::time::Instant::now() + WS_LIVE_DRAIN;
+                while stop.live() > 0 && tokio::time::Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                 }
             })
             .await
@@ -261,8 +344,12 @@ fn stream_byte(stream: Stream) -> u8 {
     }
 }
 
-async fn ws_upgrade(ws: WebSocketUpgrade, State(sup): State<Arc<Supervisor>>) -> Response {
-    ws.on_upgrade(move |socket| ws_session(socket, sup))
+async fn ws_upgrade(
+    ws: WebSocketUpgrade,
+    State(sup): State<Arc<Supervisor>>,
+    Extension(stop): Extension<Arc<WebuiLifecycle>>,
+) -> Response {
+    ws.on_upgrade(move |socket| ws_session(socket, sup, stop))
 }
 
 /// Compute which programs changed between two snapshots (spec: incremental
@@ -278,14 +365,26 @@ fn status_delta(prev: &[ProgramInfo], cur: &[ProgramInfo]) -> Vec<ProgramInfo> {
         .collect()
 }
 
-async fn ws_session(socket: WebSocket, sup: Arc<Supervisor>) {
+async fn ws_session(socket: WebSocket, sup: Arc<Supervisor>, stop: Arc<WebuiLifecycle>) {
+    stop.enter_session();
     let (mut sink, mut source) = socket.split();
     // All outgoing frames funnel through this channel; one writer task.
-    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(128);
+    // `None` is the graceful-close sentinel: everything already queued
+    // flushes first (FIFO), then the WebSocket Close frame goes out —
+    // webui-api: 停伺服时先发关闭帧再断开，不丢已在途推送帧.
+    let (out_tx, mut out_rx) = mpsc::channel::<Option<Vec<u8>>>(128);
     let writer = tokio::spawn(async move {
         while let Some(frame) = out_rx.recv().await {
-            if sink.send(Message::Binary(frame.into())).await.is_err() {
-                break;
+            match frame {
+                Some(data) => {
+                    if sink.send(Message::Binary(data.into())).await.is_err() {
+                        break;
+                    }
+                }
+                None => {
+                    let _ = sink.send(Message::Close(None)).await;
+                    break;
+                }
             }
         }
     });
@@ -301,7 +400,7 @@ async fn ws_session(socket: WebSocket, sup: Arc<Supervisor>) {
     // isomorphic per the webui-api data-format requirement.
     if let Ok(payload) = rmp_serde::to_vec_named(&snap) {
         let _ = out_tx
-            .send(api::encode_ws_message(msg_type::SNAPSHOT, &payload))
+            .send(Some(api::encode_ws_message(msg_type::SNAPSHOT, &payload)))
             .await;
     }
 
@@ -310,6 +409,9 @@ async fn ws_session(socket: WebSocket, sup: Arc<Supervisor>) {
     let mut subs: HashMap<(String, Stream), tokio::task::JoinHandle<()>> = HashMap::new();
     // A saturated session closes wholesale; subscribe tasks signal here.
     let (close_tx, mut close_rx) = mpsc::channel::<()>(1);
+    // True when THIS side initiates the close (stop/shutdown): the writer
+    // then flushes a Close frame instead of being aborted.
+    let mut graceful = false;
 
     loop {
         tokio::select! {
@@ -323,21 +425,21 @@ async fn ws_session(socket: WebSocket, sup: Arc<Supervisor>) {
                                 let stream = match stream_of(&stream) {
                                     Some(s) => s,
                                     None => {
-                                        let _ = out_tx.send(api::encode_ws_message(
+                                        let _ = out_tx.send(Some(api::encode_ws_message(
                                             msg_type::ERROR,
                                             b"{\"error\":\"stream must be out or err\"}",
-                                        )).await;
+                                        ))).await;
                                         continue;
                                     }
                                 };
                                 let known = sup.state.lock().unwrap()
                                     .programs.contains_key(&program);
                                 if !known {
-                                    let _ = out_tx.send(api::encode_ws_message(
+                                    let _ = out_tx.send(Some(api::encode_ws_message(
                                         msg_type::ERROR,
                                         json!({ "error": format!("unknown program {program:?}") })
                                             .to_string().as_bytes(),
-                                    )).await;
+                                    ))).await;
                                     continue;
                                 }
                                 let key = (program.clone(), stream);
@@ -356,10 +458,10 @@ async fn ws_session(socket: WebSocket, sup: Arc<Supervisor>) {
                                 }
                             }
                             Err(_) => {
-                                let _ = out_tx.send(api::encode_ws_message(
+                                let _ = out_tx.send(Some(api::encode_ws_message(
                                     msg_type::ERROR,
                                     b"{\"error\":\"bad message\"}",
-                                )).await;
+                                ))).await;
                             }
                         }
                     }
@@ -386,19 +488,23 @@ async fn ws_session(socket: WebSocket, sup: Arc<Supervisor>) {
                     }
                     if let Ok(bytes) = serde_json::to_vec(&payload) {
                         let _ = out_tx
-                            .send(api::encode_ws_message(msg_type::STATUS, &bytes))
+                            .send(Some(api::encode_ws_message(msg_type::STATUS, &bytes)))
                             .await;
                     }
                 }
-                // Daemon shutting down: end the session so the console
-                // server's graceful drain (webui-api: 随守护进程退出) can
-                // complete instead of waiting on this connection forever.
-                if sup.state.lock().unwrap().shutdown.load(Ordering::SeqCst) {
+                // Console stopping (reload off/rebind) or daemon shutting
+                // down: end the session gracefully — queued pushes flush and
+                // a Close frame is sent before the socket drops (webui-api:
+                // 随停机 graceful 关闭 / 随守护进程退出).
+                let closing = stop.stopped()
+                    || sup.state.lock().unwrap().shutdown.load(Ordering::SeqCst);
+                if closing {
+                    graceful = true;
                     break;
                 }
             }
             _ = heartbeat.tick() => {
-                let _ = out_tx.send(api::encode_ws_message(msg_type::HEARTBEAT, b"null")).await;
+                let _ = out_tx.send(Some(api::encode_ws_message(msg_type::HEARTBEAT, b"null"))).await;
             }
             _ = close_rx.recv() => {
                 // A log subscriber hit sustained backpressure: drop the whole
@@ -411,7 +517,16 @@ async fn ws_session(socket: WebSocket, sup: Arc<Supervisor>) {
     for (_, handle) in subs.drain() {
         handle.abort();
     }
-    writer.abort();
+    stop.exit_session();
+    if graceful {
+        // The close sentinel goes out after everything already queued; bound
+        // the cleanup so a frozen client can never stall the server drain.
+        let _ = tokio::time::timeout(Duration::from_secs(2), out_tx.send(None)).await;
+        drop(out_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), writer).await;
+    } else {
+        writer.abort();
+    }
 }
 
 /// Replay the current tail once, then forward ring-buffer batches as
@@ -423,7 +538,7 @@ async fn ws_session(socket: WebSocket, sup: Arc<Supervisor>) {
 /// 推送与背压; slow viewers never back up the pump).
 async fn subscribe_logs(
     sup: Arc<Supervisor>,
-    out_tx: mpsc::Sender<Vec<u8>>,
+    out_tx: mpsc::Sender<Option<Vec<u8>>>,
     close_tx: mpsc::Sender<()>,
     program: String,
     stream: Stream,
@@ -443,7 +558,7 @@ async fn subscribe_logs(
         let mut data = tail.join("\n");
         data.push('\n');
         if out_tx
-            .send(api::encode_log_frame(&program, sb, data.as_bytes()))
+            .send(Some(api::encode_log_frame(&program, sb, data.as_bytes())))
             .await
             .is_err()
         {
@@ -528,8 +643,8 @@ async fn subscribe_logs(
 /// One frame to the session writer. Ordinary frames carry the saturation
 /// bound (a frozen network must free the session); gap frames wait far
 /// longer. False = give up and close this session.
-async fn send_frame(out_tx: &mpsc::Sender<Vec<u8>>, frame: Vec<u8>) -> bool {
-    match out_tx.send_timeout(frame, LOG_SEND_TIMEOUT).await {
+async fn send_frame(out_tx: &mpsc::Sender<Option<Vec<u8>>>, frame: Vec<u8>) -> bool {
+    match out_tx.send_timeout(Some(frame), LOG_SEND_TIMEOUT).await {
         Ok(()) => true,
         Err(_) => false,
     }
@@ -555,6 +670,16 @@ mod tests {
         Supervisor::new(config, &dir).unwrap()
     }
 
+    fn test_stop() -> Arc<WebuiLifecycle> {
+        WebuiLifecycle::new()
+    }
+
+    /// A free loopback port for real-socket lifecycle tests.
+    fn free_listen() -> String {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("{}", l.local_addr().unwrap())
+    }
+
     async fn get(app: Router, uri: &str) -> (StatusCode, axum::body::Bytes) {
         let resp = app
             .oneshot(Request::get(uri).body(Body::empty()).unwrap())
@@ -569,7 +694,7 @@ mod tests {
 
     #[tokio::test]
     async fn rest_endpoints_serve_projection_and_404_objects() {
-        let app = build_router(test_sup());
+        let app = build_router(test_sup(), test_stop());
 
         let (status, body) = get(app.clone(), "/api/health").await;
         assert_eq!(status, StatusCode::OK);
@@ -690,7 +815,7 @@ mod tests {
     #[tokio::test]
     async fn overview_json_carries_metric_fields() {
         let (sup, name) = sup_with_metrics();
-        let app = build_router(sup);
+        let app = build_router(sup, test_stop());
         let (status, body) = get(app, "/api/overview").await;
         assert_eq!(status, StatusCode::OK);
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -712,8 +837,9 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let sup2 = sup.clone();
+        let stop = test_stop();
         tokio::spawn(async move {
-            let _ = axum::serve(listener, build_router(sup2)).await;
+            let _ = axum::serve(listener, build_router(sup2, stop)).await;
         });
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
             .await
@@ -754,6 +880,156 @@ mod tests {
         assert_eq!(p["mem_bytes"], 4096);
         assert_eq!(v["daemon"]["system"]["cpu_percent"], 3.4);
     }
+
+    // -- lifecycle: external stop + graceful WS close (config-driven-webui) ---
+
+    /// `web::serve` honors the external stop flag: the bind outcome is
+    /// reported on the channel, the socket is reachable while serving, and a
+    /// set flag ends the server gracefully (reload off/rebind path).
+    #[test]
+    fn serve_exits_on_external_stop_flag() {
+        let sup = test_sup();
+        let listen = free_listen();
+        let stop = test_stop();
+        let (bound_tx, bound_rx) = std::sync::mpsc::channel();
+        let stop2 = Arc::clone(&stop);
+        let addr = listen.clone();
+        let handle = std::thread::spawn(move || serve(sup, &addr, stop2, Some(bound_tx)));
+
+        let bound = bound_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("bind report in time")
+            .expect("bind succeeded");
+        assert_eq!(bound, listen);
+        assert!(
+            std::net::TcpStream::connect(&listen).is_ok(),
+            "the console is reachable while serving"
+        );
+
+        stop.stop();
+        let started = std::time::Instant::now();
+        handle.join().expect("serve thread").expect("graceful stop is not an error");
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "graceful stop completes promptly, took {:?}",
+            started.elapsed()
+        );
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            std::net::TcpStream::connect(&listen).is_err(),
+            "the port is closed after the stop"
+        );
+    }
+
+    /// An occupied listen degrades non-fatally: serve reports the bind error
+    /// through the channel and returns (the manager keeps the daemon alive).
+    #[test]
+    fn serve_reports_bind_failure_nonfatally() {
+        let sup = test_sup();
+        let blocker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listen = format!("{}", blocker.local_addr().unwrap());
+        let stop = test_stop();
+        let (bound_tx, bound_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || serve(sup, &listen, stop, Some(bound_tx)));
+        let err = bound_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("bind report in time")
+            .expect_err("occupied port must fail the bind");
+        assert!(
+            err.to_string().contains("webui server error") || err.to_string().contains("addr"),
+            "the error explains the bind failure: {err:#}"
+        );
+        let _ = handle.join().expect("serve thread returns after bind failure");
+    }
+
+    /// Daemon shutdown (the shared flag set by Ctrl+C / `POST /v1/shutdown`)
+    /// ends the console too: serve returns promptly and the port closes
+    /// (webui-api: 控制台随守护进程退出).
+    #[test]
+    fn serve_exits_on_daemon_shutdown_flag() {
+        let sup = test_sup();
+        let listen = free_listen();
+        let stop = test_stop();
+        let (bound_tx, bound_rx) = std::sync::mpsc::channel();
+        let stop2 = Arc::clone(&stop);
+        let addr = listen.clone();
+        let sup2 = Arc::clone(&sup);
+        let handle = std::thread::spawn(move || serve(sup2, &addr, stop2, Some(bound_tx)));
+        let bound = bound_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("bind report in time")
+            .expect("bind succeeded");
+        assert_eq!(bound, listen);
+
+        sup.state
+            .lock()
+            .unwrap()
+            .shutdown
+            .store(true, Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        handle
+            .join()
+            .expect("serve thread")
+            .expect("graceful stop is not an error");
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "serve exits promptly on the daemon shutdown flag"
+        );
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            std::net::TcpStream::connect(&listen).is_err(),
+            "the port is closed after the daemon shutdown"
+        );
+    }
+
+    /// Reload-driven stop closes WS sessions gracefully: queued frames flush
+    /// and a WebSocket Close frame arrives before the socket drops.
+    #[tokio::test]
+    async fn ws_session_closes_with_close_frame_on_stop() {
+        let sup = test_sup();
+        let listen = free_listen();
+        let stop = test_stop();
+        let (bound_tx, bound_rx) = std::sync::mpsc::channel();
+        let stop2 = Arc::clone(&stop);
+        std::thread::spawn(move || serve(sup, &listen, stop2, Some(bound_tx)));
+        let bound = bound_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("bind report in time")
+            .expect("bind succeeded");
+
+        let (mut ws, _) =
+            tokio_tungstenite::connect_async(format!("ws://{bound}/ws")).await.unwrap();
+        // The first frame is the snapshot (webui-api contract).
+        let msg = ws.next().await.unwrap().unwrap();
+        let (t, _) = api::decode_ws_message(&msg.into_data()).unwrap();
+        assert_eq!(t, msg_type::SNAPSHOT);
+
+        stop.stop();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(tokio::time::Instant::now() < deadline, "no close frame arrived");
+            let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+                .await
+                .expect("a frame arrives in time")
+                .expect("the stream must not end without a Close frame");
+            match msg.unwrap() {
+                tokio_tungstenite::tungstenite::Message::Close(_) => break,
+                // status/heartbeat frames may interleave before the close.
+                tokio_tungstenite::tungstenite::Message::Binary(_)
+                | tokio_tungstenite::tungstenite::Message::Ping(_)
+                | tokio_tungstenite::tungstenite::Message::Pong(_) => continue,
+                other => panic!("unexpected frame while closing: {other:?}"),
+            }
+        }
+        // After the close frame the stream ends (server dropped the socket).
+        let ended = tokio::time::timeout(Duration::from_secs(5), ws.next()).await;
+        match ended {
+            Ok(None) => {}
+            Ok(Some(Ok(m))) => panic!("expected stream end, got {m:?}"),
+            Ok(Some(Err(_))) => {} // abrupt TCP close after handshake is fine
+            Err(_) => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -769,6 +1045,10 @@ mod high_speed_tests {
     use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
     type ClientWs = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+    fn test_stop() -> Arc<WebuiLifecycle> {
+        WebuiLifecycle::new()
+    }
 
     /// Supervisor + router on an ephemeral port + one declared program "m"
     /// whose out-ring is directly pushable (stand-in for a firehose child).
@@ -792,7 +1072,7 @@ mod high_speed_tests {
         let addr = listener.local_addr().unwrap();
         let sup2 = sup.clone();
         tokio::spawn(async move {
-            let _ = axum::serve(listener, build_router(sup2)).await;
+            let _ = axum::serve(listener, build_router(sup2, test_stop())).await;
         });
         let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
             .await
@@ -964,6 +1244,10 @@ mod pending_ws_tests {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
+    fn test_stop() -> Arc<WebuiLifecycle> {
+        WebuiLifecycle::new()
+    }
+
     fn sup_with_pending() -> std::sync::Arc<Supervisor> {
         let config = crate::config::DaemonConfig::default();
         let dir = std::env::temp_dir().join(format!("xk-web-pending-{}", std::process::id()));
@@ -988,7 +1272,7 @@ mod pending_ws_tests {
     #[tokio::test]
     async fn ws_status_delta_carries_pending_changes() {
         let sup = sup_with_pending();
-        let app = build_router(sup.clone());
+        let app = build_router(sup.clone(), test_stop());
         let resp = app
             .oneshot(Request::get("/api/overview").body(Body::empty()).unwrap())
             .await
@@ -1001,7 +1285,7 @@ mod pending_ws_tests {
         assert_eq!(v["pending"]["programs"][0]["program"], "web");
         assert_eq!(v["pending"]["programs"][0]["running"], true);
         // And /api/pending serves the same doc.
-        let app2 = build_router(sup.clone());
+        let app2 = build_router(sup.clone(), test_stop());
         let resp = app2
             .oneshot(Request::get("/api/pending").body(Body::empty()).unwrap())
             .await

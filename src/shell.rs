@@ -1,15 +1,19 @@
-//! Interactive shell client (`xkeeper shell`) and the `xkeeper system webui`
-//! helper — a pure client over the control-plane API, mirroring the
-//! supervisorctl workflow. The daemon is untouched: every command reuses
-//! `client::Client` and the shared exit-code contract.
+//! Interactive shell client (`xkeeper shell`) — a pure client over the
+//! control-plane API, mirroring the supervisorctl workflow. The daemon is
+//! untouched: every command reuses `client::Client` and the shared exit-code
+//! contract. The `open` verb probes the web console (`GET /api/health`) and
+//! launches the system browser; enabling the console itself is a daemon
+//! config concern (`[webui]` section + `xkeeper reload`).
 
 use std::io::Write;
 
 use anyhow::{Context, Result, bail};
 
 use crate::client::{self, Client};
+use crate::config::DEFAULT_WEBUI_LISTEN;
 
-/// Default webui listen address, matching `xkeeper webui --listen`.
+/// Default webui listen address, matching the built-in default of the
+/// daemon config's `[webui]` section (`webui.listen`, 127.0.0.1:9877).
 const DEFAULT_WEBUI_URL: &str = "http://127.0.0.1:9877";
 
 /// What a start/stop/restart targets: one program (bare name, unchanged
@@ -360,11 +364,13 @@ pub(crate) fn run(config_path: &std::path::Path, single: Option<&str>) -> Result
     }
 }
 
+/// Console base URL for the `open` verb: the configured `[webui]` listen
+/// address when the section is present, else the built-in default.
 fn webui_url_of(config: &crate::config::DaemonConfig) -> String {
-    if config.daemon.host == "127.0.0.1" || config.daemon.host == "localhost" {
-        // The console defaults to its own port; /v1 port is not it.
+    match &config.webui {
+        Some(w) => format!("http://{}", w.listen),
+        None => DEFAULT_WEBUI_URL.to_string(),
     }
-    DEFAULT_WEBUI_URL.to_string()
 }
 
 /// Read-eval-print loop. rustyline provides line editing/history on a TTY and
@@ -705,11 +711,15 @@ fn browser_command(url: &str) -> std::process::Command {
     }
 }
 
-/// Probe webui; when reachable open the browser, otherwise print a hint.
+/// Probe webui; when reachable open the browser, otherwise print a hint
+/// (shell-client spec: `open` never launches the browser when the console
+/// is down).
 fn open_webui(url: &str) -> Result<()> {
     if let Err(e) = webui_health(url) {
         eprintln!(
-            "webui not reachable at {url} — start it with `xkeeper webui` (or `xkeeper system webui`)"
+            "webui not reachable at {url} — enable it in the daemon config \
+             (`xkeeper config --set webui.listen={DEFAULT_WEBUI_LISTEN}`) and run \
+             `xkeeper reload`, then retry"
         );
         bail!("{e:#}");
     }
@@ -721,88 +731,6 @@ fn open_webui(url: &str) -> Result<()> {
         }
         _ => bail!("could not launch the system browser for {url}"),
     }
-}
-
-/// `xkeeper system webui [url]`: open the console in a browser, starting the
-/// daemon in webui mode first when it is not running. This command itself
-/// stays short-lived — the spawned child owns the daemon lifecycle.
-pub(crate) fn system_webui(url: Option<&str>) -> Result<()> {
-    let url = url
-        .map(String::from)
-        .unwrap_or_else(|| DEFAULT_WEBUI_URL.to_string());
-    // The daemon command line records its own config path; the spawned child
-    // re-reads the platform default (or errors clearly if misconfigured).
-    let config = client::load_config(&crate::default_config_path())?;
-    let c = Client::from_config(&config);
-
-    if c.health().is_ok() {
-        // Daemon runs: never touch its lifecycle — open or explain.
-        if webui_health(&url).is_ok() {
-            open_browser(&url)?;
-            println!("{url}");
-            return Ok(());
-        }
-        bail!(
-            "daemon is running but webui is not reachable at {url} — restart it with `xkeeper webui`"
-        );
-    }
-
-    // Daemon offline: spawn `xkeeper webui` detached from this process.
-    let exe = std::env::current_exe().context("cannot locate current executable")?;
-    let listen = listen_of(&url)?;
-    let mut child = {
-        let mut cmd = std::process::Command::new(&exe);
-        cmd.args(["webui", "--listen", &listen]);
-        cmd.stdin(std::process::Stdio::null());
-        cmd.stdout(std::process::Stdio::null());
-        cmd.stderr(std::process::Stdio::null());
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
-        }
-        cmd.spawn()
-            .with_context(|| format!("failed to start {} webui", exe.display()))?
-    };
-    println!("daemon starting (pid {}) at {url}", child.id());
-
-    // Wait up to 5s for the console to answer, then open the browser.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        if webui_health(&url).is_ok() {
-            open_browser(&url)?;
-            println!("{url}");
-            return Ok(());
-        }
-        if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            bail!(
-                "webui did not become reachable within 5s — start it manually with `xkeeper webui`"
-            );
-        }
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }
-}
-
-/// Derive the `--listen` value from a URL (host:port), defaulting to loopback.
-fn listen_of(url: &str) -> Result<String> {
-    let rest = url
-        .strip_prefix("http://")
-        .ok_or_else(|| anyhow::anyhow!("only http:// urls are supported, got {url}"))?;
-    let authority = rest.split('/').next().unwrap_or_default();
-    if authority.is_empty() {
-        bail!("cannot parse listen address from {url}");
-    }
-    Ok(authority.to_string())
-}
-
-fn open_browser(url: &str) -> Result<()> {
-    let mut cmd = browser_command(url);
-    let st = cmd.status().context("cannot launch the system browser")?;
-    if !st.success() {
-        bail!("browser command exited with {st}");
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1025,17 +953,21 @@ mod tests {
         assert!(webui_health("http://127.0.0.1:1").is_err());
     }
 
+    /// The `open` verb addresses the console from the `[webui]` config when
+    /// the section is present and falls back to the built-in default listen
+    /// otherwise (shell-client migration: `system webui` is gone, the URL
+    /// follows `webui.listen`).
     #[test]
-    fn listen_of_parses() {
+    fn webui_url_of_uses_configured_listen_or_default() {
+        let cfg: crate::config::DaemonConfig =
+            toml::from_str("[webui]\nlisten = '0.0.0.0:9999'\n").unwrap();
+        assert_eq!(webui_url_of(&cfg), "http://0.0.0.0:9999");
+        let off: crate::config::DaemonConfig = toml::from_str("[daemon]\nport = 1\n").unwrap();
+        assert_eq!(webui_url_of(&off), "http://127.0.0.1:9877");
         assert_eq!(
-            listen_of("http://127.0.0.1:9877").unwrap(),
-            "127.0.0.1:9877"
+            webui_url_of(&off),
+            format!("http://{DEFAULT_WEBUI_LISTEN}"),
+            "the fallback matches the built-in [webui] default"
         );
-        assert_eq!(
-            listen_of("http://127.0.0.1:9877/x").unwrap(),
-            "127.0.0.1:9877"
-        );
-        assert!(listen_of("ftp://x").is_err());
-        assert!(listen_of("http://").is_err());
     }
 }

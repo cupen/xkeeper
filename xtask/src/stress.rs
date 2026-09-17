@@ -1,7 +1,8 @@
 //! Firehose stress + zero-backpressure verification against the REAL daemon
 //! binary (moved from the in-process `#[ignore]` test in src/web.rs — this
-//! version drives an actual `xkeeper webui` process, so the measurements
-//! include the full HTTP/WS stack and a real child generator).
+//! version drives an actual `xkeeper run` process with a `[webui]` config
+//! section, so the measurements include the full HTTP/WS stack and a real
+//! child generator).
 //!
 //! What it verifies (specs: log-management 输出排空零反压, webui-api WS 日志
 //! 批量推送与背压, metrics):
@@ -88,10 +89,12 @@ fn spawn_daemon(bin: &Path, _args: &Args) -> Result<Daemon> {
 
     let control_port = free_port()?;
     let webui_port = free_port()?;
+    // The console is config-driven: the [webui] section enables it for this
+    // run (config-driven-webui).
     std::fs::write(
         workspace.join("daemon.toml"),
         format!(
-            "[daemon]\nport = {control_port}\nlog_dir = \"{}/logs\"\nlog_level = \"warn\"\nlog_buffer_lines = 100000\n",
+            "[daemon]\nport = {control_port}\nlog_dir = \"{}/logs\"\nlog_level = \"warn\"\nlog_buffer_lines = 100000\n\n[webui]\nlisten = \"127.0.0.1:{webui_port}\"\n",
             workspace.display()
         ),
     )?;
@@ -124,9 +127,7 @@ fn spawn_daemon(bin: &Path, _args: &Args) -> Result<Daemon> {
     let mut child = Command::new(bin)
         .arg("--config")
         .arg(workspace.join("daemon.toml"))
-        .arg("webui")
-        .arg("--listen")
-        .arg(format!("127.0.0.1:{webui_port}"))
+        .arg("run")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

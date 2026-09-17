@@ -23,8 +23,8 @@ Linux 与 Windows 上行为一致：崩溃自动拉起、启动顺序与依赖�
 - **daemon 根配置**（全局唯一）：Linux `/etc/xkeeper/daemon.toml`，Windows
   `%APPDATA%\xkeeper\daemon.toml`，`-c/--config` 可覆盖；**文件可以不存在**——
   xkeeper 以内置默认值空启动。只放全局内容：`[daemon]`（含 `app_dir` 注册
-  目录）与可选 `[app-default]`（所有应用共享的默认值）。任何应用专属条目
-  都会被未知字段校验拒绝。
+  目录）、可选 `[app-default]`（所有应用共享的默认值）与可选 `[webui]`
+  （内嵌 Web 控制台，缺省关闭）。任何应用专属条目都会被未知字段校验拒绝。
 - **app 配置**（每个应用一份）：放在应用自己的部署目录，默认名
   `xkeeper.toml`，由部署人维护。`[program.<name>]` map 接口，键即程序名，
   绝大多数字段可省略。
@@ -116,6 +116,24 @@ autorestart = "always"
 restart_backoff = 1.0
 ```
 
+### Web 控制台开关（`[webui]` 段）
+
+内嵌 Web 控制台是**配置驱动**的可选段：daemon 配置里存在 `[webui]` 段即开启，
+缺省关闭。无需任何额外子命令——`xkeeper run` 启动时按配置伺服，运行中改动
+由 `xkeeper reload` 热生效（开启/关闭/换址重绑；端口被占用时降级运行并在
+reload 输出中说明，守护进程不受影响）：
+
+```toml
+[webui]
+listen = "127.0.0.1:9877"   # 缺省 127.0.0.1:9877
+```
+
+```bash
+xkeeper config --set webui.listen=127.0.0.1:9877   # 一次性写入（等价手改 [webui] 段）
+xkeeper reload                                     # 守护在线时热开启；输出附 webui: 结果行
+xkeeper config --delete webui                      # 删整段 = 关闭控制台；reload 热关闭
+```
+
 app（部署目录 `xkeeper.toml`，`examples/demo-app/xkeeper.toml`）：
 
 ```toml
@@ -166,16 +184,17 @@ xkeeper config --delete port                 # 删除（回到「未配置」态
 xkeeper config --edit                        # $VISUAL/$EDITOR 全文编辑 + 保存后校验
 ```
 
-- **白名单强类型**：`--set`/`--get`/`--delete` 只接受 `[daemon]` 表的 8 个已知键
+- **白名单强类型**：`--set`/`--get`/`--delete` 接受 `[daemon]` 表的 8 个已知键
   （`log_level`、`log_dir`、`monitor_interval`、`host`、`port`、`auth_token`、
-  `log_buffer_lines`、`app_dir`）；`port` 限 1–65535 整数、`monitor_interval` 为正浮点、
-  `log_buffer_lines` 为非负整数、`log_level` ∈ trace|debug|info|warn|error。未知键或
-  类型不符以退出码 2 拒绝，不落盘。
+  `log_buffer_lines`、`app_dir`）与 `[webui]` 段的 `webui.listen`；`port` 限
+  1–65535 整数、`monitor_interval` 为正浮点、`log_buffer_lines` 为非负整数、
+  `log_level` ∈ trace|debug|info|warn|error、`webui.listen` 须为 host:port。
+  未知键或类型不符以退出码 2 拒绝，不落盘。
 - **读-改-写保留格式**：写入只改动目标键的值节点，未触碰键的顺序、值与注释原样保持。
 - **写后整体校验 + 原子落盘**：先写临时文件、整体校验通过后 rename 覆盖；校验失败
   回滚为原内容（磁盘不留半成品）。
 - **删除即回退默认**：删除有默认值的键后回到「未配置」态；目标本不存在时幂等成功
-  （文件不变）；未知键/未知表拒绝（`--delete webui` 当前被拒——键表尚只覆盖 `[daemon]`）。
+  （文件不变）；未知键/未知表拒绝。删除整段 `--delete webui` 即关闭 Web 控制台。
 - **缺失文件语义**：`--get` 等价全默认回答；`--set`/`--delete` 拒绝并提示先执行
   `xkeeper config --init`；`--edit` 先创建再打开。
 - **在线提示**：写动作成功后对既有控制面地址发一次短超时探活——在线则提示执行
@@ -305,8 +324,9 @@ CLI 退出码：`0` 成功、`1` 一般错误、`2` 配置错误、`3` 守护进
 例外：`xkeeper action` 成功时**透传动作自身的退出码**（超时/调用失败为 1，
 守护不可达为 3）。
 
-Web 控制台（`xkeeper webui`）在同一守护进程内另开一个回环端口，伺服内嵌 UI、
-`/api/*` 查询与 `/ws` WebSocket 推送——状态投影与本控制面完全一致（见下文 Web UI）。
+Web 控制台与控制面同属一个守护进程：存在 `[webui]` 配置段时（见上文
+「Web 控制台开关」）另开一个回环端口，伺服内嵌 UI、`/api/*` 查询与 `/ws`
+WebSocket 推送——状态投影与本控制面完全一致（见下文 Web UI）。
 
 ### 交互式 shell（`xkeeper shell`）
 
@@ -323,15 +343,15 @@ xkeeper shell -e "status"            # 单命令模式：执行一条后退出�
 `signal <program> <SIGNAL>`、`pid <name>`、`log <name> [-f] [--tail N] [--stream out|err]`、
 `pending`、`apply [<app> [<program>]] [--restart]`、`shutdown`、`open`（用系统浏览器打开 webui 控制台）、`help`/`?`、`exit`/`quit`。
 
-### 一键打开控制台（`xkeeper system webui`）
+### 一键打开控制台（`xkeeper shell` 的 `open` 动词）
+
+控制台默认关闭：先在 daemon 配置里加 `[webui]` 段（或
+`xkeeper config --set webui.listen=127.0.0.1:9877`），守护在线时
+`xkeeper reload` 热开启（离线则下次 `xkeeper run` 自动伺服），然后：
 
 ```bash
-xkeeper system webui                 # 守护离线 → 后台拉起 xkeeper webui → 浏览器打开 http://127.0.0.1:9877
-xkeeper system webui http://127.0.0.1:12345   # 指定控制台地址
+xkeeper shell -e "open"     # 探活 GET /api/health 可达才调起系统浏览器；不可达给出开启提示
 ```
-
-守护已在跑时不改动它的生命周期：webui 可达则直接开浏览器，不可达则提示用
-`xkeeper webui` 启动（退出码 1）。拉起失败（如端口被占用）同样归入退出码 1。
 
 ## Web UI
 
@@ -361,8 +381,8 @@ rust-embed 在运行时直接读取磁盘上的 `webui/dist`——手动 `pnpm b
 `/api`、`/health` 经代理转发到后端——开发与部署访问的是同一组路径。
 
 ```bash
-# 终端 A：后端（API + 内嵌 UI）
-cargo run -- webui                  # http://127.0.0.1:9877
+# 终端 A：后端（API + 内嵌 UI）——daemon 配置含 [webui] 段即伺服控制台
+cargo run -- run                    # 配置未开控制台时，先: xkeeper config --set webui.listen=127.0.0.1:9877
 
 # 终端 B：前端热更新开发服务器
 cd webui
@@ -398,9 +418,9 @@ Ansible role 部署见 [.ansible/README.md](.ansible/README.md)：默认免 inve
 
 ### API 概览
 
-控制台模式下（`xkeeper webui` = 守护循环 + 控制台一体），HTTP API 与 WebSocket
-同端口伺服。`/api/*` 与控制面 `/v1/*` 使用**同一份状态投影**（`server.rs`），
-数据同源：程序状态来自守护循环，日志来自内存环形缓冲（不受轮转影响）：
+守护进程按 daemon 配置的 `[webui]` 段伺服控制台（守护循环 + 控制台一体），
+HTTP API 与 WebSocket 同端口伺服。`/api/*` 与控制面 `/v1/*` 使用**同一份状态投影**
+（`server.rs`），数据同源：程序状态来自守护循环，日志来自内存环形缓冲（不受轮转影响）：
 
 | 端点 | 说明 |
 |---|---|

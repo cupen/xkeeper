@@ -249,6 +249,58 @@ pub struct DaemonConfig {
     pub daemon: DaemonSettings,
     #[serde(default, rename = "app-default")]
     pub app_default: Option<AppDefaults>,
+    /// Optional `[webui]` section: its mere presence enables the embedded
+    /// console (config-driven-webui D1, presence-based — there is no
+    /// `enabled` boolean to keep the delete semantics crisp).
+    #[serde(default)]
+    pub webui: Option<WebuiSettings>,
+}
+
+/// Built-in web console listen address (`webui.listen` default).
+pub const DEFAULT_WEBUI_LISTEN: &str = "127.0.0.1:9877";
+
+/// The optional `[webui]` section of the daemon config. Only `listen` exists
+/// for now; unknown keys are rejected like everywhere else.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebuiSettings {
+    pub listen: String,
+}
+
+impl Default for WebuiSettings {
+    fn default() -> Self {
+        Self {
+            listen: DEFAULT_WEBUI_LISTEN.to_string(),
+        }
+    }
+}
+
+/// The shared `host:port` rule for `webui.listen`: non-empty, a non-empty
+/// host part and a port in 1..=65535. Write-time (`config --set`) and
+/// load-time (`validate`/`run`/`reload`) use this one gate, so a value
+/// accepted by one is accepted by the other.
+pub fn validate_listen_addr(s: &str) -> std::result::Result<(), String> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Err("must not be empty (expected host:port)".to_string());
+    }
+    if t != s {
+        return Err(format!(
+            "must not have surrounding whitespace, got {s:?} (expected host:port)"
+        ));
+    }
+    let Some((host, port)) = s.rsplit_once(':') else {
+        return Err(format!("must be host:port, got {s:?} (missing port)"));
+    };
+    if host.is_empty() {
+        return Err(format!("must be host:port, got {s:?} (missing host)"));
+    }
+    match port.parse::<u16>() {
+        Ok(p) if p > 0 => Ok(()),
+        _ => Err(format!(
+            "port must be an integer in 1..=65535, got {port:?}"
+        )),
+    }
 }
 
 /// Built-in rotation defaults: 50MB per file, 2 rotated files kept
@@ -317,7 +369,14 @@ impl DaemonConfig {
         DaemonConfig {
             daemon: DaemonSettings::default(),
             app_default: None,
+            webui: None,
         }
+    }
+
+    /// The webui console intent this config expresses: `None` when the
+    /// `[webui]` section is absent (console off, presence-based).
+    pub fn webui_listen(&self) -> Option<&str> {
+        self.webui.as_ref().map(|w| w.listen.as_str())
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -351,6 +410,11 @@ impl DaemonConfig {
         }
         if let Some(def) = &self.app_default {
             check_level_defaults("[app-default]", def, &mut errors);
+        }
+        if let Some(w) = &self.webui {
+            if let Err(e) = validate_listen_addr(&w.listen) {
+                errors.push(format!("webui.listen: {e}"));
+            }
         }
         if errors.is_empty() {
             Ok(())
@@ -1177,11 +1241,18 @@ fn parse_string(s: &str) -> std::result::Result<KeyValue, String> {
     Ok(KeyValue::Str(s.to_string()))
 }
 
-/// One known `[daemon]` key: name + strong-type CLI parser. Built-in defaults
-/// are NOT copied here — they flow from [`DaemonSettings::default`] via
-/// [`daemon_key_display`] and the init template (design D3: one source of
-/// truth, no drift). `set`/`get`/`delete`/init all resolve through this table,
-/// so a later change that adds keys (e.g. `[webui]`) extends one list.
+/// `webui.listen` parser: the same host:port gate the loader applies, so an
+/// accepted value can never fail validation after the write.
+fn parse_webui_listen(s: &str) -> std::result::Result<KeyValue, String> {
+    validate_listen_addr(s).map_err(|e| format!("webui.listen: {e}"))?;
+    Ok(KeyValue::Str(s.to_string()))
+}
+
+/// One known config key: a leaf inside a known table. Built-in defaults are
+/// NOT copied here — they flow from the settings structs' `Default` impls via
+/// the display helpers and the init template (design D3: one source of truth,
+/// no drift). `set`/`get`/`delete` all resolve through these tables, so a
+/// later change that adds keys extends one list.
 pub struct DaemonKey {
     pub name: &'static str,
     pub parse: fn(&str) -> std::result::Result<KeyValue, String>,
@@ -1226,12 +1297,44 @@ pub fn find_daemon_key(name: &str) -> Option<&'static DaemonKey> {
     DAEMON_KEYS.iter().find(|k| k.name == name)
 }
 
+/// `[webui]` section keys (config-driven-webui): the section's presence
+/// enables the console, so `listen` is the only key — no `enabled` boolean.
+pub const WEBUI_KEYS: &[DaemonKey] = &[DaemonKey {
+    name: "listen",
+    parse: parse_webui_listen,
+}];
+
+fn find_webui_key(name: &str) -> Option<&'static DaemonKey> {
+    WEBUI_KEYS.iter().find(|k| k.name == name)
+}
+
+/// Resolve a CLI key to its `(table, leaf)`. Bare names are `[daemon]` leaf
+/// shorthand (existing behavior); `daemon.<leaf>` and `webui.<leaf>` name the
+/// table directly. Returns `None` for unknown keys.
+fn resolve_key(key: &str) -> Option<(&'static str, &str)> {
+    if let Some(leaf) = key.strip_prefix("daemon.") {
+        return find_daemon_key(leaf).map(|_| ("daemon", leaf));
+    }
+    if let Some(leaf) = key.strip_prefix("webui.") {
+        return find_webui_key(leaf).map(|_| ("webui", leaf));
+    }
+    find_daemon_key(key).map(|_| ("daemon", key))
+}
+
+/// The table a (pre-validated) key addresses — the write path routes on it.
+fn resolve_key_table(key: &str) -> Option<&'static str> {
+    resolve_key(key).map(|(table, _)| table)
+}
+
+/// The leaf of a (pre-validated) dotted or bare key.
+fn key_leaf(key: &str) -> &str {
+    key.rsplit_once('.').map(|(_, leaf)| leaf).unwrap_or(key)
+}
+
 fn known_key_list() -> String {
-    DAEMON_KEYS
-        .iter()
-        .map(|k| k.name)
-        .collect::<Vec<_>>()
-        .join(", ")
+    let mut names: Vec<String> = DAEMON_KEYS.iter().map(|k| k.name.to_string()).collect();
+    names.extend(WEBUI_KEYS.iter().map(|k| format!("webui.{}", k.name)));
+    names.join(", ")
 }
 
 /// Display one `[daemon]` field for `--get`. Reads the typed field off the
@@ -1254,25 +1357,35 @@ pub fn daemon_key_display(settings: &DaemonSettings, name: &str) -> String {
 
 /// `config --get` effective value: a missing file answers with the built-in
 /// defaults (same semantics as the daemon's `load_or_default`); a present
-/// file must be valid, and its typed value wins over the default.
+/// file must be valid, and its typed value wins over the default. A missing
+/// `[webui]` section answers with the built-in default listen too (the
+/// section is presence-based; the key itself keeps a default).
 pub fn config_effective_value(text: Option<&str>, name: &str) -> Result<String> {
-    if find_daemon_key(name).is_none() {
+    let Some((table, leaf)) = resolve_key(name) else {
         bail!(
-            "unknown [daemon] key {name:?} (known keys: {})",
+            "unknown config key {name:?} (known keys: {})",
             known_key_list()
         );
-    }
-    let settings = match text {
-        None => DaemonSettings::default(),
+    };
+    let cfg = match text {
+        None => DaemonConfig::empty(),
         Some(t) => {
             let cfg: DaemonConfig =
                 toml::from_str(t).with_context(|| "daemon config is invalid".to_string())?;
             cfg.validate()
                 .with_context(|| "daemon config is invalid".to_string())?;
-            cfg.daemon
+            cfg
         }
     };
-    Ok(daemon_key_display(&settings, name))
+    Ok(match table {
+        "daemon" => daemon_key_display(&cfg.daemon, leaf),
+        "webui" => cfg
+            .webui
+            .as_ref()
+            .map(|w| w.listen.clone())
+            .unwrap_or_else(|| DEFAULT_WEBUI_LISTEN.to_string()),
+        other => unreachable!("key tables are daemon|webui: {other:?}"),
+    })
 }
 
 /// Parse `--set K=V` pairs against the key whitelist. Every pair is validated
@@ -1283,13 +1396,21 @@ pub fn parse_sets(pairs: &[String]) -> Result<Vec<(String, KeyValue)>> {
         let (k, v) = p
             .split_once('=')
             .ok_or_else(|| anyhow::anyhow!("--set expects KEY=VALUE, got {p:?}"))?;
-        let key = find_daemon_key(k).ok_or_else(|| {
+        let key = resolve_key_table(k).ok_or_else(|| {
             anyhow::anyhow!(
-                "unknown [daemon] key {k:?} (known keys: {})",
+                "unknown config key {k:?} (known keys: {})",
                 known_key_list()
             )
         })?;
-        let kv = (key.parse)(v).map_err(|e| anyhow::anyhow!("--set {p}: {e}"))?;
+        let leaf = key_leaf(k);
+        // The leaf parser is the strong-typed gate (resolve_key validated the
+        // table membership; this validates the value).
+        let kv = match key {
+            "daemon" => (find_daemon_key(leaf).expect("resolve_key validated").parse)(v),
+            "webui" => (find_webui_key(leaf).expect("resolve_key validated").parse)(v),
+            other => unreachable!("key tables are daemon|webui: {other:?}"),
+        }
+        .map_err(|e| anyhow::anyhow!("--set {p}: {e}"))?;
         out.push((k.to_string(), kv));
     }
     Ok(out)
@@ -1370,23 +1491,33 @@ fn load_daemon_text(text: &str) -> Result<DaemonConfig> {
 
 /// `config --set`: read-modify-write via toml_edit — only the target value
 /// nodes change; untouched keys keep their order, formatting and comments.
-/// The rendered text is validated as a whole before it is returned; the
-/// caller writes it atomically (design D2/D4).
+/// Keys route to their table (`[daemon]` leaves, `webui.listen` → `[webui]`);
+/// setting a `[webui]` key creates the section when missing (that is how
+/// `--set webui.listen=...` turns the console on). The rendered text is
+/// validated as a whole before it is returned; the caller writes it
+/// atomically (design D2/D4).
 pub fn config_apply_sets(text: &str, sets: &[(String, KeyValue)]) -> Result<String> {
     load_daemon_text(text)?;
     let mut doc: toml_edit::DocumentMut = text
         .parse()
         .with_context(|| "failed to parse daemon config as TOML".to_string())?;
     for (key, kv) in sets {
+        let table = resolve_key_table(key).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown config key {key:?} (known keys: {})",
+                known_key_list()
+            )
+        })?;
+        let leaf = key_leaf(key);
         let item = doc
-            .entry("daemon")
+            .entry(table)
             .or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
         match item {
-            toml_edit::Item::Table(t) => set_value_in_table(t, key, kv),
+            toml_edit::Item::Table(t) => set_value_in_table(t, leaf, kv),
             toml_edit::Item::Value(toml_edit::Value::InlineTable(t)) => {
-                set_value_in_inline(t, key, kv)
+                set_value_in_inline(t, leaf, kv)
             }
-            _ => bail!("[daemon] entry is not a table — cannot set {key:?}"),
+            _ => bail!("[{table}] entry is not a table — cannot set {key:?}"),
         }
     }
     let rendered = doc.to_string();
@@ -1405,44 +1536,58 @@ pub enum DeleteOutcome {
     NoChange,
 }
 
-/// One resolved `--delete` target: a leaf key inside the `[daemon]` table.
-/// Bare keys are shorthand for `[daemon]` leaves (`port` ≡ `daemon.port`).
-/// A dotted path whose first segment names a known non-daemon table would
-/// delete that whole table — with the key table currently limited to
-/// `[daemon]` there is no such target yet (`--delete webui` is rejected),
-/// and future key-table entries unlock the mechanism without code changes.
+/// One resolved `--delete` target: a leaf key inside a known table, or a
+/// whole optional table. Bare keys are shorthand for `[daemon]` leaves
+/// (`port` ≡ `daemon.port`); the presence-based `[webui]` section is deleted
+/// as a whole with its bare table name (`--delete webui` = console off).
 #[derive(Debug, PartialEq)]
-struct DeleteTarget(String);
+enum DeleteTarget {
+    Leaf(&'static str, String),
+    Table(&'static str),
+}
 
 fn resolve_delete_target(path: &str) -> std::result::Result<DeleteTarget, String> {
     match path.split_once('.') {
         None => {
             if find_daemon_key(path).is_some() {
-                Ok(DeleteTarget(path.to_string()))
+                Ok(DeleteTarget::Leaf("daemon", path.to_string()))
+            } else if path == "webui" {
+                Ok(DeleteTarget::Table("webui"))
             } else {
                 Err(format!(
-                    "unknown [daemon] key {path:?} (known keys: {}; dotted paths like \
-                     daemon.port name a [daemon] leaf)",
+                    "unknown config key {path:?} (known keys: {}; a bare optional table name \
+                     deletes the whole section, e.g. --delete webui)",
                     known_key_list()
                 ))
             }
         }
-        Some((table, leaf)) => {
-            if table != "daemon" {
-                return Err(format!(
-                    "unknown table {table:?} in delete path {path:?} — the config key \
-                     table currently only covers [daemon]"
-                ));
+        Some((table, leaf)) => match table {
+            "daemon" => {
+                if find_daemon_key(leaf).is_some() {
+                    Ok(DeleteTarget::Leaf("daemon", leaf.to_string()))
+                } else {
+                    Err(format!(
+                        "unknown [daemon] key {path:?} (known keys: {})",
+                        known_key_list()
+                    ))
+                }
             }
-            if find_daemon_key(leaf).is_some() {
-                Ok(DeleteTarget(leaf.to_string()))
-            } else {
-                Err(format!(
-                    "unknown [daemon] key {path:?} (known keys: {})",
-                    known_key_list()
-                ))
+            "webui" => {
+                if find_webui_key(leaf).is_some() {
+                    Ok(DeleteTarget::Leaf("webui", leaf.to_string()))
+                } else {
+                    Err(format!(
+                        "unknown [webui] key {path:?} (known keys: {}; delete the whole \
+                         section with `--delete webui`)",
+                        known_key_list()
+                    ))
+                }
             }
-        }
+            other => Err(format!(
+                "unknown table {other:?} in delete path {path:?} — the config key table covers \
+                 [daemon] leaves and the [webui] section"
+            )),
+        },
     }
 }
 
@@ -1450,7 +1595,8 @@ fn resolve_delete_target(path: &str) -> std::result::Result<DeleteTarget, String
 /// the value nodes via toml_edit. Absent targets are skipped; when nothing
 /// was removed the original text is returned untouched as `NoChange`.
 /// Deletion puts a key back into its "unconfigured" state (built-in defaults
-/// apply again). Rendered output is validated like `--set`.
+/// apply again); deleting the `[webui]` table switches the console off.
+/// Rendered output is validated like `--set`.
 pub fn config_apply_deletes(text: &str, targets: &[String]) -> Result<DeleteOutcome> {
     load_daemon_text(text)?;
     let mut resolved = Vec::new();
@@ -1461,26 +1607,34 @@ pub fn config_apply_deletes(text: &str, targets: &[String]) -> Result<DeleteOutc
         .parse()
         .with_context(|| "failed to parse daemon config as TOML".to_string())?;
     let mut any = false;
-    match doc.get_mut("daemon") {
-        Some(toml_edit::Item::Table(tbl)) => {
-            for t in &resolved {
-                if tbl.contains_key(&t.0) {
-                    tbl.remove(&t.0);
+    for target in &resolved {
+        match target {
+            DeleteTarget::Leaf(table, leaf) => match doc.get_mut(*table) {
+                Some(toml_edit::Item::Table(tbl)) => {
+                    if tbl.contains_key(leaf.as_str()) {
+                        tbl.remove(leaf.as_str());
+                        any = true;
+                    }
+                }
+                // Dotted-key style config: `daemon.port = 1` parses as an
+                // inline table.
+                Some(toml_edit::Item::Value(toml_edit::Value::InlineTable(tbl))) => {
+                    if tbl.contains_key(leaf.as_str()) {
+                        tbl.remove(leaf.as_str());
+                        any = true;
+                    }
+                }
+                // Table not present at all: the target is absent.
+                _ => {}
+            },
+            DeleteTarget::Table(table) => {
+                // Covers both the `[webui]` table style and the dotted-key
+                // style (a root `webui` key holding an inline table).
+                if doc.remove(*table).is_some() {
                     any = true;
                 }
             }
         }
-        // Dotted-key style config: `daemon.port = 1` parses as an inline table.
-        Some(toml_edit::Item::Value(toml_edit::Value::InlineTable(tbl))) => {
-            for t in &resolved {
-                if tbl.contains_key(&t.0) {
-                    tbl.remove(&t.0);
-                    any = true;
-                }
-            }
-        }
-        // No [daemon] table at all: every target is absent.
-        _ => {}
     }
     if !any {
         return Ok(DeleteOutcome::NoChange);
@@ -1547,6 +1701,9 @@ pub fn render_init_template() -> String {
 #
 # Every field below is the built-in default; edit freely, or delete the file
 # entirely (a missing config means \"run with defaults\").
+# The embedded web console is opt-in and stays OFF by default: add a
+# `[webui]` section (optionally with `listen = \"127.0.0.1:9877\"`) to enable
+# it, or run `xkeeper config --set webui.listen=127.0.0.1:9877` + reload.
 # Validate:  xkeeper validate          Edit:  xkeeper config --edit
 # Scripted:  xkeeper config --get port | --set port=8080 | --delete port
 
@@ -2324,7 +2481,8 @@ log_buffer_lines = 7
     }
 
     /// Delete targets resolve through the whitelist; unknown keys/tables are
-    /// rejected (spec: --delete webui 目前必须被拒绝).
+    /// rejected (spec: 未知键/未知表拒绝). The presence-based `[webui]`
+    /// section deletes as a whole with its bare table name.
     #[test]
     fn delete_resolves_paths_and_rejects_unknowns() {
         // Bare key ≡ daemon.port.
@@ -2337,11 +2495,29 @@ log_buffer_lines = 7
         // Explicit dotted form works too.
         let r = config_apply_deletes("[daemon]\nport = 1\n", &["daemon.port".to_string()]);
         assert!(matches!(r, Ok(DeleteOutcome::Changed(_))), "{r:?}");
+        // `--delete webui` removes the whole [webui] section (console off).
+        let base = "[daemon]\nport = 1\n\n[webui]\n# console note\nlisten = \"127.0.0.1:9877\"\n";
+        let rendered =
+            match config_apply_deletes(base, &["webui".to_string()]).unwrap() {
+                DeleteOutcome::Changed(t) => t,
+                other => panic!("expected Changed, got {other:?}"),
+            };
+        assert!(!rendered.contains("webui") && !rendered.contains("listen"), "{rendered}");
+        assert!(rendered.contains("port = 1"), "untouched [daemon] kept: {rendered}");
+        assert!(
+            !rendered.contains("# console note"),
+            "the section's comments go with it: {rendered}"
+        );
+        // Idempotent when the section is absent.
+        assert_eq!(
+            config_apply_deletes("[daemon]\nport = 1\n", &["webui".to_string()]).unwrap(),
+            DeleteOutcome::NoChange
+        );
         // Unknown leaf, unknown table, bare table name, deeper path.
         for bad in [
             "foo",
-            "webui",
             "webui.theme",
+            "webui.listen.x",
             "daemon",
             "daemon.port.x",
             "daemon.foo",
@@ -2524,6 +2700,185 @@ log_buffer_lines = 7
             "[daemon]\nport = 8080\n"
         );
         assert!(!tmp.join("daemon.toml.tmp").exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // -- [webui] section (config-driven-webui, tasks 1.1/1.2/1.3) -------------
+
+    /// The `[webui]` section is presence-based: absent = None, present with
+    /// only a comment/empty body = default listen; unknown keys are rejected
+    /// at parse time; an illegal listen fails whole-config validation.
+    #[test]
+    fn webui_section_parse_and_validate() {
+        // No section: disabled.
+        let none: DaemonConfig = toml::from_str("[daemon]\nport = 1\n").unwrap();
+        assert!(none.webui.is_none());
+        assert_eq!(none.webui_listen(), None);
+        assert!(none.validate().is_ok());
+        // Empty section (bare header): enabled with the default listen.
+        let empty: DaemonConfig = toml::from_str("[webui]\n").unwrap();
+        assert_eq!(empty.webui.as_ref().unwrap().listen, DEFAULT_WEBUI_LISTEN);
+        // Explicit value round-trips.
+        let explicit: DaemonConfig =
+            toml::from_str("[webui]\nlisten = \"0.0.0.0:8080\"\n").unwrap();
+        assert_eq!(explicit.webui_listen(), Some("0.0.0.0:8080"));
+        assert!(explicit.validate().is_ok());
+        // Unknown keys inside the section are rejected (deny_unknown_fields).
+        let r: Result<DaemonConfig, _> = toml::from_str("[webui]\nauth = true\n");
+        assert!(r.is_err(), "unknown [webui] key must be rejected");
+        // Illegal listen values fail validation and name the field.
+        for bad in ["9877", "", " ", ":9877", "127.0.0.1:0", "127.0.0.1:99999", "127.0.0.1:x"] {
+            let cfg: DaemonConfig =
+                toml::from_str(&format!("[webui]\nlisten = \"{bad}\"\n")).unwrap();
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("webui.listen"),
+                "illegal listen {bad:?} must name the field: {err}"
+            );
+        }
+        // The shared gate accepts host:port forms (ipv6 bracket host too).
+        for ok in ["127.0.0.1:9877", "0.0.0.0:80", "[::1]:9877", "localhost:1"] {
+            assert!(
+                validate_listen_addr(ok).is_ok(),
+                "{ok:?} must be accepted"
+            );
+        }
+    }
+
+    /// `--get webui.listen`: the built-in default answers when the file or the
+    /// section is missing; the file value wins when configured.
+    #[test]
+    fn get_webui_listen_falls_back_to_default() {
+        // Missing file → default.
+        assert_eq!(
+            config_effective_value(None, "webui.listen").unwrap(),
+            "127.0.0.1:9877"
+        );
+        // Existing file without the section → default (console off, but the
+        // key still answers with its default).
+        assert_eq!(
+            config_effective_value(Some("[daemon]\nport = 1\n"), "webui.listen").unwrap(),
+            "127.0.0.1:9877"
+        );
+        // Section present → its value.
+        assert_eq!(
+            config_effective_value(
+                Some("[webui]\nlisten = \"0.0.0.0:8080\"\n"),
+                "webui.listen"
+            )
+            .unwrap(),
+            "0.0.0.0:8080"
+        );
+        // Unknown [webui] leaf / bare table name are rejected for --get.
+        assert!(config_effective_value(None, "webui.theme").is_err());
+        assert!(config_effective_value(None, "webui").is_err());
+        // daemon.<leaf> dotted form works for --get too.
+        assert_eq!(
+            config_effective_value(Some("[daemon]\nport = 1\n"), "daemon.port").unwrap(),
+            "1"
+        );
+    }
+
+    /// `--set webui.listen` writes into the `[webui]` section, creating it
+    /// when missing (写入即开启); an illegal value is rejected by the parser
+    /// before anything is written, and an existing section keeps its comments.
+    #[test]
+    fn set_webui_listen_creates_section_and_validates() {
+        // Creates the section on a config without one.
+        let rendered = config_apply_sets(
+            "[daemon]\nport = 1234\n",
+            &[("webui.listen".to_string(), KeyValue::Str("127.0.0.1:9877".into()))],
+        )
+        .unwrap();
+        assert!(rendered.contains("[webui]"), "section created: {rendered}");
+        assert!(rendered.contains("listen = \"127.0.0.1:9877\""), "{rendered}");
+        load_daemon_text(&rendered).unwrap();
+        assert_eq!(
+            config_effective_value(Some(&rendered), "webui.listen").unwrap(),
+            "127.0.0.1:9877"
+        );
+        // Existing section: only the value node changes, comments survive.
+        let base = "[webui]\n# console note\nlisten = \"127.0.0.1:1\" # trailing\n";
+        let rendered = config_apply_sets(
+            base,
+            &[("webui.listen".to_string(), KeyValue::Str("0.0.0.0:9".into()))],
+        )
+        .unwrap();
+        assert!(rendered.contains("# console note"), "{rendered}");
+        assert!(rendered.contains("listen = \"0.0.0.0:9\" # trailing"), "{rendered}");
+        // The daemon table is untouched.
+        let rendered = config_apply_sets(
+            "[daemon]\nport = 1234\n",
+            &[
+                ("port".to_string(), KeyValue::Int(4321)),
+                ("webui.listen".to_string(), KeyValue::Str("127.0.0.1:9877".into())),
+            ],
+        )
+        .unwrap();
+        assert!(rendered.contains("port = 4321") && rendered.contains("[webui]"), "{rendered}");
+        // parse_sets routes the webui key through the strong-typed parser.
+        let parsed = parse_sets(&["webui.listen=9877".to_string()]).is_err();
+        assert!(parsed, "a host-less listen is rejected at parse time");
+        let parsed = parse_sets(&["webui.listen=".to_string()]).is_err();
+        assert!(parsed, "an empty listen is rejected at parse time");
+        let parsed = parse_sets(&["webui.listen=127.0.0.1:9877".to_string()]).unwrap();
+        assert_eq!(parsed[0].0, "webui.listen");
+        // Unknown keys under the section are rejected.
+        assert!(parse_sets(&["webui.theme=dark".to_string()]).is_err());
+        // Surrounding whitespace would pass a trim-based check but fail the
+        // later TcpListener::bind — rejected at both gates.
+        assert!(parse_sets(&["webui.listen= 127.0.0.1:9877".to_string()]).is_err());
+        assert!(load_daemon_text("[daemon]\n[webui]\nlisten = \" 127.0.0.1:9877\"\n").is_err());
+    }
+
+    /// `--delete webui.listen` removes the leaf; the section (if otherwise
+    /// empty) means "enabled with the default listen" — the off switch is the
+    /// whole-table delete, so this asserts the leaf path keeps that semantics.
+    #[test]
+    fn delete_webui_listen_leaf() {
+        let base = "[webui]\n# note\nlisten = \"127.0.0.1:9877\"\n";
+        let rendered =
+            match config_apply_deletes(base, &["webui.listen".to_string()]).unwrap() {
+                DeleteOutcome::Changed(t) => t,
+                other => panic!("expected Changed, got {other:?}"),
+            };
+        assert!(!rendered.contains("127.0.0.1:9877"), "{rendered}");
+        // The empty section still parses (presence = enabled, default listen).
+        let cfg: DaemonConfig = toml::from_str(&rendered).unwrap();
+        assert!(cfg.webui.is_some());
+        assert_eq!(cfg.webui_listen(), Some(DEFAULT_WEBUI_LISTEN));
+        // Dotted-key style file.
+        let dotted = "webui.listen = \"127.0.0.1:1\"\n";
+        let rendered =
+            match config_apply_deletes(dotted, &["webui.listen".to_string()]).unwrap() {
+                DeleteOutcome::Changed(t) => t,
+                other => panic!("expected Changed, got {other:?}"),
+            };
+        assert!(!rendered.contains("webui"), "{rendered}");
+    }
+
+    /// The `--init` template does not render the `[webui]` section (task 1.3:
+    /// the console stays off by default); the product loads clean and parses
+    /// with no webui section.
+    #[test]
+    fn init_template_has_no_webui_section() {
+        let text = render_init_template();
+        let cfg: DaemonConfig = toml::from_str(&text).expect("template must parse");
+        cfg.validate().expect("template must validate");
+        assert!(cfg.webui.is_none(), "init must not enable the console");
+        assert!(
+            !text.contains("[webui]\n"),
+            "no rendered [webui] section in the template:\n{text}"
+        );
+        // The opt-in hint is present (first-contact discoverability).
+        assert!(text.contains("[webui]"), "the template explains the opt-in");
+        // config --init over the real filesystem loads with no webui section.
+        let tmp = std::env::temp_dir().join(format!("xk-cfg-init-webui-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let cfg_path = tmp.join("daemon.toml");
+        config_init(&cfg_path).unwrap();
+        let (loaded, existed) = DaemonConfig::load_or_default(&cfg_path).unwrap();
+        assert!(existed && loaded.webui.is_none());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

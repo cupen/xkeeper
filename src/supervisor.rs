@@ -375,6 +375,9 @@ pub struct Supervisor {
     /// (program, action) mutual exclusion for custom actions. Only the
     /// control-plane worker threads touch it — never the supervision loop.
     pub actions: Arc<crate::action::ActionRuns>,
+    /// Web-console intent handle (config-driven-webui): reload publishes a
+    /// new intent here, the resident manager thread converges the runtime.
+    pub webui: Arc<WebuiControl>,
     config_path: Mutex<PathBuf>,
     started: std::time::Instant,
     interval: Duration,
@@ -401,6 +404,7 @@ impl Supervisor {
             health_tasks: Arc::new(Mutex::new(HashMap::new())),
             metrics: Arc::new(crate::metrics::MetricsTable::new()),
             actions: crate::action::ActionRuns::new(),
+            webui: WebuiControl::new(),
             config_path: Mutex::new(config_dir.join("xkeeper.toml")),
             started: std::time::Instant::now(),
             interval,
@@ -963,9 +967,23 @@ impl Supervisor {
     }
 
     /// `reload` now only detects: rescan and publish the pending preview.
+    /// The `[webui]` section never enters pending — it is hot-applied here:
+    /// publish the new intent to the console manager and wait (bounded) for
+    /// convergence. A bind failure degrades to a note (Ok), while an invalid
+    /// `[webui]` section fails the whole reload earlier via `detect`
+    /// (load-time validation), leaving the running console untouched.
     fn cmd_reload(&self) -> Result<String> {
         let doc = self.detect(true)?;
-        Ok(render_pending(&doc))
+        let mut out = render_pending(&doc);
+        let config_path = self.config_path.lock().unwrap().clone();
+        let (new_config, _) = DaemonConfig::load_or_default(&config_path)
+            .map_err(|e| anyhow::anyhow!("reload aborted, daemon config invalid: {e:#}"))?;
+        let generation = self.webui.set_desired(WebuiIntent::from_config(&new_config));
+        // Degraded convergence is logged by the webui manager; the note is
+        // appended to the reply below for the CLI caller.
+        let (_, note) = self.webui.wait_applied(generation, WEBUI_CONVERGE_TIMEOUT);
+        out.push_str(&format!("\nwebui: {note}"));
+        Ok(out)
     }
 
     /// `apply`: detect fresh, then act on the in-scope part of the diff.
@@ -1360,6 +1378,318 @@ impl Supervisor {
     }
 }
 
+// -- Web console lifecycle (config-driven-webui) ----------------------------
+
+/// How long `reload` waits for the webui manager to converge on a new intent.
+const WEBUI_CONVERGE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the manager waits for a running console to stop before detaching
+/// it (the detached thread ends on its own; its port may linger briefly).
+const WEBUI_STOP_WAIT: Duration = Duration::from_secs(3);
+/// Manager poll slice: reaps dead instances while idle between intents.
+const WEBUI_MANAGER_POLL: Duration = Duration::from_millis(500);
+/// How long `start_webui` waits for the bind report before assuming success.
+const WEBUI_BIND_WAIT: Duration = Duration::from_secs(5);
+
+/// The desired web-console state, derived from the `[webui]` config section:
+/// present = enabled at `listen`, absent = disabled (design D1: presence IS
+/// the switch, there is no boolean).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebuiIntent {
+    pub enabled: bool,
+    pub listen: String,
+}
+
+impl WebuiIntent {
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            listen: String::new(),
+        }
+    }
+
+    pub fn from_config(config: &DaemonConfig) -> Self {
+        match config.webui_listen() {
+            Some(listen) => Self {
+                enabled: true,
+                listen: listen.to_string(),
+            },
+            None => Self::disabled(),
+        }
+    }
+
+    /// Does an instance bound to `listen` already satisfy this intent?
+    fn serves(&self, listen: &str) -> bool {
+        self.enabled && self.listen == listen
+    }
+}
+
+/// Shared intent mailbox between the reload path (writer) and the resident
+/// manager thread (reader/converger). Plain Mutex + Condvar on purpose: the
+/// manager must be usable before any tokio runtime exists and must never be
+/// tied to one (design D3). A generation counter makes the handshake
+/// race-free: `set_desired` bumps it and `wait_applied` waits until the
+/// manager reports exactly that generation.
+#[derive(Default)]
+struct WebuiShared {
+    /// `None` = disabled intent at generation 0.
+    desired: Option<(WebuiIntent, u64)>,
+    /// Latest `(generation, ok, note)` reported by the manager.
+    applied: Option<(u64, bool, String)>,
+}
+
+/// Handle for publishing the console intent and waiting for convergence.
+/// Lives on `Supervisor` so the API threads (reload) and main.rs (startup)
+/// share one instance with the manager thread.
+pub struct WebuiControl {
+    shared: Mutex<WebuiShared>,
+    cv: Condvar,
+}
+
+impl WebuiControl {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            shared: Mutex::new(WebuiShared::default()),
+            cv: Condvar::new(),
+        })
+    }
+
+    /// Publish a new intent and return its generation (reload/startup path).
+    pub fn set_desired(&self, intent: WebuiIntent) -> u64 {
+        let mut sh = self.shared.lock().unwrap();
+        let generation = sh.desired.as_ref().map(|(_, g)| *g).unwrap_or(0) + 1;
+        sh.desired = Some((intent, generation));
+        sh.applied = None;
+        self.cv.notify_all();
+        generation
+    }
+
+    /// Current intent + generation (manager thread).
+    fn desired(&self) -> (WebuiIntent, u64) {
+        let sh = self.shared.lock().unwrap();
+        sh.desired
+            .clone()
+            .unwrap_or((WebuiIntent::disabled(), 0))
+    }
+
+    /// Bounded wait until the manager reports `generation` applied. On timeout the
+    /// console may still converge later; the caller surfaces the note.
+    pub fn wait_applied(&self, generation: u64, timeout: Duration) -> (bool, String) {
+        let mut sh = self.shared.lock().unwrap();
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some((g, ok, note)) = &sh.applied {
+                if *g >= generation {
+                    return (*ok, note.clone());
+                }
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return (
+                    false,
+                    "webui change did not converge in time (the manager retries on the next reload)"
+                        .to_string(),
+                );
+            }
+            let (guard, _) = self
+                .cv
+                .wait_timeout(sh, deadline.saturating_duration_since(now))
+                .unwrap();
+            sh = guard;
+        }
+    }
+
+    /// Manager thread: record the outcome for generation `generation`.
+    fn mark_applied(&self, generation: u64, ok: bool, note: String) {
+        let mut sh = self.shared.lock().unwrap();
+        sh.applied = Some((generation, ok, note));
+        self.cv.notify_all();
+    }
+
+    /// Manager thread: bounded wait for a newer intent. Wakes early on
+    /// `set_desired` (it notifies the condvar); daemon shutdown is noticed
+    /// by the loop's own poll at the latest.
+    fn wait_for_change(&self, seen: u64, timeout: Duration) {
+        let guard = self.shared.lock().unwrap();
+        let current = guard.desired.as_ref().map(|(_, g)| *g).unwrap_or(0);
+        if current > seen {
+            return;
+        }
+        let _ = self.cv.wait_timeout(guard, timeout).unwrap();
+    }
+}
+
+/// One live console instance owned by the manager thread.
+struct RunningWebui {
+    listen: String,
+    stop: Arc<crate::web::WebuiLifecycle>,
+    handle: Option<std::thread::JoinHandle<Result<()>>>,
+}
+
+impl RunningWebui {
+    /// If the serve thread already exited (unexpected crash), take and join
+    /// it. Returns true when an instance was reaped.
+    fn reap_if_finished(&mut self) -> bool {
+        let done = self
+            .handle
+            .as_ref()
+            .map(|h| h.is_finished())
+            .unwrap_or(true);
+        if done {
+            if let Some(h) = self.handle.take() {
+                if let Err(e) = h.join() {
+                    error!("webui console thread panicked: {e:?}");
+                }
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Ask the instance to stop and wait (bounded) for its thread. Returns
+    /// false when it did not stop in time — the thread is detached and its
+    /// port may stay bound a little longer; a same-port restart then fails
+    /// the bind, which the manager reports non-fatally (design D5).
+    fn stop_and_wait(&mut self) -> bool {
+        self.stop.stop();
+        let deadline = Instant::now() + WEBUI_STOP_WAIT;
+        while Instant::now() < deadline {
+            if self.handle.as_ref().map(|h| h.is_finished()).unwrap_or(true) {
+                if let Some(h) = self.handle.take() {
+                    let _ = h.join();
+                }
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        warn!(
+            "webui console on {} did not stop within {:?}; detaching it",
+            self.listen, WEBUI_STOP_WAIT
+        );
+        self.handle = None;
+        false
+    }
+}
+
+/// Spawn one console instance and report `(instance, ok, note)`. Bind
+/// failures are non-fatal (design D5): the daemon keeps running without the
+/// console and the note explains how to retry.
+fn start_webui(sup: &Arc<Supervisor>, listen: &str) -> (Option<RunningWebui>, bool, String) {
+    let stop = crate::web::WebuiLifecycle::new();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let sup2 = Arc::clone(sup);
+    let stop2 = Arc::clone(&stop);
+    let addr = listen.to_string();
+    let handle = std::thread::Builder::new()
+        .name("webui".into())
+        .spawn(move || crate::web::serve(sup2, &addr, stop2, Some(tx)))
+        .expect("spawn webui thread");
+    match rx.recv_timeout(WEBUI_BIND_WAIT) {
+        Ok(Ok(bound)) => (
+            Some(RunningWebui {
+                listen: bound.clone(),
+                stop,
+                handle: Some(handle),
+            }),
+            true,
+            format!("webui console serving on http://{bound}"),
+        ),
+        Ok(Err(e)) => {
+            let _ = handle.join();
+            (
+                None,
+                false,
+                format!(
+                    "webui console unavailable: {e:#} (daemon continues without it; fix the config and reload to retry)"
+                ),
+            )
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => (
+            None,
+            false,
+            "webui console exited during startup".to_string(),
+        ),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            // Slow bind (rare): assume it is coming; the manager reaps the
+            // instance if the thread dies.
+            (
+                Some(RunningWebui {
+                    listen: listen.to_string(),
+                    stop,
+                    handle: Some(handle),
+                }),
+                true,
+                format!("webui console binding on {listen}"),
+            )
+        }
+    }
+}
+
+/// Resident manager: converges the running console to the latest intent.
+/// Runs on its own thread for the daemon's lifetime; on daemon shutdown it
+/// stops the console first so the port is released promptly.
+pub fn webui_manager_loop(sup: Arc<Supervisor>) {
+    let mut running: Option<RunningWebui> = None;
+    let mut converged_gen: u64 = 0;
+    loop {
+        if sup.state.lock().unwrap().shutdown.load(Ordering::SeqCst) {
+            if let Some(r) = running.as_mut() {
+                r.stop_and_wait();
+            }
+            return;
+        }
+        // Reap crashed instances. No auto-restart (design D5): the console
+        // comes back on the next intent change (i.e. an explicit reload).
+        let reaped = running
+            .as_mut()
+            .map(|r| (r.reap_if_finished(), r.listen.clone()))
+            .filter(|(done, _)| *done)
+            .map(|(_, listen)| listen);
+        if let Some(listen) = reaped {
+            error!(
+                "webui console on {listen} exited unexpectedly; daemon continues without it (reload to retry)"
+            );
+            running = None;
+        }
+        let (desired, generation) = sup.webui.desired();
+        if generation > converged_gen {
+            let matches = running
+                .as_ref()
+                .map(|r| desired.serves(&r.listen))
+                .unwrap_or(false);
+            if matches {
+                sup.webui.mark_applied(
+                    generation,
+                    true,
+                    format!("webui console serving on http://{}", desired.listen),
+                );
+            } else {
+                if let Some(old) = running.as_mut() {
+                    old.stop_and_wait();
+                }
+                running = None;
+                if desired.enabled {
+                    info!("webui console starting on {}", desired.listen);
+                    let (inst, ok, note) = start_webui(&sup, &desired.listen);
+                    running = inst;
+                    // Log degraded starts (bind failure, early exit) right
+                    // here so both `run` startup and `reload` record it —
+                    // the note alone is only visible to reload's reply.
+                    if !ok {
+                        error!("{note}");
+                    }
+                    sup.webui.mark_applied(generation, ok, note);
+                } else {
+                    info!("webui console disabled");
+                    sup.webui
+                        .mark_applied(generation, true, "webui console disabled".to_string());
+                }
+            }
+            converged_gen = generation;
+        }
+        sup.webui.wait_for_change(generation, WEBUI_MANAGER_POLL);
+    }
+}
+
 /// mtime+size of a config file, or None when it cannot be stat'ed.
 fn file_stamp(path: &Path) -> Option<(std::time::SystemTime, u64)> {
     let m = std::fs::metadata(path).ok()?;
@@ -1548,6 +1878,7 @@ mod tests {
             "demo",
             "[app]\nautostart = true\n[program.p]\ncommand = 'sleep 30'\nstartsecs = 0.0\n",
         );
+        let mgr = spawn_manager(&sup);
         wait_state(&sup, "p", ProgramState::Running);
         let pid_before = sup.state.lock().unwrap().programs["p"].pid();
 
@@ -1560,6 +1891,10 @@ mod tests {
         assert!(
             out.contains("p"),
             "preview lists the changed program: {out}"
+        );
+        assert!(
+            out.contains("webui: webui console disabled"),
+            "reload always reports the webui outcome: {out}"
         );
 
         {
@@ -1574,6 +1909,7 @@ mod tests {
             assert_eq!(st.pending.programs.len(), 1);
             assert!(st.pending.programs[0].running);
         }
+        end_manager(&sup, mgr);
         let _ = sup.shutdown_all();
     }
 
@@ -2231,6 +2567,349 @@ mod tests {
         assert_eq!(e, SignalError::UnknownProgram);
         assert_eq!(e.http_status(), 404);
         let _ = pid;
+        let _ = sup.shutdown_all();
+    }
+
+    // -- web console lifecycle (config-driven-webui) ------------------------
+
+    /// Spawn the resident manager thread like run_daemon does. Tests end it
+    /// with [`end_manager`].
+    fn spawn_manager(sup: &Arc<Supervisor>) -> std::thread::JoinHandle<()> {
+        let sup2 = Arc::clone(sup);
+        std::thread::Builder::new()
+            .name("webui-manager-test".into())
+            .spawn(move || webui_manager_loop(sup2))
+            .unwrap()
+    }
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    /// Flip the daemon shutdown flag so the manager stops any console and
+    /// returns, then join it.
+    fn end_manager(sup: &Supervisor, mgr: std::thread::JoinHandle<()>) {
+        sup.state
+            .lock()
+            .unwrap()
+            .shutdown
+            .store(true, Ordering::SeqCst);
+        mgr.join().unwrap();
+    }
+
+    fn wait_applied_ok(sup: &Supervisor, generation: u64) -> String {
+        let (ok, note) = sup.webui.wait_applied(generation, Duration::from_secs(10));
+        assert!(ok, "manager converged: {note}");
+        note
+    }
+
+    /// manager: an enabled intent starts the console, a disabled one stops
+    /// it and closes the port (reload 动态开关的服务端机制).
+    #[test]
+    fn webui_manager_follows_intent_on_and_off() {
+        let (sup, _) = setup(
+            "demo",
+            "[app]\nautostart = false\n[program.p]\ncommand = 'true'\nstartsecs = 0.0\n",
+        );
+        let listen = format!("127.0.0.1:{}", free_port());
+        let mgr = spawn_manager(&sup);
+
+        let generation = sup.webui.set_desired(WebuiIntent {
+            enabled: true,
+            listen: listen.clone(),
+        });
+        let note = wait_applied_ok(&sup, generation);
+        assert!(
+            note.contains("serving on http://"),
+            "note names the serving URL: {note}"
+        );
+        assert!(
+            std::net::TcpStream::connect(&listen).is_ok(),
+            "console reachable once enabled"
+        );
+
+        let generation = sup.webui.set_desired(WebuiIntent::disabled());
+        let note = wait_applied_ok(&sup, generation);
+        assert_eq!(note, "webui console disabled");
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            std::net::TcpStream::connect(&listen).is_err(),
+            "console port closed after disable"
+        );
+        end_manager(&sup, mgr);
+        let _ = sup.shutdown_all();
+    }
+
+    /// manager: a listen change stops the old instance and binds the new
+    /// address (reload 换址重绑).
+    #[test]
+    fn webui_manager_rebinds_on_listen_change() {
+        let (sup, _) = setup(
+            "demo",
+            "[app]\nautostart = false\n[program.p]\ncommand = 'true'\nstartsecs = 0.0\n",
+        );
+        let old = format!("127.0.0.1:{}", free_port());
+        let new = format!("127.0.0.1:{}", free_port());
+        let mgr = spawn_manager(&sup);
+
+        let generation = sup.webui.set_desired(WebuiIntent {
+            enabled: true,
+            listen: old.clone(),
+        });
+        wait_applied_ok(&sup, generation);
+        assert!(std::net::TcpStream::connect(&old).is_ok());
+
+        let generation = sup.webui.set_desired(WebuiIntent {
+            enabled: true,
+            listen: new.clone(),
+        });
+        wait_applied_ok(&sup, generation);
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            std::net::TcpStream::connect(&old).is_err(),
+            "old port released after rebind"
+        );
+        assert!(
+            std::net::TcpStream::connect(&new).is_ok(),
+            "new port serving after rebind"
+        );
+        end_manager(&sup, mgr);
+        let _ = sup.shutdown_all();
+    }
+
+    /// manager: binding a taken port degrades non-fatally (D5) — the daemon
+    /// stays alive, the failure is reported, and the next intent change
+    /// (once the port is free again) recovers.
+    #[test]
+    fn webui_bind_failure_degrades_then_recovers() {
+        let (sup, _) = setup(
+            "demo",
+            "[app]\nautostart = false\n[program.p]\ncommand = 'true'\nstartsecs = 0.0\n",
+        );
+        let blocker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let taken = format!("{}", blocker.local_addr().unwrap());
+        let mgr = spawn_manager(&sup);
+
+        let generation = sup.webui.set_desired(WebuiIntent {
+            enabled: true,
+            listen: taken.clone(),
+        });
+        let (ok, note) = sup.webui.wait_applied(generation, Duration::from_secs(10));
+        assert!(!ok, "occupied port must not report success: {note}");
+        assert!(
+            note.contains("unavailable") && note.contains("reload to retry"),
+            "note explains the degradation and the retry path: {note}"
+        );
+        // The daemon itself is unaffected.
+        assert!(!sup.state.lock().unwrap().shutdown.load(Ordering::SeqCst));
+
+        // Free the port and re-publish the same intent: the manager retries.
+        drop(blocker);
+        std::thread::sleep(Duration::from_millis(100));
+        let generation = sup.webui.set_desired(WebuiIntent {
+            enabled: true,
+            listen: taken.clone(),
+        });
+        wait_applied_ok(&sup, generation);
+        assert!(
+            std::net::TcpStream::connect(&taken).is_ok(),
+            "console serving after the port freed up"
+        );
+        end_manager(&sup, mgr);
+        let _ = sup.shutdown_all();
+    }
+
+    /// The intent mapping is the single source for both startup (`run_daemon`)
+    /// and reload (`cmd_reload`): section absent = disabled, bare section =
+    /// enabled at the built-in default listen, explicit listen passes through
+    /// (webui-api: 启动时按配置伺服; configuration: `listen` 缺省 127.0.0.1:9877).
+    #[test]
+    fn webui_intent_from_config_maps_presence_and_default() {
+        let off: DaemonConfig = toml::from_str("[daemon]\nport = 1\n").unwrap();
+        assert_eq!(WebuiIntent::from_config(&off), WebuiIntent::disabled());
+        // A bare `[webui]` table enables the console at the default address.
+        let bare: DaemonConfig = toml::from_str("[webui]\n").unwrap();
+        assert_eq!(
+            WebuiIntent::from_config(&bare),
+            WebuiIntent {
+                enabled: true,
+                listen: crate::config::DEFAULT_WEBUI_LISTEN.to_string(),
+            }
+        );
+        // An explicit listen passes through verbatim.
+        let explicit: DaemonConfig =
+            toml::from_str("[webui]\nlisten = '0.0.0.0:8080'\n").unwrap();
+        assert_eq!(
+            WebuiIntent::from_config(&explicit),
+            WebuiIntent {
+                enabled: true,
+                listen: "0.0.0.0:8080".to_string(),
+            }
+        );
+    }
+
+    /// reload: an unchanged `[webui]` section re-publishes the same intent and
+    /// must NOT bounce the console (a live TCP connection survives), while an
+    /// invalid section fails the whole reload with the serving console
+    /// untouched (webui-api: reload 时 [webui] 段非法 → 保持既有伺服状态不变),
+    /// and a later valid section converges again.
+    #[test]
+    #[cfg(unix)]
+    fn reload_invalid_webui_keeps_serving_and_recovers() {
+        use std::io::Read as _;
+        let (sup, _app_file) = setup(
+            "demo",
+            "[app]\nautostart = false\n[program.p]\ncommand = 'true'\nstartsecs = 0.0\n",
+        );
+        let cfg_path = sup.config_path();
+        let mgr = spawn_manager(&sup);
+        let port_a = free_port();
+        let addr_a = format!("127.0.0.1:{port_a}");
+
+        // Serving on A.
+        std::fs::write(&cfg_path, format!("[webui]\nlisten = '127.0.0.1:{port_a}'\n")).unwrap();
+        let out = sup.cmd_reload().unwrap();
+        assert!(
+            out.contains(&format!("webui: webui console serving on http://{addr_a}")),
+            "reload reports the converged console: {out}"
+        );
+        // A live connection the reload must not disturb.
+        let mut held = std::net::TcpStream::connect(&addr_a).unwrap();
+        held.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+
+        // Unchanged section: the intent is republished, the console is not
+        // rebound (the held connection never sees an EOF).
+        let out = sup.cmd_reload().unwrap();
+        assert!(
+            out.contains(&format!("webui: webui console serving on http://{addr_a}")),
+            "an unchanged section still reports serving: {out}"
+        );
+        std::thread::sleep(Duration::from_millis(150));
+        let mut buf = [0u8; 16];
+        match held.read(&mut buf) {
+            Ok(0) => panic!("the console was rebound on an unchanged reload"),
+            Ok(_) => {} // unsolicited data would be harmless
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => panic!("the held connection broke on an unchanged reload: {e}"),
+        }
+
+        // Invalid section: the whole reload fails, A keeps serving.
+        std::fs::write(&cfg_path, "[webui]\nlisten = 'no-host-or-port'\n").unwrap();
+        let err = sup.cmd_reload().err().expect("invalid [webui] fails reload");
+        assert!(
+            err.to_string().contains("webui.listen"),
+            "the error names the offending key: {err:#}"
+        );
+        assert!(
+            std::net::TcpStream::connect(&addr_a).is_ok(),
+            "the serving console is untouched by the failed reload"
+        );
+
+        // Recovery: a valid section converges again.
+        std::fs::write(&cfg_path, format!("[webui]\nlisten = '127.0.0.1:{port_a}'\n")).unwrap();
+        let out = sup.cmd_reload().unwrap();
+        assert!(
+            out.contains("webui: webui console serving on http://"),
+            "reload recovers the console: {out}"
+        );
+        end_manager(&sup, mgr);
+        let _ = sup.shutdown_all();
+    }
+
+    /// reload: the `[webui]` section is hot-applied (off→on→rebind→off),
+    /// an invalid section fails the whole reload leaving the console
+    /// untouched, and daemon hints still render (回归：[daemon] 语义不变).
+    #[test]
+    #[cfg(unix)]
+    fn reload_hot_applies_webui_and_keeps_daemon_hints() {
+        let (sup, _app_file) = setup(
+            "demo",
+            "[app]\nautostart = false\n[program.p]\ncommand = 'true'\nstartsecs = 0.0\n",
+        );
+        let cfg_path = sup.config_path();
+        let mgr = spawn_manager(&sup);
+
+        // off → on.
+        let port_a = free_port();
+        std::fs::write(
+            &cfg_path,
+            format!("[webui]\nlisten = '127.0.0.1:{port_a}'\n"),
+        )
+        .unwrap();
+        let out = sup.cmd_reload().unwrap();
+        assert!(
+            out.contains(&format!("webui: webui console serving on http://127.0.0.1:{port_a}")),
+            "reload reports the converged console: {out}"
+        );
+        assert!(std::net::TcpStream::connect(&format!("127.0.0.1:{port_a}")).is_ok());
+
+        // Rebind: listen change.
+        let port_b = free_port();
+        std::fs::write(
+            &cfg_path,
+            format!("[webui]\nlisten = '127.0.0.1:{port_b}'\n"),
+        )
+        .unwrap();
+        let out = sup.cmd_reload().unwrap();
+        assert!(
+            out.contains(&format!("serving on http://127.0.0.1:{port_b}")),
+            "reload reports the new address: {out}"
+        );
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(std::net::TcpStream::connect(&format!("127.0.0.1:{port_a}")).is_err());
+        assert!(std::net::TcpStream::connect(&format!("127.0.0.1:{port_b}")).is_ok());
+
+        // on → off.
+        std::fs::write(&cfg_path, "").unwrap();
+        let out = sup.cmd_reload().unwrap();
+        assert!(
+            out.contains("webui: webui console disabled"),
+            "reload reports the disabled console: {out}"
+        );
+        assert!(std::net::TcpStream::connect(&format!("127.0.0.1:{port_b}")).is_err());
+
+        // Invalid listen: the whole reload fails, console stays off.
+        std::fs::write(&cfg_path, "[webui]\nlisten = 'no-host-or-port'\n").unwrap();
+        let err = sup.cmd_reload().err().expect("invalid [webui] fails reload");
+        assert!(
+            err.to_string().contains("webui.listen"),
+            "the error names the offending key: {err:#}"
+        );
+
+        // Regression: [daemon] changes still produce restart hints, and webui
+        // diffs never appear in pending.
+        let port_c = free_port();
+        std::fs::write(
+            &cfg_path,
+            format!("[daemon]\nport = 17310\n[webui]\nlisten = '127.0.0.1:{port_c}'\n"),
+        )
+        .unwrap();
+        let out = sup.cmd_reload().unwrap();
+        assert!(
+            out.contains("daemon host/port changed: restart xkeeper to apply"),
+            "daemon hint still renders: {out}"
+        );
+        assert!(out.contains("webui:"), "webui note appended: {out}");
+        {
+            let st = sup.state.lock().unwrap();
+            assert!(
+                st.pending.daemon_hints
+                    .iter()
+                    .any(|h| h.contains("host/port")),
+                "hint recorded in pending"
+            );
+            assert!(
+                st.pending.programs.is_empty() && st.pending.apps_added.is_empty(),
+                "webui section must not create pending entries"
+            );
+        }
+        end_manager(&sup, mgr);
         let _ = sup.shutdown_all();
     }
 }

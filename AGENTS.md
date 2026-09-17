@@ -2,13 +2,13 @@
 
 轻量级进程守护工具（Rust），通过 TOML 配置守护任意多个子进程：退出后指数退避重启、
 stdout/stderr 落盘、Ctrl+C / SIGTERM 优雅停机、Windows Job Object 清理进程树。
-附带 `xkeeper webui` 子命令伺服内嵌的 Web 控制台。
+内嵌 Web 控制台由 daemon 配置的 `[webui]` 段驱动（缺省关闭，`xkeeper reload` 热生效）。
 
 ## Architecture
 
-- `src/main.rs` — CLI 入口：`run`（纯守护）| `webui`（守护 + Web 控制台）|
-  `validate` | `config`（daemon 配置本地管理：init/set/get/delete/edit 五动作，
-  白名单键表与读改写/原子落盘引擎在 `src/config.rs`）；控制子命令
+- `src/main.rs` — CLI 入口：`run`（唯一守护入口；daemon 配置含 `[webui]` 段时
+  伺服内嵌控制台）| `validate` | `config`（daemon 配置本地管理：init/set/get/
+  delete/edit 五动作，白名单键表与读改写/原子落盘引擎在 `src/config.rs`）；控制子命令
   `status/start/stop/restart/log/pid/reload/shutdown`
   走本地 HTTP API；`add/remove/list` 管理 app 注册表（add 按路径形态分派：
   目录/`.toml` → 既有注册；其他普通文件 → 脚手架生成 `app_dir/<name>.toml`，
@@ -19,7 +19,8 @@ stdout/stderr 落盘、Ctrl+C / SIGTERM 优雅停机、Windows Job Object 清理
   `src/health.rs` — 健康探测；`src/client.rs` — CLI HTTP 客户端。
 - `src/server.rs` — 控制平面：std 手写 HTTP（`/v1/*`，可选 Bearer 鉴权），
   状态投影（`StatusDoc`/`ProgramInfo`）由此导出。
-- `src/web.rs` + `src/api.rs` — Web 控制台（`xkeeper webui`）：axum 伺服内嵌
+- `src/web.rs` + `src/api.rs` — Web 控制台（配置驱动：`[webui]` 段开启，
+  supervisor 管理线程按意图 spawn/停 `web::serve`，reload 热生效）：axum 伺服内嵌
   SPA + `/api/*`（复用控制面投影）+ `/ws` 推送（快照/增量/日志/心跳，
   MessagePack 二进制帧）；与控制面共享 `Supervisor` 与环形缓冲。
 - `src/assets.rs` — `rust-embed` 内嵌 webui `dist/`。
@@ -41,7 +42,8 @@ pnpm dev                               # HMR dev server（:5273），代理 /api
 cargo run -p xtask -- e2e             # 验收 e2e：CLI 检出/apply/范围/--restart/add 场景
                                        #   + playwright 驱动真实浏览器的 webui 交互（--no-browser 跳过浏览器段）
 cargo run -- validate                  # 校验 daemon 配置 + 全部注册应用
-cargo run -- webui --listen 127.0.0.1:9877   # 守护 + Web 控制台
+cargo run -- run                       # 守护（daemon 配置含 [webui] 段时伺服内嵌控制台；
+                                       #   config --set webui.listen=... + reload 可热开启）
 cargo run -- status                    # 控制面 CLI（默认端口 7310）
 ```
 

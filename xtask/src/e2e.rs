@@ -28,7 +28,19 @@
 //!      multi-key), strong-typed set (comments and key order preserved),
 //!      rejection paths (unknown key, type violation, missing file, init
 //!      overwrite), delete (default fallback, idempotent, unknown table),
-//!      and `--edit` through a fake $EDITOR (valid + invalid).
+//!      and `--edit` through a fake $EDITOR (valid + invalid). The webui
+//!      keys ride the same engine (K16: set/get/delete on webui.listen and
+//!      the whole [webui] table).
+//! - webui lifecycle pass (config-driven-webui): the daemon boots with
+//!   `xkeeper run` and a `[webui]` section in daemon.toml; W1 deletes the
+//!   section + reload → connection refused, W2 sets a new listen + reload →
+//!   serving on the new address, W3 restores the listen + reload → rebind,
+//!   W4/W5 occupy then free the listen → reload degrades with a note and
+//!   recovers, W7 boots a second daemon with a bare `[webui]` → serves the
+//!   built-in default 127.0.0.1:9877 and the console exits with the daemon.
+//!   Offline: G0c2 pins the removed `webui`/`system webui` subcommands,
+//!   G0c3 covers the shell exit-3 contract, G0d2 rejects an unknown
+//!   `[webui]` key through `validate`.
 //! - webui pass — a real browser (playwright, chromium) against the embedded
 //!   console: the pending badge appears after a disk edit, "Apply 此应用"
 //!   (app-scope) confirms and applies, the result text renders, and a second
@@ -81,10 +93,12 @@ fn setup_workspace(tag: &str) -> Result<Workspace> {
     // Forward slashes in the TOML basic string: a raw Windows path would
     // put invalid `\U`-style escapes into the config.
     let log_dir = root.join("logs").to_string_lossy().replace('\\', "/");
+    // The web console is config-driven: the `[webui]` section enables it and
+    // pins its port for the browser pass.
     std::fs::write(
         root.join("daemon.toml"),
         format!(
-            "[daemon]\nhost = \"127.0.0.1\"\nport = {control_port}\nlog_dir = \"{log_dir}\"\nlog_level = \"warn\"\nmonitor_interval = 0.5\n",
+            "[daemon]\nhost = \"127.0.0.1\"\nport = {control_port}\nlog_dir = \"{log_dir}\"\nlog_level = \"warn\"\nmonitor_interval = 0.5\n\n[webui]\nlisten = \"127.0.0.1:{webui_port}\"\n",
         ),
     )?;
     std::fs::write(
@@ -140,9 +154,7 @@ fn spawn_daemon(bin: &Path, ws: &Workspace) -> Result<Daemon> {
     let mut child = Command::new(bin)
         .arg("--config")
         .arg(ws.root.join("daemon.toml"))
-        .arg("webui")
-        .arg("--listen")
-        .arg(format!("127.0.0.1:{}", ws.webui_port))
+        .arg("run")
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err))
         .spawn()
@@ -476,6 +488,26 @@ fn offline_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         "the error says the daemon is unreachable",
     )?;
 
+    step("G0c2. removed webui/system subcommands stay removed (BREAKING, config-driven-webui)");
+    for bad in [&["webui"][..], &["system", "webui"][..]] {
+        let (ok, _code, combined) = cli_try(bin, ws, bad)?;
+        expect(
+            !ok && combined.contains("unrecognized subcommand"),
+            &format!("{bad:?} must be rejected as an unknown subcommand: {combined:?}"),
+        )?;
+    }
+
+    step("G0c3. `shell -e status` with no daemon exits 3 (shell 纳入退出码约定)");
+    let (ok, code, combined) = cli_try(bin, ws, &["shell", "-e", "status"])?;
+    expect(
+        !ok && code == 3,
+        &format!("shell -e status without a daemon exits 3, got {code}"),
+    )?;
+    expect(
+        combined.contains("unreachable"),
+        "the shell reports the daemon as unreachable",
+    )?;
+
     step("G0d. a relative daemon.log_dir fails validate AND refuses daemon startup");
     let bad_cfg = ws.root.join("daemon-bad.toml");
     std::fs::write(&bad_cfg, "[daemon]\nlog_dir = \"logs\"\n")?;
@@ -491,9 +523,7 @@ fn offline_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     let mut child = Command::new(bin)
         .arg("--config")
         .arg(&bad_cfg)
-        .arg("webui")
-        .arg("--listen")
-        .arg(format!("127.0.0.1:{}", free_port()?))
+        .arg("run")
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err))
         .spawn()
@@ -520,6 +550,16 @@ fn offline_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     expect(
         refusal.contains("daemon.log_dir") && refusal.contains("absolute"),
         "the startup refusal names daemon.log_dir and the fix",
+    )?;
+
+    step("G0d2. an unknown [webui] key fails validate (whole-config rejection)");
+    let bad_webui = ws.root.join("daemon-webui-bad.toml");
+    std::fs::write(&bad_webui, "[webui]\nauth = true\n")?;
+    let (ok, _code, combined) = cli_try_cfg(bin, &bad_webui, &["validate"])?;
+    expect(!ok, "validate rejects an unknown [webui] key")?;
+    expect(
+        combined.contains("auth") && combined.contains("unknown field"),
+        "the error names the unknown field: {combined:?}",
     )?;
 
     // Clean the offline registration so the daemon pass starts clean.
@@ -713,8 +753,8 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         "the file was not rewritten",
     )?;
 
-    step("K10. unknown keys/tables are refused (webui is not in the key table)");
-    for bad in ["foo", "webui"] {
+    step("K10. unknown keys/tables are refused");
+    for bad in ["foo", "daemon.nope", "webui.theme", "webui.listen.x"] {
         let (ok, code, combined) = cli_try_cfg(bin, &cfg, &["config", "--delete", bad])?;
         expect(!ok && code == 2, &format!("--delete {bad} exits 2"))?;
         expect(
@@ -726,6 +766,51 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         std::fs::read_to_string(&cfg)? == before,
         "rejected deletes leave the file unchanged",
     )?;
+
+    // K16: webui keys ride the same engine (config-driven-webui).
+    step("K16a. --set webui.listen writes a [webui] section; illegal listen is refused");
+    let (ok, code, combined) =
+        cli_try_cfg(bin, &cfg, &["config", "--set", "webui.listen=not-an-addr"])?;
+    expect(!ok && code == 2, "an illegal listen exits 2 untouched")?;
+    expect(
+        combined.contains("webui.listen") && std::fs::read_to_string(&cfg)? == before,
+        "the error names webui.listen and the file is byte-identical",
+    )?;
+    let out = cli_cfg(
+        bin,
+        &cfg,
+        &[
+            "config",
+            "--set",
+            "webui.listen=127.0.0.1:19877",
+        ],
+    )?;
+    expect(out.contains("webui.listen"), "set reports the written key")?;
+    let text = std::fs::read_to_string(&cfg)?;
+    expect(
+        text.contains("[webui]") && text.contains("listen = \"127.0.0.1:19877\""),
+        "the [webui] section was created with the listen value",
+    )?;
+
+    step("K16b. --get webui.listen answers the file value; default when unset");
+    let out = cli_cfg(bin, &cfg, &["config", "--get", "webui.listen"])?;
+    expect(out.trim() == "127.0.0.1:19877", "get reads the section")?;
+    let other = dir.join("daemon-empty.toml");
+    std::fs::write(&other, "[daemon]\nport = 7310\n")?;
+    let out = cli_cfg(bin, &other, &["config", "--get", "webui.listen"])?;
+    expect(
+        out.trim() == "127.0.0.1:9877",
+        "an absent section answers the built-in default",
+    )?;
+
+    step("K16c. --delete webui removes the whole section (console off)");
+    let out = cli_cfg(bin, &cfg, &["config", "--delete", "webui"])?;
+    let text = std::fs::read_to_string(&cfg)?;
+    expect(!text.contains("[webui]"), "the section is gone")?;
+    expect(out.contains("webui"), "delete reports the removed table")?;
+    // Idempotent second delete of the absent table.
+    let (ok, code, _) = cli_try_cfg(bin, &cfg, &["config", "--delete", "webui"])?;
+    expect(ok && code == 0, "an absent table delete is an idempotent success")?;
 
     step("K11. config --edit through a fake $EDITOR (valid + invalid)");
     if cfg!(unix) {
@@ -1903,6 +1988,210 @@ fn actions_online_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     Ok(())
 }
 
+// -- webui lifecycle pass ---------------------------------------------------------
+
+/// `GET /api/health` probe via curl (same mechanism as the daemon wait).
+fn http_ok(url: &str) -> bool {
+    Command::new("curl")
+        .args(["-sf", "-m", "3", url])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// The console is config-driven: `config --delete webui` + `reload` turns it
+/// off, `config --set webui.listen=...` + `reload` turns it on or rebinds it
+/// (config-driven-webui acceptance scenarios). Restores the setup listen so
+/// the browser pass finds the console on `ws.webui_port`.
+fn webui_pass(bin: &Path, ws: &Workspace) -> Result<()> {
+    let health = |port: u16| http_ok(&format!("http://127.0.0.1:{port}/api/health"));
+
+    step("W1. config --delete webui + reload stops the console (connection refused)");
+    expect(
+        health(ws.webui_port),
+        "the console answers before the test (setup wrote [webui])",
+    )?;
+    let out = cli(bin, ws, &["config", "--delete", "webui"])?;
+    expect(
+        out.contains("deleted webui"),
+        &format!("delete reports the removed table: {out:?}"),
+    )?;
+    let out = cli(bin, ws, &["reload"])?;
+    expect(
+        out.contains("webui: webui console disabled"),
+        &format!("reload reports the disabled console: {out:?}"),
+    )?;
+    expect(
+        !health(ws.webui_port),
+        "the console port refuses connections after the reload",
+    )?;
+
+    step("W2. config --set webui.listen + reload serves on the new address (off→on)");
+    let new_port = free_port()?;
+    let out = cli(
+        bin,
+        ws,
+        &["config", "--set", &format!("webui.listen=127.0.0.1:{new_port}")],
+    )?;
+    expect(
+        out.contains("webui.listen"),
+        &format!("set reports the written key: {out:?}"),
+    )?;
+    let out = cli(bin, ws, &["reload"])?;
+    expect(
+        out.contains(&format!(
+            "webui: webui console serving on http://127.0.0.1:{new_port}"
+        )),
+        &format!("reload reports the serving console: {out:?}"),
+    )?;
+    expect(health(new_port), "the console answers on the new port")?;
+    expect(!health(ws.webui_port), "the old port stays closed")?;
+
+    step("W3. restoring the listen + reload rebinds back (listen change)");
+    let out = cli(
+        bin,
+        ws,
+        &[
+            "config",
+            "--set",
+            &format!("webui.listen=127.0.0.1:{}", ws.webui_port),
+        ],
+    )?;
+    expect(
+        out.contains("webui.listen"),
+        &format!("set reports the restored key: {out:?}"),
+    )?;
+    let out = cli(bin, ws, &["reload"])?;
+    expect(
+        out.contains(&format!(
+            "serving on http://127.0.0.1:{}",
+            ws.webui_port
+        )),
+        &format!("reload reports the restored address: {out:?}"),
+    )?;
+    expect(
+        health(ws.webui_port),
+        "the original console port answers again",
+    )?;
+    expect(!health(new_port), "the temporary port is released")?;
+
+    step("W4. reload with an occupied port degrades: note in the output, daemon keeps running");
+    let blocker = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let occupied = blocker.local_addr()?.port();
+    let out = cli(
+        bin,
+        ws,
+        &["config", "--set", &format!("webui.listen=127.0.0.1:{occupied}")],
+    )?;
+    let out = cli(bin, ws, &["reload"])?;
+    expect(
+        out.contains("webui: webui console unavailable"),
+        &format!("reload reports the degraded console: {out:?}"),
+    )?;
+    expect(
+        api(ws, "/v1/status")?.contains("programs"),
+        "the daemon keeps serving the control plane",
+    )?;
+
+    step("W5. freeing the port + reload recovers the console on the same address");
+    drop(blocker);
+    std::thread::sleep(Duration::from_millis(150));
+    let out = cli(bin, ws, &["reload"])?;
+    expect(
+        out.contains(&format!(
+            "webui: webui console serving on http://127.0.0.1:{occupied}"
+        )),
+        &format!("reload recovers the console: {out:?}"),
+    )?;
+    expect(health(occupied), "the console answers after recovery")?;
+
+    step("W6. restore the setup listen for the browser pass");
+    let out = cli(
+        bin,
+        ws,
+        &[
+            "config",
+            "--set",
+            &format!("webui.listen=127.0.0.1:{}", ws.webui_port),
+        ],
+    )?;
+    let _ = cli(bin, ws, &["reload"])?;
+    expect(health(ws.webui_port), "the setup port serves again")?;
+    expect(!health(occupied), "the temporary port is released")?;
+
+    step("W7. a bare [webui] section serves the built-in default 127.0.0.1:9877 and exits with the daemon");
+    // Skip politely when something else owns the default port on this host.
+    match std::net::TcpListener::bind("127.0.0.1:9877") {
+        Err(_) => println!("    skip: 127.0.0.1:9877 is occupied on this host"),
+        Ok(reserve) => {
+            drop(reserve);
+            let control2 = free_port()?;
+            let log2 = ws.root.join("logs2");
+            let apps2 = ws.root.join("apps2");
+            std::fs::create_dir_all(&log2)?;
+            std::fs::create_dir_all(&apps2)?;
+            // A second daemon with its own control port, log dir and an empty
+            // app registry — the bare `[webui]` section is the only switch.
+            let cfg2 = ws.root.join("daemon2.toml");
+            std::fs::write(
+                &cfg2,
+                format!(
+                    "[daemon]\nhost = \"127.0.0.1\"\nport = {control2}\nlog_dir = \"{}\"\nlog_level = \"warn\"\napp_dir = \"{}\"\n\n[webui]\n",
+                    log2.display().to_string().replace('\\', "/"),
+                    apps2.display().to_string().replace('\\', "/"),
+                ),
+            )?;
+            let out = std::fs::File::create(ws.root.join("daemon2.out.log"))?;
+            let err = out.try_clone()?;
+            let mut child = Command::new(bin)
+                .arg("--config")
+                .arg(&cfg2)
+                .arg("run")
+                .stdout(Stdio::from(out))
+                .stderr(Stdio::from(err))
+                .spawn()?;
+            let mut up = false;
+            for _ in 0..120 {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    break;
+                }
+                if http_ok("http://127.0.0.1:9877/api/health") {
+                    up = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(150));
+            }
+            expect(
+                up,
+                "the console serves on the default listen without an explicit listen",
+            )?;
+            // The console exits with the daemon (POST /v1/shutdown).
+            let _ = Command::new("curl")
+                .args([
+                    "-sf",
+                    "-m",
+                    "10",
+                    "-X",
+                    "POST",
+                    &format!("http://127.0.0.1:{control2}/v1/shutdown"),
+                ])
+                .output();
+            for _ in 0..80 {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            std::thread::sleep(Duration::from_millis(300));
+            expect(
+                !http_ok("http://127.0.0.1:9877/api/health"),
+                "the console is gone once the daemon has exited",
+            )?;
+        }
+    }
+    Ok(())
+}
+
 // -- browser pass -----------------------------------------------------------------
 
 /// Drive the embedded console with playwright (node script via npx-resolved
@@ -2092,7 +2381,7 @@ pub(crate) fn run(args: Args) -> Result<()> {
     setup_actions_app(&ws, &bin)?;
 
     println!(
-        "workspace: {}\ndaemon: webui 127.0.0.1:{}, control 127.0.0.1:{}",
+        "workspace: {}\ndaemon: run (webui 127.0.0.1:{} via [webui]), control 127.0.0.1:{}",
         ws.root.display(),
         ws.webui_port,
         ws.control_port
@@ -2105,6 +2394,7 @@ pub(crate) fn run(args: Args) -> Result<()> {
     let result = (|| {
         cli_pass(&bin, &ws)?;
         actions_online_pass(&bin, &ws)?;
+        webui_pass(&bin, &ws)?;
         if args.no_browser {
             println!("\n(--no-browser: skipping browser pass)");
         } else {
