@@ -65,7 +65,9 @@ daemon `[app-default]` > 内置默认。`autostart`/`priority` 是应用级字�
 ```bash
 cargo build --release          # 产物: target/release/xkeeper(.exe)
 
-xkeeper edit                   # 可选：用 $VISUAL/$EDITOR（缺省 vi/notepad）打开 daemon 配置，
+xkeeper config --init          # 可选：初始化 daemon 配置（8 个已知键的默认值 + 注释模板），
+                               #   已存在则拒绝；连带创建 app 注册目录与 example.toml.sample
+xkeeper config --edit          # 可选：用 $VISUAL/$EDITOR（缺省 vi/notepad）打开 daemon 配置，
                                #   不存在则创建；保存退出后自动校验，非法以退出码 2 报告
 
 # 1. 在你的应用部署目录写一个 xkeeper.toml（见 examples/demo-app）
@@ -149,6 +151,38 @@ restart_on_unhealthy = true # unhealthy 触发与崩溃一致的重启
 升级前依赖默认相对 `logs` 目录的部署，新日志会改写到 `/tmp/xkeeper/logs`，旧日志
 仍留在 `<daemon 配置目录>/logs`，不会自动迁移。已有 `log_dir = "logs"` 等相对路径
 配置会被拒绝启动，需改为绝对路径。
+
+## daemon 配置管理（`xkeeper config`）
+
+daemon 配置的脚本化管理入口，纯本地文件操作（不依赖运行中的守护进程）。
+动作由 flag 指定，一次调用只执行一类动作；无任何动作 flag 时打印用法并以 0 退出：
+
+```bash
+xkeeper config --init                        # 全新初始化（拒绝覆盖既有文件）
+xkeeper config --get port                    # 查询生效值：文件显式值优先，未设置回退内置默认（单键只打印值）
+xkeeper config --get port --get host         # 多键查询：每行 key=value
+xkeeper config --set port=8080 --set log_level=debug   # 白名单强类型写入（可重复）
+xkeeper config --delete port                 # 删除（回到「未配置」态；幂等；点路径 daemon.port 等价）
+xkeeper config --edit                        # $VISUAL/$EDITOR 全文编辑 + 保存后校验
+```
+
+- **白名单强类型**：`--set`/`--get`/`--delete` 只接受 `[daemon]` 表的 8 个已知键
+  （`log_level`、`log_dir`、`monitor_interval`、`host`、`port`、`auth_token`、
+  `log_buffer_lines`、`app_dir`）；`port` 限 1–65535 整数、`monitor_interval` 为正浮点、
+  `log_buffer_lines` 为非负整数、`log_level` ∈ trace|debug|info|warn|error。未知键或
+  类型不符以退出码 2 拒绝，不落盘。
+- **读-改-写保留格式**：写入只改动目标键的值节点，未触碰键的顺序、值与注释原样保持。
+- **写后整体校验 + 原子落盘**：先写临时文件、整体校验通过后 rename 覆盖；校验失败
+  回滚为原内容（磁盘不留半成品）。
+- **删除即回退默认**：删除有默认值的键后回到「未配置」态；目标本不存在时幂等成功
+  （文件不变）；未知键/未知表拒绝（`--delete webui` 当前被拒——键表尚只覆盖 `[daemon]`）。
+- **缺失文件语义**：`--get` 等价全默认回答；`--set`/`--delete` 拒绝并提示先执行
+  `xkeeper config --init`；`--edit` 先创建再打开。
+- **在线提示**：写动作成功后对既有控制面地址发一次短超时探活——在线则提示执行
+  `xkeeper reload` 生效，离线提示下次启动生效。探测失败不阻塞动作本身。
+
+app 配置不进入 `config` 的键空间（继续走 add/apply 体系）；`[app-default]` 仅在
+`--init` 模板中以注释形式提示。
 
 ## 配置变更：检出与应用（两阶段）
 

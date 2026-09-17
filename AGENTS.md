@@ -7,7 +7,8 @@ stdout/stderr 落盘、Ctrl+C / SIGTERM 优雅停机、Windows Job Object 清理
 ## Architecture
 
 - `src/main.rs` — CLI 入口：`run`（纯守护）| `webui`（守护 + Web 控制台）|
-  `validate` | `edit`（编辑器打开 daemon 配置 + 校验）；控制子命令
+  `validate` | `config`（daemon 配置本地管理：init/set/get/delete/edit 五动作，
+  白名单键表与读改写/原子落盘引擎在 `src/config.rs`）；控制子命令
   `status/start/stop/restart/log/pid/reload/shutdown`
   走本地 HTTP API；`add/remove/list` 管理 app 注册表（add 按路径形态分派：
   目录/`.toml` → 既有注册；其他普通文件 → 脚手架生成 `app_dir/<name>.toml`，

@@ -23,6 +23,12 @@
 //!      timeout tree kill, same-action mutual exclusion, chained
 //!      `xkeeper restart` inside an action, stopped-program pid→empty,
 //!      signal whitelist in/out + not-running (unix).
+//!   K. config subcommand (add-config-subcommand): init (defaults + comments
+//!      + app dir + example.toml.sample), get (defaults / file values /
+//!      multi-key), strong-typed set (comments and key order preserved),
+//!      rejection paths (unknown key, type violation, missing file, init
+//!      overwrite), delete (default fallback, idempotent, unknown table),
+//!      and `--edit` through a fake $EDITOR (valid + invalid).
 //! - webui pass — a real browser (playwright, chromium) against the embedded
 //!   console: the pending badge appears after a disk edit, "Apply 此应用"
 //!   (app-scope) confirms and applies, the result text renders, and a second
@@ -242,6 +248,19 @@ fn cli_try_cfg(bin: &Path, cfg: &Path, args: &[&str]) -> Result<(bool, i32, Stri
     );
     let code = out.status.code().unwrap_or(-1);
     Ok((out.status.success(), code, combined))
+}
+
+/// Run the CLI against an explicit daemon config, expecting SUCCESS.
+fn cli_cfg(bin: &Path, cfg: &Path, args: &[&str]) -> Result<String> {
+    let (ok, _code, combined) = cli_try_cfg(bin, cfg, args)?;
+    if !ok {
+        bail!(
+            "xkeeper {:?} (cfg {}) failed: {combined}",
+            args,
+            cfg.display()
+        );
+    }
+    Ok(combined)
 }
 
 /// HTTP status code + body of a control-plane request (curl, like `api`,
@@ -509,6 +528,314 @@ fn offline_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         out.contains("generated config file removed"),
         "offline remove deletes the generated file",
     )?;
+    Ok(())
+}
+
+// -- config subcommand pass (add-config-subcommand) -------------------------------
+
+/// Offline scenarios for `xkeeper config` (runs BEFORE the daemon exists, so
+/// write actions report the offline note). Uses its own config paths under
+/// `cfgcmd/` so the workspace's daemon.toml stays untouched for the daemon
+/// pass. Covers: init → get defaults → set → get file values → illegal sets
+/// rejected with the file unchanged → delete falls back to defaults →
+/// idempotent delete → unknown-key delete rejected → init-overwrite rejected
+/// → set on a missing file refused → sample not scanned as an app →
+/// `config --edit` through a fake $EDITOR (valid + invalid).
+fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
+    let dir = ws.root.join("cfgcmd");
+    let cfg = dir.join("daemon.toml");
+
+    step("K1. config --init creates defaults + comments + app dir + sample");
+    let out = cli_cfg(bin, &cfg, &["config", "--init"])?;
+    expect(cfg.is_file(), "daemon.toml created")?;
+    let text = std::fs::read_to_string(&cfg)?;
+    for key in [
+        "log_level",
+        "log_dir",
+        "monitor_interval",
+        "host",
+        "port",
+        "auth_token",
+        "log_buffer_lines",
+        "app_dir",
+    ] {
+        expect(
+            text.contains(key),
+            &format!("the template renders the known key {key}"),
+        )?;
+    }
+    expect(
+        text.contains("port = 7310") && text.contains("host = \"127.0.0.1\""),
+        "defaults are rendered with values",
+    )?;
+    expect(
+        text.contains("auth_token = \"\""),
+        "auth_token renders empty",
+    )?;
+    expect(
+        text.contains("# [app-default]"),
+        "a fully commented [app-default] template section exists",
+    )?;
+    expect(dir.join("apps").is_dir(), "the app registry dir is created")?;
+    let sample = dir.join("apps/example.toml.sample");
+    expect(sample.is_file(), "example.toml.sample is created")?;
+    expect(out.contains("next:"), "init prints the next-step hint")?;
+
+    step("K2. config --get: defaults for unset keys, bare value / key=value");
+    let out = cli_cfg(bin, &cfg, &["config", "--get", "port"])?;
+    expect(
+        out.trim() == "7310",
+        &format!("a single key prints the bare value: {out:?}"),
+    )?;
+    let out = cli_cfg(bin, &cfg, &["config", "--get", "port", "--get", "host"])?;
+    expect(
+        out.contains("port=7310") && out.contains("host=127.0.0.1"),
+        &format!("multiple keys print key=value lines: {out:?}"),
+    )?;
+
+    step("K3. config --init refuses to overwrite an existing config");
+    let before = std::fs::read_to_string(&cfg)?;
+    let (ok, code, combined) = cli_try_cfg(bin, &cfg, &["config", "--init"])?;
+    expect(
+        !ok && code == 2,
+        &format!("init over an existing file exits 2, got {code}"),
+    )?;
+    expect(
+        combined.contains("already exists"),
+        "the error explains the refusal",
+    )?;
+    expect(
+        std::fs::read_to_string(&cfg)? == before,
+        "the existing config was not touched",
+    )?;
+
+    step("K4. config --set writes strong-typed keys (offline note printed)");
+    let out = cli_cfg(
+        bin,
+        &cfg,
+        &["config", "--set", "port=8080", "--set", "log_level=debug"],
+    )?;
+    expect(out.contains("port"), "set reports the written keys: {out}")?;
+    expect(
+        out.contains("offline"),
+        "the offline note says the change takes effect at next start",
+    )?;
+    expect(
+        out.contains("set port = 8080") && out.contains("set log_level = debug"),
+        "set prints the written keys with their new values",
+    )?;
+    let out = cli_cfg(bin, &cfg, &["config", "--get", "port"])?;
+    expect(out.trim() == "8080", "the file value wins over the default")?;
+    let out = cli_cfg(bin, &cfg, &["config", "--get", "log_level"])?;
+    expect(out.trim() == "debug", "log_level was written")?;
+
+    step("K5. --set keeps comments, key order and untouched values");
+    std::fs::write(
+        &cfg,
+        "# my header\n[daemon]\n# keep me\nlog_level = \"info\"\nlog_buffer_lines = 7 # count\nport = 1234 # trailing\n",
+    )?;
+    cli_cfg(bin, &cfg, &["config", "--set", "port=8081"])?;
+    let text = std::fs::read_to_string(&cfg)?;
+    for snippet in [
+        "# my header",
+        "# keep me",
+        "log_level = \"info\"",
+        "log_buffer_lines = 7 # count",
+    ] {
+        expect(
+            text.contains(snippet),
+            &format!("untouched content survives: {snippet:?}"),
+        )?;
+    }
+    expect(
+        text.contains("port = 8081 # trailing"),
+        "the touched key's trailing comment survives",
+    )?;
+
+    step("K6. illegal sets are rejected with the file unchanged");
+    let before = std::fs::read_to_string(&cfg)?;
+    for bad in [
+        "port=abc",
+        "port=0",
+        "port=65536",
+        "foo=1",
+        "log_level=verbose",
+        "monitor_interval=0",
+        "log_dir=relative/logs", // parses, fails whole-config validation
+    ] {
+        let (ok, code, _combined) = cli_try_cfg(bin, &cfg, &["config", "--set", bad])?;
+        expect(
+            !ok && code == 2,
+            &format!("--set {bad} is rejected with exit 2"),
+        )?;
+    }
+    expect(
+        std::fs::read_to_string(&cfg)? == before,
+        "rejected sets leave the file byte-identical",
+    )?;
+
+    step("K7. --set on a missing file is refused with the --init hint");
+    let fresh = ws.root.join("cfgcmd-fresh.toml");
+    let (ok, code, combined) = cli_try_cfg(bin, &fresh, &["config", "--set", "port=1"])?;
+    expect(
+        !ok && code == 2,
+        &format!("set without a config exits 2, got {code}"),
+    )?;
+    expect(
+        combined.contains("config --init"),
+        "the error points at `xkeeper config --init`",
+    )?;
+    expect(!fresh.exists(), "nothing was created by the refused set")?;
+
+    step("K8. --delete removes the key, the default applies again");
+    cli_cfg(bin, &cfg, &["config", "--delete", "port"])?;
+    let out = cli_cfg(bin, &cfg, &["config", "--get", "port"])?;
+    expect(
+        out.trim() == "7310",
+        "the deleted key answers with the default",
+    )?;
+    let text = std::fs::read_to_string(&cfg)?;
+    expect(!text.contains("port ="), "the port line is gone")?;
+    expect(
+        text.contains("log_buffer_lines = 7 # count"),
+        "untouched keys survive the delete",
+    )?;
+
+    step("K9. --delete of an absent key is an idempotent success");
+    let before = std::fs::read_to_string(&cfg)?;
+    let out = cli_cfg(bin, &cfg, &["config", "--delete", "host"])?;
+    expect(
+        out.contains("no change"),
+        "the output explains nothing changed",
+    )?;
+    expect(
+        std::fs::read_to_string(&cfg)? == before,
+        "the file was not rewritten",
+    )?;
+
+    step("K10. unknown keys/tables are refused (webui is not in the key table)");
+    for bad in ["foo", "webui"] {
+        let (ok, code, combined) = cli_try_cfg(bin, &cfg, &["config", "--delete", bad])?;
+        expect(!ok && code == 2, &format!("--delete {bad} exits 2"))?;
+        expect(
+            combined.contains("unknown"),
+            "the error says the key/table is unknown",
+        )?;
+    }
+    expect(
+        std::fs::read_to_string(&cfg)? == before,
+        "rejected deletes leave the file unchanged",
+    )?;
+
+    step("K11. config --edit through a fake $EDITOR (valid + invalid)");
+    if cfg!(unix) {
+        let script = dir.join("fake-editor.sh");
+        // Valid edit: the config passes validation afterwards.
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf '[daemon]\\nport = 9999\\n' > \"$1\"\n",
+        )?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+        let out = Command::new(bin)
+            .env("EDITOR", &script)
+            .arg("--config")
+            .arg(&cfg)
+            .args(["config", "--edit"])
+            .output()
+            .context("run config --edit (valid)")?;
+        expect(out.status.success(), "a valid edit exits 0")?;
+        let out = cli_cfg(bin, &cfg, &["config", "--get", "port"])?;
+        expect(out.trim() == "9999", "the edited value is effective")?;
+        // Invalid edit: exit 2 and the file keeps the editor's content.
+        std::fs::write(&script, "#!/bin/sh\nprintf 'bogus_field = 1\\n' > \"$1\"\n")?;
+        let out = Command::new(bin)
+            .env("EDITOR", &script)
+            .arg("--config")
+            .arg(&cfg)
+            .args(["config", "--edit"])
+            .output()
+            .context("run config --edit (invalid)")?;
+        expect(
+            out.status.code() == Some(2),
+            &format!(
+                "an invalid edit result exits 2, got {:?}",
+                out.status.code()
+            ),
+        )?;
+        let text = std::fs::read_to_string(&cfg)?;
+        expect(
+            text.contains("bogus_field"),
+            "the file keeps the editor's content (no rollback)",
+        )?;
+        // Restore a legal config for the following scenario.
+        std::fs::write(&cfg, "[daemon]\nport = 9999\n")?;
+    } else {
+        println!("    (windows: the fake-EDITOR edit scenario requires unix; skipping)");
+    }
+
+    step("K12. example.toml.sample is not scanned as an app");
+    let out = cli_cfg(bin, &cfg, &["list"])?;
+    expect(
+        out.contains("no apps registered"),
+        "the init-produced app_dir lists no apps (.sample ignored)",
+    )?;
+
+    step("K13. bare `xkeeper config` prints the five-action usage and exits 0");
+    let out = cli_cfg(bin, &cfg, &["config"])?;
+    for flag in ["--set", "--get", "--delete", "--edit", "--init"] {
+        expect(
+            out.contains(flag),
+            &format!("the usage mentions {flag}: {out}"),
+        )?;
+    }
+
+    step("K14. unknown --get key exits 2; --delete on a missing file points at --init");
+    let (ok, code, combined) = cli_try_cfg(bin, &cfg, &["config", "--get", "foo"])?;
+    expect(!ok && code == 2, &format!("--get foo exits 2, got {code}"))?;
+    expect(
+        combined.contains("unknown"),
+        "the error names the key as unknown",
+    )?;
+    let missing = ws.root.join("cfgcmd-missing.toml");
+    let (ok, code, combined) = cli_try_cfg(bin, &missing, &["config", "--delete", "port"])?;
+    expect(
+        !ok && code == 2,
+        &format!("delete without a config exits 2, got {code}"),
+    )?;
+    expect(
+        combined.contains("config --init"),
+        "the error points at `xkeeper config --init`",
+    )?;
+    expect(!missing.exists(), "nothing was created by the refused delete")?;
+
+    step("K15. $VISUAL wins over $EDITOR for config --edit");
+    if cfg!(unix) {
+        let visual = dir.join("visual-editor.sh");
+        let editor = dir.join("env-editor.sh");
+        std::fs::write(&visual, "#!/bin/sh\nprintf '[daemon]\\nport = 9111\\n' > \"$1\"\n")?;
+        std::fs::write(&editor, "#!/bin/sh\nprintf '[daemon]\\nport = 9222\\n' > \"$1\"\n")?;
+        use std::os::unix::fs::PermissionsExt;
+        for s in [&visual, &editor] {
+            std::fs::set_permissions(s, std::fs::Permissions::from_mode(0o755))?;
+        }
+        let out = Command::new(bin)
+            .env("VISUAL", &visual)
+            .env("EDITOR", &editor)
+            .arg("--config")
+            .arg(&cfg)
+            .args(["config", "--edit"])
+            .output()
+            .context("run config --edit with both $VISUAL and $EDITOR")?;
+        expect(out.status.success(), "the edit through $VISUAL exits 0")?;
+        let out = cli_cfg(bin, &cfg, &["config", "--get", "port"])?;
+        expect(
+            out.trim() == "9111",
+            &format!("$VISUAL won over $EDITOR (9111, not 9222): {out:?}"),
+        )?;
+    } else {
+        println!("    (windows: the $VISUAL-precedence scenario requires unix; skipping)");
+    }
     Ok(())
 }
 
@@ -1773,6 +2100,7 @@ pub(crate) fn run(args: Args) -> Result<()> {
     // Offline scenarios first: the daemon must NOT be running yet.
     offline_pass(&bin, &ws)?;
     actions_offline_pass(&bin, &ws)?;
+    config_pass(&bin, &ws)?;
     let mut daemon = spawn_daemon(&bin, &ws)?;
     let result = (|| {
         cli_pass(&bin, &ws)?;

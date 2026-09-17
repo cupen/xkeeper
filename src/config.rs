@@ -1098,6 +1098,564 @@ pub fn import_legacy(legacy_path: &Path) -> Result<LegacyImport> {
 }
 
 // ---------------------------------------------------------------------------
+// `config` subcommand engine (add-config-subcommand)
+// ---------------------------------------------------------------------------
+
+/// A strong-typed `[daemon]` key value after CLI parsing.
+#[derive(Debug, Clone, PartialEq)]
+pub enum KeyValue {
+    Str(String),
+    Int(i64),
+    Float(f64),
+}
+
+impl std::fmt::Display for KeyValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KeyValue::Str(s) => f.write_str(s),
+            KeyValue::Int(i) => write!(f, "{i}"),
+            KeyValue::Float(v) => f.write_str(&fmt_float(*v)),
+        }
+    }
+}
+
+/// Render a float the way TOML and humans expect it (1.0 keeps its decimal
+/// point — a bare `1` would change the field's type on re-read).
+fn fmt_float(v: f64) -> String {
+    if v.is_finite() && v == v.trunc() && v.abs() < 1e15 {
+        format!("{v:.1}")
+    } else {
+        format!("{v}")
+    }
+}
+
+/// Type parsers for the known `[daemon]` keys (design D3). Range rules that
+/// belong to whole-config validation (e.g. monitor_interval <= 60, non-zero
+/// log_buffer_lines) are NOT duplicated here — the post-write validation
+/// catches them and the write rolls back.
+const LOG_LEVELS: [&str; 5] = ["trace", "debug", "info", "warn", "error"];
+
+fn parse_log_level(s: &str) -> std::result::Result<KeyValue, String> {
+    if LOG_LEVELS.contains(&s) {
+        Ok(KeyValue::Str(s.to_string()))
+    } else {
+        Err(format!("log_level must be one of {}", LOG_LEVELS.join("|")))
+    }
+}
+
+fn parse_port(s: &str) -> std::result::Result<KeyValue, String> {
+    let v: u16 = s
+        .parse()
+        .map_err(|_| format!("port must be an integer in 1..=65535, got {s:?}"))?;
+    if v == 0 {
+        return Err("port must be an integer in 1..=65535".to_string());
+    }
+    Ok(KeyValue::Int(v as i64))
+}
+
+fn parse_monitor_interval(s: &str) -> std::result::Result<KeyValue, String> {
+    let v: f64 = s
+        .parse()
+        .map_err(|_| format!("monitor_interval must be a positive number, got {s:?}"))?;
+    if v <= 0.0 || !v.is_finite() {
+        return Err(format!("monitor_interval must be > 0, got {s:?}"));
+    }
+    Ok(KeyValue::Float(v))
+}
+
+fn parse_count(s: &str) -> std::result::Result<KeyValue, String> {
+    let v: i64 = s
+        .parse()
+        .map_err(|_| format!("log_buffer_lines must be a non-negative integer, got {s:?}"))?;
+    if v < 0 {
+        return Err(format!("log_buffer_lines must be >= 0, got {s:?}"));
+    }
+    Ok(KeyValue::Int(v))
+}
+
+fn parse_string(s: &str) -> std::result::Result<KeyValue, String> {
+    Ok(KeyValue::Str(s.to_string()))
+}
+
+/// One known `[daemon]` key: name + strong-type CLI parser. Built-in defaults
+/// are NOT copied here — they flow from [`DaemonSettings::default`] via
+/// [`daemon_key_display`] and the init template (design D3: one source of
+/// truth, no drift). `set`/`get`/`delete`/init all resolve through this table,
+/// so a later change that adds keys (e.g. `[webui]`) extends one list.
+pub struct DaemonKey {
+    pub name: &'static str,
+    pub parse: fn(&str) -> std::result::Result<KeyValue, String>,
+}
+
+pub const DAEMON_KEYS: &[DaemonKey] = &[
+    DaemonKey {
+        name: "log_level",
+        parse: parse_log_level,
+    },
+    DaemonKey {
+        name: "log_dir",
+        parse: parse_string,
+    },
+    DaemonKey {
+        name: "monitor_interval",
+        parse: parse_monitor_interval,
+    },
+    DaemonKey {
+        name: "host",
+        parse: parse_string,
+    },
+    DaemonKey {
+        name: "port",
+        parse: parse_port,
+    },
+    DaemonKey {
+        name: "auth_token",
+        parse: parse_string,
+    },
+    DaemonKey {
+        name: "log_buffer_lines",
+        parse: parse_count,
+    },
+    DaemonKey {
+        name: "app_dir",
+        parse: parse_string,
+    },
+];
+
+pub fn find_daemon_key(name: &str) -> Option<&'static DaemonKey> {
+    DAEMON_KEYS.iter().find(|k| k.name == name)
+}
+
+fn known_key_list() -> String {
+    DAEMON_KEYS
+        .iter()
+        .map(|k| k.name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Display one `[daemon]` field for `--get`. Reads the typed field off the
+/// settings struct, so a file value and the built-in default render the same
+/// way (the default flows from `DaemonSettings::default`, never a literal).
+pub fn daemon_key_display(settings: &DaemonSettings, name: &str) -> String {
+    match name {
+        "log_level" => settings.log_level.clone(),
+        "log_dir" => settings.log_dir.to_string_lossy().into_owned(),
+        "monitor_interval" => fmt_float(settings.monitor_interval),
+        "host" => settings.host.clone(),
+        "port" => settings.port.to_string(),
+        "auth_token" => settings.auth_token.clone(),
+        "log_buffer_lines" => settings.log_buffer_lines.to_string(),
+        "app_dir" => settings.app_dir.to_string_lossy().into_owned(),
+        // Callers resolve names through DAEMON_KEYS first.
+        _ => unreachable!("key table and display are in sync: {name:?}"),
+    }
+}
+
+/// `config --get` effective value: a missing file answers with the built-in
+/// defaults (same semantics as the daemon's `load_or_default`); a present
+/// file must be valid, and its typed value wins over the default.
+pub fn config_effective_value(text: Option<&str>, name: &str) -> Result<String> {
+    if find_daemon_key(name).is_none() {
+        bail!(
+            "unknown [daemon] key {name:?} (known keys: {})",
+            known_key_list()
+        );
+    }
+    let settings = match text {
+        None => DaemonSettings::default(),
+        Some(t) => {
+            let cfg: DaemonConfig =
+                toml::from_str(t).with_context(|| "daemon config is invalid".to_string())?;
+            cfg.validate()
+                .with_context(|| "daemon config is invalid".to_string())?;
+            cfg.daemon
+        }
+    };
+    Ok(daemon_key_display(&settings, name))
+}
+
+/// Parse `--set K=V` pairs against the key whitelist. Every pair is validated
+/// before anything is written (all-or-nothing; spec: 不落盘 on rejection).
+pub fn parse_sets(pairs: &[String]) -> Result<Vec<(String, KeyValue)>> {
+    let mut out = Vec::new();
+    for p in pairs {
+        let (k, v) = p
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("--set expects KEY=VALUE, got {p:?}"))?;
+        let key = find_daemon_key(k).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown [daemon] key {k:?} (known keys: {})",
+                known_key_list()
+            )
+        })?;
+        let kv = (key.parse)(v).map_err(|e| anyhow::anyhow!("--set {p}: {e}"))?;
+        out.push((k.to_string(), kv));
+    }
+    Ok(out)
+}
+
+/// The old value's decor (whitespace after `=` / same-line trailing comment),
+/// re-attached to the new value so the line keeps its exact spacing and
+/// comments. Comments above the key live on the key node and survive the
+/// replacement untouched.
+type ValueDecor = (Option<toml_edit::RawString>, Option<toml_edit::RawString>);
+
+fn table_value_decor(tbl: &toml_edit::Table, key: &str) -> ValueDecor {
+    tbl.get(key)
+        .and_then(|it| it.as_value())
+        .map(|v| (v.decor().prefix().cloned(), v.decor().suffix().cloned()))
+        .unwrap_or((None, None))
+}
+
+fn inline_value_decor(tbl: &toml_edit::InlineTable, key: &str) -> ValueDecor {
+    tbl.get(key)
+        .map(|v| (v.decor().prefix().cloned(), v.decor().suffix().cloned()))
+        .unwrap_or((None, None))
+}
+
+/// Build a toml_edit value item carrying the old line's decor.
+fn typed_value_item(kv: &KeyValue, decor: ValueDecor) -> toml_edit::Item {
+    let mut item = match kv {
+        KeyValue::Str(s) => toml_edit::value(s.clone()),
+        KeyValue::Int(i) => toml_edit::value(*i),
+        KeyValue::Float(f) => toml_edit::value(*f),
+    };
+    if let Some(v) = item.as_value_mut() {
+        if let Some(pfx) = decor.0 {
+            v.decor_mut().set_prefix(pfx);
+        }
+        if let Some(sfx) = decor.1 {
+            v.decor_mut().set_suffix(sfx);
+        }
+    }
+    item
+}
+
+/// Replace one value in a `[daemon]` table. Assignment through `IndexMut`
+/// swaps only the value node — the key keeps its own decor (comments above
+/// the line, spacing). `Table::insert` would reformat the key and is avoided.
+fn set_value_in_table(tbl: &mut toml_edit::Table, key: &str, kv: &KeyValue) {
+    let decor = table_value_decor(tbl, key);
+    let item = typed_value_item(kv, decor);
+    tbl[key] = item;
+}
+
+/// Same for the dotted-key style (`daemon.port = 1` parses as an inline table).
+fn set_value_in_inline(tbl: &mut toml_edit::InlineTable, key: &str, kv: &KeyValue) {
+    let decor = inline_value_decor(tbl, key);
+    let item = typed_value_item(kv, decor);
+    // typed_value_item always builds Item::Value, so this cannot fail.
+    let value = match item.into_value() {
+        Ok(v) => v,
+        Err(_) => unreachable!("typed_value_item builds Item::Value"),
+    };
+    match tbl.get_mut(key) {
+        Some(slot) => *slot = value,
+        None => {
+            tbl.insert(key, value);
+        }
+    }
+}
+
+/// Parse+validate daemon config text (the base of a write must be legal —
+/// design D2: only touch valid files).
+fn load_daemon_text(text: &str) -> Result<DaemonConfig> {
+    let cfg: DaemonConfig =
+        toml::from_str(text).with_context(|| "existing daemon config is invalid".to_string())?;
+    cfg.validate()
+        .with_context(|| "existing daemon config is invalid".to_string())?;
+    Ok(cfg)
+}
+
+/// `config --set`: read-modify-write via toml_edit — only the target value
+/// nodes change; untouched keys keep their order, formatting and comments.
+/// The rendered text is validated as a whole before it is returned; the
+/// caller writes it atomically (design D2/D4).
+pub fn config_apply_sets(text: &str, sets: &[(String, KeyValue)]) -> Result<String> {
+    load_daemon_text(text)?;
+    let mut doc: toml_edit::DocumentMut = text
+        .parse()
+        .with_context(|| "failed to parse daemon config as TOML".to_string())?;
+    for (key, kv) in sets {
+        let item = doc
+            .entry("daemon")
+            .or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
+        match item {
+            toml_edit::Item::Table(t) => set_value_in_table(t, key, kv),
+            toml_edit::Item::Value(toml_edit::Value::InlineTable(t)) => {
+                set_value_in_inline(t, key, kv)
+            }
+            _ => bail!("[daemon] entry is not a table — cannot set {key:?}"),
+        }
+    }
+    let rendered = doc.to_string();
+    let out: DaemonConfig = toml::from_str(&rendered)
+        .with_context(|| "the new config does not validate".to_string())?;
+    out.validate()
+        .with_context(|| "the new config does not validate".to_string())?;
+    Ok(rendered)
+}
+
+/// `config --delete` result: `Changed` carries the re-rendered text; `NoChange`
+/// means no target existed (file untouched, idempotent success).
+#[derive(Debug, PartialEq)]
+pub enum DeleteOutcome {
+    Changed(String),
+    NoChange,
+}
+
+/// One resolved `--delete` target: a leaf key inside the `[daemon]` table.
+/// Bare keys are shorthand for `[daemon]` leaves (`port` ≡ `daemon.port`).
+/// A dotted path whose first segment names a known non-daemon table would
+/// delete that whole table — with the key table currently limited to
+/// `[daemon]` there is no such target yet (`--delete webui` is rejected),
+/// and future key-table entries unlock the mechanism without code changes.
+#[derive(Debug, PartialEq)]
+struct DeleteTarget(String);
+
+fn resolve_delete_target(path: &str) -> std::result::Result<DeleteTarget, String> {
+    match path.split_once('.') {
+        None => {
+            if find_daemon_key(path).is_some() {
+                Ok(DeleteTarget(path.to_string()))
+            } else {
+                Err(format!(
+                    "unknown [daemon] key {path:?} (known keys: {}; dotted paths like \
+                     daemon.port name a [daemon] leaf)",
+                    known_key_list()
+                ))
+            }
+        }
+        Some((table, leaf)) => {
+            if table != "daemon" {
+                return Err(format!(
+                    "unknown table {table:?} in delete path {path:?} — the config key \
+                     table currently only covers [daemon]"
+                ));
+            }
+            if find_daemon_key(leaf).is_some() {
+                Ok(DeleteTarget(leaf.to_string()))
+            } else {
+                Err(format!(
+                    "unknown [daemon] key {path:?} (known keys: {})",
+                    known_key_list()
+                ))
+            }
+        }
+    }
+}
+
+/// `config --delete`: resolve every target first (all-or-nothing), then remove
+/// the value nodes via toml_edit. Absent targets are skipped; when nothing
+/// was removed the original text is returned untouched as `NoChange`.
+/// Deletion puts a key back into its "unconfigured" state (built-in defaults
+/// apply again). Rendered output is validated like `--set`.
+pub fn config_apply_deletes(text: &str, targets: &[String]) -> Result<DeleteOutcome> {
+    load_daemon_text(text)?;
+    let mut resolved = Vec::new();
+    for t in targets {
+        resolved.push(resolve_delete_target(t).map_err(|e| anyhow::anyhow!("{e}"))?);
+    }
+    let mut doc: toml_edit::DocumentMut = text
+        .parse()
+        .with_context(|| "failed to parse daemon config as TOML".to_string())?;
+    let mut any = false;
+    match doc.get_mut("daemon") {
+        Some(toml_edit::Item::Table(tbl)) => {
+            for t in &resolved {
+                if tbl.contains_key(&t.0) {
+                    tbl.remove(&t.0);
+                    any = true;
+                }
+            }
+        }
+        // Dotted-key style config: `daemon.port = 1` parses as an inline table.
+        Some(toml_edit::Item::Value(toml_edit::Value::InlineTable(tbl))) => {
+            for t in &resolved {
+                if tbl.contains_key(&t.0) {
+                    tbl.remove(&t.0);
+                    any = true;
+                }
+            }
+        }
+        // No [daemon] table at all: every target is absent.
+        _ => {}
+    }
+    if !any {
+        return Ok(DeleteOutcome::NoChange);
+    }
+    let rendered = doc.to_string();
+    let out: DaemonConfig = toml::from_str(&rendered)
+        .with_context(|| "the new config does not validate".to_string())?;
+    out.validate()
+        .with_context(|| "the new config does not validate".to_string())?;
+    Ok(DeleteOutcome::Changed(rendered))
+}
+
+/// Write a rendered daemon config atomically with a post-write validation
+/// gate (design D4): temp file next to the target → load+validate the temp
+/// content → rename over the target. Validation failure removes the temp
+/// file and leaves the target untouched; a crash never leaves a half-written
+/// config behind.
+pub fn atomic_write_daemon_config(path: &Path, text: &str) -> Result<()> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "daemon.toml".to_string());
+    let tmp = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+        .join(format!("{name}.tmp"));
+    std::fs::write(&tmp, text).with_context(|| format!("cannot write {}", tmp.display()))?;
+    if let Err(e) = DaemonConfig::load_or_default(&tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(anyhow::anyhow!("{e:#}")).context(format!(
+            "rejected: the new config does not validate; {} was not modified",
+            path.display()
+        ));
+    }
+    std::fs::rename(&tmp, path).with_context(|| format!("cannot replace {}", path.display()))?;
+    Ok(())
+}
+
+/// The fully commented `[app-default]` template section of the init output.
+const INIT_APP_DEFAULT_SECTION: &str = "\
+# ---------------------------------------------------------------------------
+# Shared defaults for every app ([app-default]) — optional, omitted here.
+# Priority: [program.*] explicit fields > the app file's [app] table > this.
+# Uncomment to use; field names match program-level fields:
+# [app-default]
+# autostart = true
+# autorestart = \"always\"
+# restart_backoff = 1.0
+# max_restart_backoff = 30.0
+# max_restarts = 0
+";
+
+/// Render the `config --init` daemon template: `[daemon]` with every known
+/// key at its built-in default (injected from [`DaemonSettings::default`],
+/// design D3/D5) plus a fully commented `[app-default]` template section.
+pub fn render_init_template() -> String {
+    let d = DaemonSettings::default();
+    // Strings render through toml_edit so escaping is always valid TOML.
+    let s = |v: &str| toml_edit::Value::from(v.to_string()).to_string();
+    let mut out = format!(
+        "\
+# xkeeper daemon config — generated by `xkeeper config --init`.
+#
+# Every field below is the built-in default; edit freely, or delete the file
+# entirely (a missing config means \"run with defaults\").
+# Validate:  xkeeper validate          Edit:  xkeeper config --edit
+# Scripted:  xkeeper config --get port | --set port=8080 | --delete port
+
+[daemon]
+# Daemon log level: trace | debug | info | warn | error.
+log_level = {log_level}
+# Directory for child process stdout/stderr logs; must be an absolute path.
+# /tmp (%TEMP% on Windows) is volatile — pin an absolute path such as
+# /var/log/xkeeper for logs that survive reboots.
+log_dir = {log_dir}
+# Supervision loop period in seconds, range (0, 60].
+monitor_interval = {monitor_interval}
+# Control-plane HTTP API bind address; the CLI and webui clients talk to it.
+# Loopback only by default — evaluate auth before exposing it.
+host = {host}
+port = {port}
+# Non-empty = the control plane requires `Authorization: Bearer <token>`
+# (CLI and webui must send the same value); empty = no auth.
+auth_token = {auth_token}
+# Recent output lines kept in memory per stream (the source for
+# `xkeeper log` and the webui live log).
+log_buffer_lines = {log_buffer_lines}
+# App registry directory: one <name>.toml record per registered app.
+# A relative value resolves against the directory of THIS config file.
+app_dir = {app_dir}
+
+",
+        log_level = s(&d.log_level),
+        log_dir = s(&d.log_dir.to_string_lossy()),
+        monitor_interval = fmt_float(d.monitor_interval),
+        host = s(&d.host),
+        port = d.port,
+        auth_token = s(&d.auth_token),
+        log_buffer_lines = d.log_buffer_lines,
+        app_dir = s(&d.app_dir.to_string_lossy()),
+    );
+    out.push_str(INIT_APP_DEFAULT_SECTION);
+    out
+}
+
+/// The all-commented app config template written as
+/// `<app_dir>/example.toml.sample` by `config --init`. The `.sample` suffix
+/// keeps it out of the registry scan (only `.toml` records are discovered).
+pub const APP_EXAMPLE_SAMPLE: &str = "\
+# example.toml.sample — an annotated APP config template (not loaded by
+# xkeeper; the .sample suffix keeps it out of the registry scan).
+#
+# Usage: copy it into your app deployment directory as `xkeeper.toml`, set
+# `command`, then run `xkeeper add . --name <app>` in that directory.
+# Priority: [program.*] explicit fields > the [app] table > [app-default].
+#
+# [app]
+# description = \"my app\"
+# autostart = true
+# autorestart = \"always\"      # always | on-failure | never
+#
+# [program.main]
+# command = \"/opt/myapp/myserver --port 8080\"   # single line, shell-lexed
+# work_dir = \".\"
+# env = { LOG = \"info\" }
+# depends_on = []
+# health_check = \"http://127.0.0.1:8080/health\"  # http(s):// | tcp:// | exec
+";
+
+/// What `config --init` created (for the caller's report).
+#[derive(Debug)]
+pub struct InitReport {
+    pub config_file: PathBuf,
+    pub app_dir: PathBuf,
+    pub sample_file: PathBuf,
+    pub sample_created: bool,
+}
+
+/// `config --init`: render the daemon template at `config_path`, create the
+/// app registry directory (the rendered `app_dir` resolved against the config
+/// file's directory — same rule the supervisor uses) and write the commented
+/// `example.toml.sample` into it (skipped when it already exists, design D5).
+/// The caller refuses to run this when the config file already exists.
+pub fn config_init(config_path: &Path) -> Result<InitReport> {
+    let text = render_init_template();
+    if let Some(dir) = config_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("cannot create config dir {}", dir.display()))?;
+    }
+    std::fs::write(config_path, &text)
+        .with_context(|| format!("cannot write {}", config_path.display()))?;
+
+    let config_dir = config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let app_dir = resolve_path(&DaemonSettings::default().app_dir, config_dir);
+    std::fs::create_dir_all(&app_dir)
+        .with_context(|| format!("cannot create app dir {}", app_dir.display()))?;
+    let sample = app_dir.join("example.toml.sample");
+    let sample_created = !sample.exists();
+    if sample_created {
+        std::fs::write(&sample, APP_EXAMPLE_SAMPLE)
+            .with_context(|| format!("cannot write {}", sample.display()))?;
+    }
+    Ok(InitReport {
+        config_file: config_path.to_path_buf(),
+        app_dir,
+        sample_file: sample,
+        sample_created,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // tests
 // ---------------------------------------------------------------------------
 
@@ -1493,6 +2051,479 @@ mod tests {
         assert!(text.contains("[program.web]"));
         let raw: AppRaw = toml::from_str(&text).unwrap();
         assert!(raw.program.contains_key("web"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// tests: `config` subcommand engine (add-config-subcommand)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod config_cmd_tests {
+    use super::*;
+
+    /// The key table covers exactly the 8 documented `[daemon]` keys.
+    #[test]
+    fn key_table_lists_all_daemon_keys() {
+        let names: Vec<_> = DAEMON_KEYS.iter().map(|k| k.name).collect();
+        assert_eq!(
+            names,
+            [
+                "log_level",
+                "log_dir",
+                "monitor_interval",
+                "host",
+                "port",
+                "auth_token",
+                "log_buffer_lines",
+                "app_dir"
+            ]
+        );
+    }
+
+    /// Every key accepts legal values and rejects type violations (task 2.1).
+    #[test]
+    fn key_parsers_accept_legal_and_reject_illegal() {
+        let parse = |k: &str, v: &str| {
+            let key = find_daemon_key(k).unwrap_or_else(|| panic!("{k} must be known"));
+            (key.parse)(v)
+        };
+        // log_level: enum only.
+        for v in ["trace", "debug", "info", "warn", "error"] {
+            assert_eq!(parse("log_level", v).unwrap(), KeyValue::Str(v.into()));
+        }
+        assert!(parse("log_level", "verbose").is_err());
+        assert!(parse("log_level", "INFO").is_err());
+        // port: u16 1..=65535.
+        assert_eq!(parse("port", "8080").unwrap(), KeyValue::Int(8080));
+        assert_eq!(parse("port", "1").unwrap(), KeyValue::Int(1));
+        assert_eq!(parse("port", "65535").unwrap(), KeyValue::Int(65535));
+        for bad in ["abc", "0", "-1", "65536", "8080.5", ""] {
+            assert!(parse("port", bad).is_err(), "port {bad:?} must be rejected");
+        }
+        // monitor_interval: positive float.
+        assert_eq!(
+            parse("monitor_interval", "0.5").unwrap(),
+            KeyValue::Float(0.5)
+        );
+        assert_eq!(
+            parse("monitor_interval", "60").unwrap(),
+            KeyValue::Float(60.0)
+        );
+        for bad in ["abc", "0", "-1", "", "-0.5"] {
+            assert!(
+                parse("monitor_interval", bad).is_err(),
+                "monitor_interval {bad:?} must be rejected"
+            );
+        }
+        // log_buffer_lines: non-negative integer.
+        assert_eq!(
+            parse("log_buffer_lines", "1000").unwrap(),
+            KeyValue::Int(1000)
+        );
+        assert_eq!(parse("log_buffer_lines", "0").unwrap(), KeyValue::Int(0));
+        for bad in ["abc", "-1", "1.5", ""] {
+            assert!(
+                parse("log_buffer_lines", bad).is_err(),
+                "log_buffer_lines {bad:?} must be rejected"
+            );
+        }
+        // Strings accept anything.
+        for k in ["log_dir", "host", "auth_token", "app_dir"] {
+            assert_eq!(
+                parse(k, "anything").unwrap(),
+                KeyValue::Str("anything".into())
+            );
+            assert_eq!(parse(k, "").unwrap(), KeyValue::Str(String::new()));
+        }
+    }
+
+    /// Effective values are typed off DaemonSettings, so file values and the
+    /// built-in defaults render identically (design D3, no copied literals).
+    #[test]
+    fn effective_value_file_priority_and_default_fallback() {
+        // Missing file == all defaults (spec: 文件缺失全默认).
+        assert_eq!(config_effective_value(None, "port").unwrap(), "7310");
+        assert_eq!(
+            config_effective_value(None, "host").unwrap(),
+            DaemonSettings::default().host
+        );
+        assert_eq!(
+            config_effective_value(None, "log_dir").unwrap(),
+            DaemonSettings::default()
+                .log_dir
+                .to_string_lossy()
+                .into_owned()
+        );
+        assert_eq!(
+            config_effective_value(None, "monitor_interval").unwrap(),
+            "1.0"
+        );
+        // File value wins.
+        let text = "[daemon]\nport = 8080\n";
+        assert_eq!(config_effective_value(Some(text), "port").unwrap(), "8080");
+        // Unset key in an existing file still falls back to the default
+        // (spec: 回退内置默认).
+        assert_eq!(
+            config_effective_value(Some(text), "host").unwrap(),
+            "127.0.0.1"
+        );
+        // Unknown key is rejected; an invalid file is rejected.
+        assert!(config_effective_value(None, "foo").is_err());
+        assert!(config_effective_value(None, "webui").is_err());
+        assert!(config_effective_value(Some("bogus_field = 1"), "port").is_err());
+        assert!(config_effective_value(Some("[daemon]\nlog_dir = \"rel\"\n"), "port").is_err());
+    }
+
+    /// --set keeps untouched keys' order, values and comments byte-for-byte;
+    /// the touched key's same-line trailing comment survives too.
+    #[test]
+    fn set_preserves_untouched_comments_and_order() {
+        let base = "\
+# header comment
+[daemon]
+# first key
+log_level = \"info\"
+log_buffer_lines = 7          # custom order + trailing note
+# the port comment
+port = 1234 # trailing
+app_dir = \"apps\"
+
+[app-default]
+autostart = true
+";
+        let rendered =
+            config_apply_sets(base, &[("port".to_string(), KeyValue::Int(8080))]).unwrap();
+        // The result must still be a valid config.
+        load_daemon_text(&rendered).unwrap();
+        // Untouched content is byte-identical.
+        for snippet in [
+            "# header comment",
+            "# first key",
+            "log_level = \"info\"",
+            "log_buffer_lines = 7          # custom order + trailing note",
+            "# the port comment",
+            "app_dir = \"apps\"",
+            "[app-default]",
+            "autostart = true",
+        ] {
+            assert!(
+                rendered.contains(snippet),
+                "lost {snippet:?} in:\n{rendered}"
+            );
+        }
+        // The value changed; the key's own trailing comment survives.
+        assert!(rendered.contains("port = 8080 # trailing"), "{rendered}");
+        assert!(!rendered.contains("1234"), "{rendered}");
+        // Re-read: the new value is effective.
+        assert_eq!(
+            config_effective_value(Some(&rendered), "port").unwrap(),
+            "8080"
+        );
+    }
+
+    /// --set that would make the whole config invalid renders an error and
+    /// the caller never writes (spec: 校验失败回滚不落盘).
+    #[test]
+    fn set_rejects_configs_that_fail_whole_validation() {
+        let base = "[daemon]\nport = 1234\n";
+        // log_dir parses as a string but violates the absolute-path rule.
+        let r = config_apply_sets(
+            base,
+            &[("log_dir".to_string(), KeyValue::Str("relative/logs".into()))],
+        );
+        assert!(r.is_err(), "invalid whole config must be rejected");
+        // The base itself was invalid → refuse to touch (design D2).
+        assert!(
+            config_apply_sets("bogus_field = 1", &[("port".to_string(), KeyValue::Int(1))])
+                .is_err()
+        );
+    }
+
+    /// --set creates the [daemon] table when missing; dotted-key style
+    /// configs are handled like tables.
+    #[test]
+    fn set_creates_missing_daemon_table_and_handles_dotted_style() {
+        let rendered = config_apply_sets(
+            "\n[app-default]\nautostart = true\n",
+            &[("port".to_string(), KeyValue::Int(1))],
+        )
+        .unwrap();
+        assert_eq!(
+            config_effective_value(Some(&rendered), "port").unwrap(),
+            "1"
+        );
+        // Dotted style.
+        let dotted = "daemon.port = 1234\n";
+        let rendered =
+            config_apply_sets(dotted, &[("port".to_string(), KeyValue::Int(9999))]).unwrap();
+        assert_eq!(
+            config_effective_value(Some(&rendered), "port").unwrap(),
+            "9999"
+        );
+    }
+
+    /// parse_sets validates every pair up front (all-or-nothing).
+    #[test]
+    fn parse_sets_is_all_or_nothing() {
+        let pairs = vec!["port=8080".to_string(), "foo=1".to_string()];
+        assert!(parse_sets(&pairs).is_err(), "unknown key rejects the batch");
+        let pairs = vec!["port".to_string()];
+        assert!(parse_sets(&pairs).is_err(), "missing '=' is rejected");
+        let pairs = vec!["port=1".to_string(), "log_level=debug".to_string()];
+        let out = parse_sets(&pairs).unwrap();
+        assert_eq!(out[0].0, "port");
+        assert_eq!(out[1].1, KeyValue::Str("debug".into()));
+    }
+
+    /// --delete removes the key (comment attached to the key goes with it),
+    /// keeps everything else, and the deleted key falls back to its default.
+    #[test]
+    fn delete_removes_key_and_falls_back_to_default() {
+        let base = "\
+[daemon]
+# host note
+host = \"0.0.0.0\"
+port = 8080
+log_buffer_lines = 7
+";
+        let rendered = match config_apply_deletes(base, &["port".to_string()]).unwrap() {
+            DeleteOutcome::Changed(t) => t,
+            other => panic!("expected Changed, got {other:?}"),
+        };
+        for snippet in ["# host note", "host = \"0.0.0.0\"", "log_buffer_lines = 7"] {
+            assert!(
+                rendered.contains(snippet),
+                "lost {snippet:?} in:\n{rendered}"
+            );
+        }
+        assert!(!rendered.contains("port"), "{rendered}");
+        assert_eq!(
+            config_effective_value(Some(&rendered), "port").unwrap(),
+            "7310",
+            "deleted key falls back to the built-in default"
+        );
+        load_daemon_text(&rendered).unwrap();
+    }
+
+    /// Deleting an absent key is an idempotent NoChange (file untouched).
+    #[test]
+    fn delete_absent_key_is_idempotent() {
+        let base = "[daemon]\nport = 8080\n";
+        assert_eq!(
+            config_apply_deletes(base, &["host".to_string()]).unwrap(),
+            DeleteOutcome::NoChange
+        );
+        // No [daemon] table at all: still a NoChange.
+        assert_eq!(
+            config_apply_deletes("[app-default]\nautostart = true\n", &["port".to_string()])
+                .unwrap(),
+            DeleteOutcome::NoChange
+        );
+    }
+
+    /// Delete targets resolve through the whitelist; unknown keys/tables are
+    /// rejected (spec: --delete webui 目前必须被拒绝).
+    #[test]
+    fn delete_resolves_paths_and_rejects_unknowns() {
+        // Bare key ≡ daemon.port.
+        let rendered =
+            match config_apply_deletes("[daemon]\nport = 1\n", &["port".to_string()]).unwrap() {
+                DeleteOutcome::Changed(t) => t,
+                other => panic!("expected Changed, got {other:?}"),
+            };
+        assert!(!rendered.contains("port"), "{rendered}");
+        // Explicit dotted form works too.
+        let r = config_apply_deletes("[daemon]\nport = 1\n", &["daemon.port".to_string()]);
+        assert!(matches!(r, Ok(DeleteOutcome::Changed(_))), "{r:?}");
+        // Unknown leaf, unknown table, bare table name, deeper path.
+        for bad in [
+            "foo",
+            "webui",
+            "webui.theme",
+            "daemon",
+            "daemon.port.x",
+            "daemon.foo",
+        ] {
+            let r = config_apply_deletes("[daemon]\nport = 1\n", &[bad.to_string()]);
+            assert!(r.is_err(), "{bad:?} must be rejected");
+        }
+        // Rejected batches leave nothing half-done (all-or-nothing).
+        let pairs = vec!["port".to_string(), "foo".to_string()];
+        let r = config_apply_deletes("[daemon]\nport = 1\n", &pairs);
+        assert!(r.is_err(), "one unknown key rejects the whole batch");
+        // An invalid base file is refused before anything is removed.
+        assert!(config_apply_deletes("bogus = 1", &["port".to_string()]).is_err());
+    }
+
+    /// --delete is repeatable: one call removes several targets (bare and
+    /// dotted forms mixed) and the dotted-key file style (an inline table)
+    /// is handled too; untouched keys survive byte-for-byte.
+    #[test]
+    fn delete_multiple_targets_in_one_call() {
+        // Table style, mixed bare + dotted targets.
+        let base = "\
+[daemon]
+# port note
+port = 8080
+host = \"0.0.0.0\"
+log_buffer_lines = 7
+";
+        let rendered = match config_apply_deletes(
+            base,
+            &["port".to_string(), "daemon.host".to_string()],
+        ) {
+            Ok(DeleteOutcome::Changed(t)) => t,
+            other => panic!("expected Changed, got {other:?}"),
+        };
+        assert!(!rendered.contains("port"), "{rendered}");
+        assert!(!rendered.contains("host"), "{rendered}");
+        assert!(
+            rendered.contains("log_buffer_lines = 7"),
+            "the untouched key survives: {rendered}"
+        );
+        load_daemon_text(&rendered).unwrap();
+
+        // Dotted-key style (parses as an inline table): both targets go.
+        let dotted = "daemon.port = 8080\ndaemon.host = \"0.0.0.0\"\n";
+        let rendered = match config_apply_deletes(
+            dotted,
+            &["port".to_string(), "host".to_string()],
+        ) {
+            Ok(DeleteOutcome::Changed(t)) => t,
+            other => panic!("expected Changed, got {other:?}"),
+        };
+        assert!(!rendered.contains("port") && !rendered.contains("host"), "{rendered}");
+        load_daemon_text(&rendered).unwrap();
+    }
+
+    /// The init template loads as a valid daemon config whose values equal
+    /// the built-in defaults (task 3.1; design D5/D3 single source).
+    #[test]
+    fn init_template_renders_defaults_and_loads() {
+        let text = render_init_template();
+        let cfg: DaemonConfig = toml::from_str(&text).expect("template must parse");
+        cfg.validate().expect("template must validate");
+        let d = DaemonSettings::default();
+        assert_eq!(cfg.daemon.log_level, d.log_level);
+        assert_eq!(cfg.daemon.log_dir, d.log_dir);
+        assert_eq!(cfg.daemon.monitor_interval, d.monitor_interval);
+        assert_eq!(cfg.daemon.host, d.host);
+        assert_eq!(cfg.daemon.port, d.port);
+        assert_eq!(cfg.daemon.auth_token, d.auth_token);
+        assert_eq!(cfg.daemon.log_buffer_lines, d.log_buffer_lines);
+        assert_eq!(cfg.daemon.app_dir, d.app_dir);
+        assert!(cfg.app_default.is_none(), "app-default stays commented out");
+        // Comments survive the round-trip (init is the first-contact docs).
+        assert!(text.contains("# [app-default]"));
+        assert!(text.contains("auth_token = \"\""));
+        assert!(text.contains("app_dir = \"apps\""));
+        assert!(
+            text.contains("resolves against the directory of THIS config file"),
+            "app_dir relative-resolution note present"
+        );
+    }
+
+    /// config --init creates the config + app dir + sample; a re-init on an
+    /// existing config is refused by the caller; a missing sample is written
+    /// but an existing one is kept untouched (spec: 重复 init 幂等安全).
+    #[test]
+    fn init_creates_workspace_and_skips_existing_sample() {
+        let tmp = std::env::temp_dir().join(format!("xk-cfg-init-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let cfg_path = tmp.join("conf").join("daemon.toml"); // nested parents
+        let rep = config_init(&cfg_path).unwrap();
+        assert!(cfg_path.is_file());
+        let d = DaemonSettings::default();
+        let want_app_dir = resolve_path(&d.app_dir, cfg_path.parent().unwrap());
+        assert_eq!(
+            rep.app_dir, want_app_dir,
+            "app_dir resolves like the daemon"
+        );
+        assert!(rep.app_dir.is_dir());
+        assert!(rep.sample_created);
+        let sample = tmp.join("conf/apps/example.toml.sample");
+        assert_eq!(rep.sample_file, sample);
+        assert!(sample.is_file());
+        let sample_text = std::fs::read_to_string(&sample).unwrap();
+        assert!(sample_text.contains("[program.main]"), "{sample_text}");
+        // Second run (config file deleted, sample kept): sample untouched.
+        std::fs::remove_file(&cfg_path).unwrap();
+        let rep2 = config_init(&cfg_path).unwrap();
+        assert!(!rep2.sample_created, "existing sample is skipped");
+        assert_eq!(
+            std::fs::read_to_string(&sample).unwrap(),
+            sample_text,
+            "the sample was not rewritten"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The `.sample` suffix keeps the example template out of the registry
+    /// scan (task 3.3): a directory holding only the sample lists no apps.
+    #[test]
+    fn sample_suffix_is_ignored_by_registry_scan() {
+        let tmp = std::env::temp_dir().join(format!("xk-cfg-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let cfg_path = tmp.join("daemon.toml");
+        let rep = config_init(&cfg_path).unwrap();
+        let (config, _) = DaemonConfig::load_or_default(&cfg_path).unwrap();
+        // Point the scan at the init-produced app_dir.
+        let mut config = config;
+        config.daemon.app_dir = rep.app_dir.clone();
+        let listed = crate::registry::list(&config, cfg_path.parent().unwrap()).unwrap();
+        assert!(
+            listed.is_empty(),
+            "example.toml.sample must not be scanned as an app: {listed:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The init template renders string values through toml_edit, so a
+    /// Windows-style default log_dir (backslashes) round-trips as a valid
+    /// TOML basic string (task 5.3: platform-different defaults render
+    /// correctly; verifiable cross-platform without a Windows toolchain).
+    #[test]
+    fn init_template_escapes_windows_style_paths() {
+        let win_path = r"C:\Users\x\AppData\Local\Temp\xkeeper\logs";
+        let rendered = toml_edit::Value::from(win_path.to_string()).to_string();
+        let doc: toml_edit::DocumentMut = format!("[daemon]\nlog_dir = {rendered}\n")
+            .parse()
+            .expect("the escaped path must be valid TOML");
+        assert_eq!(doc["daemon"]["log_dir"].as_str(), Some(win_path));
+    }
+
+    /// Atomic write: an invalid payload never reaches the target and leaves
+    /// no temp file behind (design D4).
+    #[test]
+    fn atomic_write_rejects_invalid_and_leaves_no_tmp() {
+        let tmp = std::env::temp_dir().join(format!("xk-cfg-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let cfg_path = tmp.join("daemon.toml");
+        std::fs::write(&cfg_path, "[daemon]\nport = 1\n").unwrap();
+
+        let bad = "[daemon]\nport = 1\nbogus_field = 2\n";
+        let r = atomic_write_daemon_config(&cfg_path, bad);
+        assert!(r.is_err(), "invalid payload must be rejected");
+        assert_eq!(
+            std::fs::read_to_string(&cfg_path).unwrap(),
+            "[daemon]\nport = 1\n",
+            "the target was not modified"
+        );
+        assert!(
+            !tmp.join("daemon.toml.tmp").exists(),
+            "no temp file left behind"
+        );
+
+        // A valid payload replaces the target and cleans up the temp file.
+        atomic_write_daemon_config(&cfg_path, "[daemon]\nport = 8080\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&cfg_path).unwrap(),
+            "[daemon]\nport = 8080\n"
+        );
+        assert!(!tmp.join("daemon.toml.tmp").exists());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
